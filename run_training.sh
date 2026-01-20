@@ -34,6 +34,7 @@ export MODEL_OUTPUT_SIZE="1"
 export LEARNING_RATE="0.001"
 export BATCH_SIZE="32"
 export NUM_EPOCHS="1"
+export WINDOW_SIZE="24"
 
 echo -e "${GREEN}Environment variables set${NC}"
 echo "  CLIENT_ID: $CLIENT_ID"
@@ -41,6 +42,7 @@ echo "  CLUSTER_ID: $CLUSTER_ID"
 echo "  SERVER_PORT: $SERVER_PORT"
 echo "  BATCH_SIZE: $BATCH_SIZE"
 echo "  NUM_EPOCHS: $NUM_EPOCHS"
+echo "  WINDOW_SIZE: $WINDOW_SIZE"
 
 # Start stream service in background
 echo -e "\n${BLUE}Starting stream service on port 5001...${NC}"
@@ -104,4 +106,3 @@ else
 fi
 
 exit $CLIENT_EXIT_CODE
-

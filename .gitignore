@@ -73,6 +73,6 @@ Thumbs.db
 tests/
 dataset/
 output/
-workflow.md
-run.md
+*.md
+*.pdf
 .dist/

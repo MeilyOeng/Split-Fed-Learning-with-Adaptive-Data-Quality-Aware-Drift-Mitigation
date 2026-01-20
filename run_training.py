@@ -9,6 +9,7 @@ import sys
 import time
 import subprocess
 import signal
+import csv
 import requests
 from pathlib import Path
 
@@ -43,6 +44,21 @@ def wait_for_service(url, max_attempts=30, delay=1):
         time.sleep(delay)
     return False
 
+
+def load_client_ids_for_cluster(cluster_id: str, assignments_path: Path) -> list:
+    """Load client IDs for a given cluster from the assignment CSV."""
+    if not assignments_path.exists():
+        return []
+    client_ids = []
+    with assignments_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if str(row.get("Cluster", "")).strip() == str(cluster_id):
+                client_id = str(row.get("ID", "")).strip()
+                if client_id:
+                    client_ids.append(client_id)
+    return client_ids
+
 def main():
     print_colored("=" * 50, Colors.BLUE)
     print_colored("Starting Split-Fed Learning Training", Colors.BLUE)
@@ -67,12 +83,13 @@ def main():
         "MODEL_OUTPUT_SIZE": "1",
         "LEARNING_RATE": "0.001",
         "BATCH_SIZE": "32",
-        "NUM_EPOCHS": "1",
+        "NUM_EPOCHS": "50",
+        "WINDOW_SIZE": "24",
         "USE_LOCALHOST": "true",
     })
     
     print_colored("\nEnvironment variables:", Colors.GREEN)
-    for key in ["CLIENT_ID", "CLUSTER_ID", "SERVER_PORT", "BATCH_SIZE", "NUM_EPOCHS"]:
+    for key in ["CLIENT_ID", "CLUSTER_ID", "SERVER_PORT", "BATCH_SIZE", "NUM_EPOCHS", "WINDOW_SIZE"]:
         print(f"  {key}: {env[key]}")
     
     processes = []
@@ -115,16 +132,32 @@ def main():
         # Wait a bit more
         time.sleep(2)
         
-        # Run client training
+        # Run client training (sequentially if multiple client IDs are provided)
         print_colored("\n[3/3] Starting client training...", Colors.BLUE)
         print_colored("=" * 50, Colors.BLUE)
-        client_proc = subprocess.run(
-            [sys.executable, "client/client.py", "train"],
-            env=env,
-            cwd=os.getcwd()
-        )
-        
-        exit_code = client_proc.returncode
+
+        client_ids = []
+        if env.get("CLIENT_IDS"):
+            client_ids = [cid.strip() for cid in env["CLIENT_IDS"].split(",") if cid.strip()]
+        if not client_ids:
+            assignments_path = Path("dataset") / "cluster-assignment.csv"
+            client_ids = load_client_ids_for_cluster(env["CLUSTER_ID"], assignments_path)
+        if not client_ids:
+            client_ids = [env["CLIENT_ID"]]
+
+        exit_code = 0
+        for idx, client_id in enumerate(client_ids, start=1):
+            env["CLIENT_ID"] = client_id
+            print_colored(f"\n[Client {idx}/{len(client_ids)}] Training CLIENT_ID={client_id}", Colors.BLUE)
+            client_proc = subprocess.run(
+                [sys.executable, "client/client.py", "train"],
+                env=env,
+                cwd=os.getcwd()
+            )
+            exit_code = client_proc.returncode
+            if exit_code != 0:
+                print_colored(f"Client {client_id} exited with code {exit_code}", Colors.RED)
+                break
         
     except KeyboardInterrupt:
         print_colored("\n\nInterrupted by user", Colors.RED)
@@ -165,4 +198,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

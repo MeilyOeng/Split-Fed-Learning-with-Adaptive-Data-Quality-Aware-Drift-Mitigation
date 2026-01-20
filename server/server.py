@@ -280,6 +280,48 @@ class ClusteredServerState:
             "loss": loss_value,
         }
 
+    def validate_step(
+        self,
+        client_id: str,
+        activations_cpu: torch.Tensor,
+        targets_cpu: torch.Tensor,
+    ) -> Dict[str, Any]:
+        """
+        Perform validation step on server-side layers (no gradient updates).
+        """
+        with torch.no_grad():
+            activations = activations_cpu.to(self.device)
+            targets = targets_cpu.to(self.device)
+            
+            if activations.dim() == 2:
+                activations = activations.unsqueeze(1)
+            
+            preds = self.model(activations)  # [batch, 1]
+            loss = self.criterion(preds, targets)
+            
+            preds_cpu = preds.detach().cpu().numpy()
+            loss_value = loss.item()
+            
+            # Log validation record
+            log_training_record(
+                TrainingRecord(
+                    ts=time.time(),
+                    role="server",
+                    mode="val",
+                    cluster_id=self.runtime_cfg.cluster_id,
+                    client_id=client_id,
+                    epoch=None,
+                    step=self.global_step,
+                    loss=loss_value,
+                    extra=None,
+                )
+            )
+            
+        return {
+            "predictions": preds_cpu,
+            "loss": loss_value,
+        }
+
     def inference_step(
         self,
         client_id: str,
@@ -470,6 +512,24 @@ def create_app() -> Flask:
 
             resp_payload = {
                 "grad_activations": result["grad_activations"],
+                "loss": result["loss"],
+            }
+            resp_bytes = pickle.dumps(resp_payload)
+            return Response(resp_bytes, content_type="application/octet-stream")
+
+    @app.route("/validate_step", methods=["POST"])
+    def validate_step_route():
+        with state.lock:
+            payload = pickle.loads(request.data)
+            client_id = payload.get("client_id", "unknown-client")
+
+            activations_cpu = payload["activations"]
+            targets_cpu = payload["targets"]
+
+            result = state.validate_step(client_id, activations_cpu, targets_cpu)
+
+            resp_payload = {
+                "predictions": result["predictions"],
                 "loss": result["loss"],
             }
             resp_bytes = pickle.dumps(resp_payload)

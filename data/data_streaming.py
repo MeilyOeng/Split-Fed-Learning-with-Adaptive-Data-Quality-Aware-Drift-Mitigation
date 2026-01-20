@@ -75,6 +75,8 @@ class StreamingIterableDataset(IterableDataset):
                         },
                         timeout=self.timeout,
                     )
+                    if resp.status_code == 204:
+                        return
                     resp.raise_for_status()
                     break  # Success!
                 except requests.RequestException as e:
@@ -91,24 +93,37 @@ class StreamingIterableDataset(IterableDataset):
                     import time
                     time.sleep(self.backoff * attempt)
 
-            # Deserialize response payload
-            payload = pickle.loads(resp.content)
-            if not isinstance(payload, dict):
-                raise RuntimeError(
-                    f"Streaming payload must be a dict; got {type(payload).__name__}"
-                )
+            # Try to deserialize response payload
+            # First try JSON (minimal service), then fall back to pickle (original service)
+            try:
+                payload = resp.json()
+                # Convert lists to tensors if using minimal service
+                if "X" in payload and isinstance(payload["X"], list):
+                    X_batch = torch.tensor(payload["X"], dtype=torch.float32)
+                    y_batch = torch.tensor(payload["y"], dtype=torch.float32)
+                else:
+                    X_batch = payload["X"]
+                    y_batch = payload["y"]
+            except (ValueError, KeyError):
+                # Fall back to pickle format
+                payload = pickle.loads(resp.content)
+                if not isinstance(payload, dict):
+                    raise RuntimeError(
+                        f"Streaming payload must be a dict; got {type(payload).__name__}"
+                    )
+                X_batch = payload["X"]
+                y_batch = payload["y"]
 
             # Validate batch data
-            if "X" not in payload or "y" not in payload or payload.get("y") is None:
-                print(f"[StreamingIterableDataset] Skipping invalid batch; keys={list(payload.keys())}")
+            if X_batch is None or y_batch is None:
+                print(f"[StreamingIterableDataset] Skipping invalid batch")
                 continue
 
-            X_batch = payload["X"]
-            y_batch = payload["y"]
-            if not torch.is_tensor(X_batch) or not torch.is_tensor(y_batch):
-                raise RuntimeError(
-                    f"Streaming payload must contain tensors; types: X={type(X_batch).__name__}, y={type(y_batch).__name__}"
-                )
+            # Ensure tensors
+            if not torch.is_tensor(X_batch):
+                X_batch = torch.tensor(X_batch, dtype=torch.float32)
+            if not torch.is_tensor(y_batch):
+                y_batch = torch.tensor(y_batch, dtype=torch.float32)
 
             # Yield the batch as (X, y)
             yield X_batch, y_batch
