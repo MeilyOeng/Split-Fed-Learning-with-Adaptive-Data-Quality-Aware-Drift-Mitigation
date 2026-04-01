@@ -35,27 +35,6 @@ env/
 env.bak/
 venv.bak/
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-.hypothesis/
-.pytest_cache/
-
-# Type checkers
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Linters
-.ruff_cache/
 
 # IDE
 .vscode/
@@ -73,6 +52,11 @@ Thumbs.db
 tests/
 dataset/
 output/
+output-1/
+output-2/
+output-3/
+output-4/
+plots/
 *.md
 *.pdf
 .dist/

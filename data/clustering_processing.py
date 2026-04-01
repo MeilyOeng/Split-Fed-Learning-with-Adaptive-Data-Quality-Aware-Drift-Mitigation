@@ -50,7 +50,7 @@ def preprocess_clusters(dataset_path: str, assignment_path: str, output_dir: str
 # Call the preprocessing function
 if __name__ == "__main__":
     preprocess_clusters(
-        dataset_path="../dataset/dataset.csv",
-        assignment_path="../dataset/cluster-assignment.csv",
-        output_dir="../dataset/output/",
+        dataset_path="./dataset/dataset.csv",
+        assignment_path="./dataset/cluster-assignment.csv",
+        output_dir="./dataset/output/",
     )
