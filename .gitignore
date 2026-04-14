@@ -25,9 +25,9 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-
-# Virtual environments
 .env
+# Virtual environments
+
 .venv
 venv/
 ENV/
@@ -60,3 +60,5 @@ plots/
 *.md
 *.pdf
 .dist/
+*.csv
+compare_lstm.py
