@@ -1031,9 +1031,6 @@
 #     return 0
 
 
-# if __name__ == "__main__":
-#     sys.exit(main())
-
 #!/usr/bin/env python3
 """Run split learning with persistent client workers and explicit server rounds.
 
@@ -1199,7 +1196,15 @@ def apply_gpu_env(env: dict, role: str, cluster_idx: int, client_idx: int | None
     selected_gpu_id = select_gpu_id(role, cluster_idx, client_idx)
     process_role = f"{role}_cluster_{cluster_idx}" if client_idx is None else f"{role}_cluster_{cluster_idx}_client_{client_idx}"
     out["PROCESS_ROLE"] = process_role
-    out["GPU_ENABLED"] = os.environ.get("GPU_ENABLED", out.get("GPU_ENABLED", "true"))
+
+    role_upper = role.upper()
+    role_gpu_enabled = os.environ.get(f"{role_upper}_GPU_ENABLED")
+    if role_gpu_enabled in (None, ""):
+        role_gpu_enabled = out.get(f"{role_upper}_GPU_ENABLED")
+    if role_gpu_enabled in (None, ""):
+        role_gpu_enabled = os.environ.get("GPU_ENABLED", out.get("GPU_ENABLED", "true"))
+    out["GPU_ENABLED"] = str(role_gpu_enabled)
+
     out["GPU_ID"] = "" if selected_gpu_id is None else str(selected_gpu_id)
     visibility = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visibility not in (None, ""):
@@ -1278,7 +1283,21 @@ def start_client_worker(cluster_id: str, client_id: str, server_port: int, strea
     log(f"[launch] client cluster={cluster_id} client={client_id} port={port} gpu_id={gpu_meta['gpu_id']} CUDA_VISIBLE_DEVICES={gpu_meta['cuda_visible_devices']}")
     proc = subprocess.Popen([sys.executable, CLIENT_PATH], env=proc_env, stdout=log_fh, stderr=subprocess.STDOUT, cwd=os.getcwd())
     if not wait_for_service(f"http://localhost:{port}/healthz"):
-        raise RuntimeError(f"Client worker failed to start: cluster={cluster_id}, client={client_id}")
+        time.sleep(1.0)
+        rc = proc.poll()
+        try:
+            log_fh.flush()
+        except Exception:
+            pass
+        worker_tail = tail_text_file(log_path, n=160)
+        if rc is None:
+            proc.terminate()
+        msg = (
+            f"Client worker failed to start: cluster={cluster_id}, client={client_id}, port={port}, "
+            f"returncode={rc}, gpu_enabled={gpu_meta['gpu_enabled']}, gpu_id={gpu_meta['gpu_id']}\n"
+            f"===== CLIENT WORKER LOG (tail) =====\n{worker_tail}"
+        )
+        raise RuntimeError(msg)
     return proc, log_fh, port
 
 
@@ -1533,10 +1552,34 @@ def chunk_round_clients(clients: List[str], accum_steps_server: int) -> List[Lis
 
 
 def finalize_epoch_boundaries(cluster_id: str, client_ports: Dict[str, int], exhausted_clients: List[str], train_durations) -> Dict[str, dict]:
+    """
+    Finalize clients that have already been identified as epoch-exhausted.
+
+    Important: do NOT call /command/train_one_batch here. Those clients are at an epoch
+    boundary already, so asking them to train again can re-enter the train path, trigger
+    validation side-effects at the wrong time, or surface a 500 from a worker that is no
+    longer expected to contribute a batch.
+
+    Instead, call the dedicated finalize endpoint. For compatibility with an older worker,
+    fall back to /command/train_one_batch only if /command/finalize_epoch returns 404.
+    """
     results: Dict[str, dict] = {}
     for client_id in exhausted_clients:
         t0 = time.time()
-        result = post_json(f"http://localhost:{client_ports[client_id]}/command/train_one_batch", {}, timeout=300.0)
+        base = f"http://localhost:{client_ports[client_id]}"
+        try:
+            result = post_json(f"{base}/command/finalize_epoch", {}, timeout=300.0)
+        except requests.HTTPError as e:
+            status = getattr(getattr(e, 'response', None), 'status_code', None)
+            if status == 404:
+                # Backward-compatibility path only.
+                result = post_json(f"{base}/command/train_one_batch", {}, timeout=300.0)
+            else:
+                dump_failure_context(cluster_id, client_id)
+                raise
+        except Exception:
+            dump_failure_context(cluster_id, client_id)
+            raise
         dt = round(time.time() - t0, 3)
         train_durations[(cluster_id, client_id)] += dt
         results[client_id] = result

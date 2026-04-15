@@ -641,6 +641,26 @@ class ClusteredClientRunner:
             "device": self.device_info,
         }
 
+    def finalize_epoch_if_needed(self) -> Dict[str, Any]:
+        if self.is_done():
+            return {"status": "done", **self.status()}
+
+        if self._prefetch_train_batch():
+            return {
+                "status": "not_epoch_boundary",
+                "message": "train batch is still available; epoch finalization is not allowed yet",
+                **self.status(),
+            }
+
+        epoch_number = self.progress["completed_epochs"] + 1
+        batch_count = int(self.progress.get("current_epoch_batch_count", 0))
+        epoch_loss = float(self.progress.get("current_epoch_loss_sum", 0.0))
+        avg_train_loss = (epoch_loss / batch_count) if batch_count > 0 else None
+        self._mark_epoch_finished()
+        summary = self._finalize_epoch(epoch_number, avg_train_loss)
+        final_status = "training_complete" if self.is_done() else "epoch_completed"
+        return {"status": final_status, "summary": summary, **self.status()}
+
     def test(self) -> Dict[str, Any]:
         mode = str(self.runtime_cfg.eval_mode).strip().lower()
         client_paths = []
@@ -706,6 +726,11 @@ def command_train_one_epoch():
 @app.route("/command/train", methods=["POST"])
 def command_train():
     return jsonify(runner.train_epochs())
+
+
+@app.route("/command/finalize_epoch", methods=["POST"])
+def command_finalize_epoch():
+    return jsonify(runner.finalize_epoch_if_needed())
 
 
 @app.route("/command/test", methods=["POST"])
