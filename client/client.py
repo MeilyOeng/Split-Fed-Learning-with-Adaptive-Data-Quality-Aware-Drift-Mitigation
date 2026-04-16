@@ -6,20 +6,20 @@ The scheduler talks to it over HTTP instead of starting a fresh process per batc
 """
 
 import json
-import math
 import os
 import pickle
 import random
 import sys
+import traceback
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Optional, Tuple
-
+import math
 import numpy as np
 import requests
 import torch
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 from torch import nn, optim
-
+torch.backends.cudnn.enabled = False
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
@@ -567,20 +567,46 @@ class ClusteredClientRunner:
         self._save_progress()
         return summary
 
+    # def _train_single_batch(self, X: torch.Tensor, y: torch.Tensor) -> float:
+    #     X, y = self._prepare_batch_for_lstm(X, y)
+    #     self.optimizer.zero_grad(set_to_none=True)
+    #     activations = self.client_model(X)
+    #     if activations.dim() == 3:
+    #         activations = activations[:, -1, :]
+    #     result = self._post_pickle(f"{self.current_server_url}/train_step", self._pack_payload(self.runtime_cfg.client_id, activations, y))
+    #     grad = result["grad_activations"].to(self.device)
+    #     if torch.isnan(grad).any():
+    #         raise ValueError(f"[Client {self.runtime_cfg.client_id}] NaN gradient from server")
+    #     activations.backward(gradient=grad)
+    #     self.optimizer.step()
+    #     return float(result["loss"])
     def _train_single_batch(self, X: torch.Tensor, y: torch.Tensor) -> float:
         X, y = self._prepare_batch_for_lstm(X, y)
         self.optimizer.zero_grad(set_to_none=True)
-        activations = self.client_model(X)
-        if activations.dim() == 3:
-            activations = activations[:, -1, :]
-        result = self._post_pickle(f"{self.current_server_url}/train_step", self._pack_payload(self.runtime_cfg.client_id, activations, y))
-        grad = result["grad_activations"].to(self.device)
-        if torch.isnan(grad).any():
-            raise ValueError(f"[Client {self.runtime_cfg.client_id}] NaN gradient from server")
-        activations.backward(gradient=grad)
-        self.optimizer.step()
-        return float(result["loss"])
 
+        # Avoid unstable cuDNN RNN backward for many long-lived LSTM workers on one GPU.
+        use_cudnn = not (self.device.type == "cuda")
+        with torch.backends.cudnn.flags(enabled=use_cudnn):
+            activations = self.client_model(X)
+            if activations.dim() == 3:
+                activations = activations[:, -1, :]
+            result = self._post_pickle(
+                f"{self.current_server_url}/train_step",
+                self._pack_payload(self.runtime_cfg.client_id, activations, y),
+            )
+            loss = float(result["loss"])
+            if not math.isfinite(loss):
+                raise ValueError(f"[Client {self.runtime_cfg.client_id}] Non-finite server loss: {loss}")
+
+            grad = result["grad_activations"].to(self.device)
+            if not torch.isfinite(grad).all():
+                raise ValueError(f"[Client {self.runtime_cfg.client_id}] Non-finite gradient from server")
+
+            activations.backward(gradient=grad)
+
+        torch.nn.utils.clip_grad_norm_(self.client_model.parameters(), max_norm=1.0)
+        self.optimizer.step()
+        return loss
     def train_one_batch(self) -> Dict[str, Any]:
         if self.is_done():
             return {"status": "done", **self.status()}
@@ -703,6 +729,27 @@ class ClusteredClientRunner:
 runner = ClusteredClientRunner()
 
 
+def _error_response(exc: Exception, endpoint: str):
+    tb = traceback.format_exc()
+    print(f"[Client {runner.runtime_cfg.client_id}] ERROR endpoint={endpoint}\n{tb}", flush=True)
+    try:
+        status = runner.status()
+    except Exception as status_exc:
+        status = {
+            "status_error_type": type(status_exc).__name__,
+            "status_error": str(status_exc),
+        }
+    payload = {
+        "status": "error",
+        "endpoint": endpoint,
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+        "traceback": tb,
+        "worker_status": status,
+    }
+    return jsonify(payload), 500
+
+
 @app.route("/healthz", methods=["GET"])
 def healthz():
     return jsonify({"status": "ok", **runner.status()})
@@ -715,27 +762,42 @@ def status():
 
 @app.route("/command/train_one_batch", methods=["POST"])
 def command_train_one_batch():
-    return jsonify(runner.train_one_batch())
+    try:
+        return jsonify(runner.train_one_batch())
+    except Exception as exc:
+        return _error_response(exc, "/command/train_one_batch")
 
 
 @app.route("/command/train_one_epoch", methods=["POST"])
 def command_train_one_epoch():
-    return jsonify(runner.train_one_epoch())
+    try:
+        return jsonify(runner.train_one_epoch())
+    except Exception as exc:
+        return _error_response(exc, "/command/train_one_epoch")
 
 
 @app.route("/command/train", methods=["POST"])
 def command_train():
-    return jsonify(runner.train_epochs())
+    try:
+        return jsonify(runner.train_epochs())
+    except Exception as exc:
+        return _error_response(exc, "/command/train")
 
 
 @app.route("/command/finalize_epoch", methods=["POST"])
 def command_finalize_epoch():
-    return jsonify(runner.finalize_epoch_if_needed())
+    try:
+        return jsonify(runner.finalize_epoch_if_needed())
+    except Exception as exc:
+        return _error_response(exc, "/command/finalize_epoch")
 
 
 @app.route("/command/test", methods=["POST"])
 def command_test():
-    return jsonify(runner.test())
+    try:
+        return jsonify(runner.test())
+    except Exception as exc:
+        return _error_response(exc, "/command/test")
 
 
 if __name__ == "__main__":

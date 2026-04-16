@@ -1916,6 +1916,13 @@ def main() -> int:
             cluster_test = run_test_phase_for_cluster(cluster_id, cluster_clients[cluster_id], cluster_idx, stop_event)
             for key, value in cluster_test.items():
                 test_durations[key] += value
+        # train_durations = run_training_schedule(cluster_ids, cluster_clients, env)
+
+        # for cluster_idx, cluster_id in enumerate(cluster_ids):
+        #     post_json(f"http://localhost:{SERVER_BASE_PORT + cluster_idx}/save_final_checkpoint", {}, timeout=30)
+        # ensure_final_client_checkpoints(cluster_ids, cluster_clients)
+
+        # test_durations = run_test_phase(cluster_ids, cluster_clients, env)
 
         for idx, cid in enumerate(cluster_ids):
             model_configs["servers"].append(collect_server_config(SERVER_BASE_PORT + idx, cid))
