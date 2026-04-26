@@ -173,6 +173,7 @@ class ClientRuntimeConfig:
     early_stopping_patience: int
     early_stopping_min_delta: float
     early_stopping_metric: str
+    early_stopping_start_from_epoch: int
     server_port: int
 
 
@@ -189,9 +190,10 @@ class ClusteredClientRunner:
             random_seed=int(_get_env("RANDOM_SEED", "42")),
             eval_mode=_get_env("EVAL_MODE", "final_shared"),
             early_stopping=parse_bool(_get_env("EARLY_STOPPING", "true")),
-            early_stopping_patience=int(_get_env("EARLY_STOPPING_PATIENCE", "10")),
+            early_stopping_patience=int(_get_env("EARLY_STOPPING_PATIENCE", "15")),
             early_stopping_min_delta=float(_get_env("EARLY_STOPPING_MIN_DELTA", "0.0")),
             early_stopping_metric=_get_env("EARLY_STOPPING_METRIC", "val_raw_mae"),
+            early_stopping_start_from_epoch=int(_get_env("EARLY_STOPPING_START_FROM_EPOCH", "30")),
             server_port=int(_get_env("SERVER_PORT", "5002")),
         )
         self.device = resolve_device()
@@ -265,6 +267,7 @@ class ClusteredClientRunner:
                     "early_stopping_patience": self.runtime_cfg.early_stopping_patience,
                     "early_stopping_min_delta": self.runtime_cfg.early_stopping_min_delta,
                     "early_stopping_metric": self.runtime_cfg.early_stopping_metric,
+                    "early_stopping_start_from_epoch": self.runtime_cfg.early_stopping_start_from_epoch,
                     "eval_mode": self.runtime_cfg.eval_mode,
                 },
                 "normalization": self.norm_stats,
@@ -534,13 +537,19 @@ class ClusteredClientRunner:
             self.best_val_score = float(val_raw_mae)
             self.best_epoch = epoch_number
             self._save_best_pair(epoch_number)
-        self.epochs_without_improvement = 0 if improved else self.epochs_without_improvement + 1
-        if self.runtime_cfg.early_stopping and self.epochs_without_improvement >= self.runtime_cfg.early_stopping_patience:
-            self.early_stopped = True
-            self.stop_reason = (
-                f"no improvement in {self.runtime_cfg.early_stopping_metric} for "
-                f"{self.runtime_cfg.early_stopping_patience} epoch(s)"
-            )
+
+        if epoch_number >= self.runtime_cfg.early_stopping_start_from_epoch:
+            self.epochs_without_improvement = 0 if improved else self.epochs_without_improvement + 1
+            if self.runtime_cfg.early_stopping and self.epochs_without_improvement >= self.runtime_cfg.early_stopping_patience:
+                self.early_stopped = True
+                self.stop_reason = (
+                    f"no improvement in {self.runtime_cfg.early_stopping_metric} for "
+                    f"{self.runtime_cfg.early_stopping_patience} epoch(s) after epoch "
+                    f"{self.runtime_cfg.early_stopping_start_from_epoch}"
+                )
+        else:
+            self.epochs_without_improvement = 0
+
         self.progress["completed_epochs"] = epoch_number
         self.progress["current_epoch_loss_sum"] = 0.0
         self.progress["current_epoch_batch_count"] = 0
@@ -567,24 +576,10 @@ class ClusteredClientRunner:
         self._save_progress()
         return summary
 
-    # def _train_single_batch(self, X: torch.Tensor, y: torch.Tensor) -> float:
-    #     X, y = self._prepare_batch_for_lstm(X, y)
-    #     self.optimizer.zero_grad(set_to_none=True)
-    #     activations = self.client_model(X)
-    #     if activations.dim() == 3:
-    #         activations = activations[:, -1, :]
-    #     result = self._post_pickle(f"{self.current_server_url}/train_step", self._pack_payload(self.runtime_cfg.client_id, activations, y))
-    #     grad = result["grad_activations"].to(self.device)
-    #     if torch.isnan(grad).any():
-    #         raise ValueError(f"[Client {self.runtime_cfg.client_id}] NaN gradient from server")
-    #     activations.backward(gradient=grad)
-    #     self.optimizer.step()
-    #     return float(result["loss"])
     def _train_single_batch(self, X: torch.Tensor, y: torch.Tensor) -> float:
         X, y = self._prepare_batch_for_lstm(X, y)
         self.optimizer.zero_grad(set_to_none=True)
 
-        # Avoid unstable cuDNN RNN backward for many long-lived LSTM workers on one GPU.
         use_cudnn = not (self.device.type == "cuda")
         with torch.backends.cudnn.flags(enabled=use_cudnn):
             activations = self.client_model(X)
@@ -607,6 +602,7 @@ class ClusteredClientRunner:
         torch.nn.utils.clip_grad_norm_(self.client_model.parameters(), max_norm=1.0)
         self.optimizer.step()
         return loss
+
     def train_one_batch(self) -> Dict[str, Any]:
         if self.is_done():
             return {"status": "done", **self.status()}
