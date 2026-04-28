@@ -1,44 +1,4 @@
 # fed_server.py
-"""
-Federated Averaging Server — always-on Flask service.
-
-WHY THIS EXISTS AS A SERVICE (not a subprocess-called script):
-  The old approach called federated.py as a subprocess after each epoch.
-  That works but has a startup cost each round (import PyTorch, read configs).
-  More importantly, it made the fed server invisible — no health endpoint,
-  no status history, no way to query what happened in past rounds.
-
-  As a persistent Flask service:
-  - Starts ONCE alongside stream services and cluster servers.
-  - run_training.py calls POST /fedavg after each epoch.
-  - The service runs the round synchronously and responds when done,
-    so run_training.py can safely start the next epoch on 200 response.
-  - Round history is kept in memory and queryable via GET /status.
-
-ARCHITECTURE:
-  run_training.py (orchestrator)
-       │
-       ├─ starts stream-svc-0, stream-svc-1, stream-svc-2
-       ├─ starts server-0, server-1, server-2
-       └─ starts fed_server   ← THIS FILE
-            │
-            │  POST /fedavg  (after every epoch)
-            │    1. POST /save_checkpoint  →  each cluster server
-            │    2. load server checkpoints from disk, FedAvg, save global
-            │    3. POST /load_weights     →  each cluster server (live push)
-            │    4. load client checkpoints from disk, FedAvg, save global
-            │       (clients read this file at startup — they are subprocesses,
-            │        not long-running services, so HTTP push is not possible)
-
-ENDPOINTS:
-  GET  /healthz   — health check
-  GET  /status    — round history
-  POST /fedavg    — trigger one aggregation round
-  POST /reset     — clear history (testing)
-
-PORT: FED_SERVER_PORT env var, default 5010.
-"""
-
 import csv
 import os
 import pickle
