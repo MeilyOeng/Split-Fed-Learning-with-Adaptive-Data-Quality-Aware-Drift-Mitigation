@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""Stateful server-side component for split learning with explicit round tracking."""
-
 import os
 import pickle
 import sys
@@ -22,8 +20,11 @@ from models.split_lstm import LSTMConfig, build_split_lstm
 app = Flask(__name__)
 
 
-def _get_env(name: str, default: str) -> str:
-    return os.environ.get(name, default)
+def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
+    val = os.environ.get(name)
+    if val is None or val.strip() == "":
+        return default
+    return val
 
 
 def parse_bool(val: str) -> bool:
@@ -113,7 +114,7 @@ class SplitLearningServerState:
         self.runtime_cfg = ServerRuntimeConfig(
             cluster_id=_get_env("CLUSTER_ID", "0"),
             learning_rate=float(_get_env("SERVER_LR", _get_env("LEARNING_RATE", "1e-3"))),
-            accum_steps_target=max(1, int(_get_env("ACCUM_STEPS_SERVER", "1"))),
+            accum_steps_target=max(1, int(_get_env("ACCUM_STEPS_SERVER", "1"))), # to make sure it's at least 1
             save_every_rounds=max(0, int(_get_env("CHECKPOINT_EVERY_ROUNDS", "1"))),
             output_dir=_get_env("OUTPUT_DIR", server_output_dir(_get_env("CLUSTER_ID", "0"))),
         )
@@ -142,8 +143,8 @@ class SplitLearningServerState:
         self.expected_clients_set: Set[str] = set()
         self.seen_clients: Set[str] = set()
         self.round_contrib_count = 0
-
-        latest_path = server_checkpoint_path(self.runtime_cfg.cluster_id, "latest.pt")
+        # try loading latest checkpoint on startup
+        latest_path = server_checkpoint_path(self.runtime_cfg.cluster_id, "latest.pt") 
         extra, ok = try_load_server_checkpoint(self.model, self.optimizer, latest_path, map_location=str(self.device))
         if ok and extra:
             self.global_step = int(extra.get("global_step", 0))
@@ -162,28 +163,28 @@ class SplitLearningServerState:
         if x.dim() == 2:
             return x.unsqueeze(1)
         return x
-
+    # saving training progress counters into a dict with checkpoint
     def _checkpoint_extra(self) -> Dict[str, Any]:
         return {
             "global_step": self.global_step,
             "optimizer_step_count": self.optimizer_step_count,
             "round_id": self.round_id,
         }
-
+    # averaging gradients if effective_accum_steps > 1 to ensure consistent scale regardless of how many steps were accumulated
     def _average_parameter_gradients(self, effective_accum_steps: int) -> None:
         if effective_accum_steps <= 1:
             return
         for p in self.model.parameters():
             if p.grad is not None:
                 p.grad.div_(effective_accum_steps)
-
+    # just to reset the tracking of each round's progress after a flush
     def _reset_round_tracking(self, increment_round: bool) -> None:
         self.pending_accum_steps = 0
         self.seen_clients.clear()
         self.round_contrib_count = 0
         if increment_round:
             self.round_id += 1
-
+    # check for expected clients, track seen clients and contributions
     def set_round(self, expected_clients: List[str], round_id: Optional[int] = None) -> Dict[str, Any]:
         unique_clients = [str(c) for c in expected_clients]
         if len(unique_clients) != len(set(unique_clients)):
@@ -248,11 +249,11 @@ class SplitLearningServerState:
 
     def train_step(self, client_id: str, activations_cpu: torch.Tensor, targets_cpu: torch.Tensor) -> Dict[str, Any]:
         client_id = str(client_id)
-        if not self.expected_clients_set:
+        if not self.expected_clients_set:               # Round must have been started via /round/start
             raise RuntimeError("No active round configured. Call /round/start first.")
-        if client_id not in self.expected_clients_set:
+        if client_id not in self.expected_clients_set:  #Client must be in the expected list for this round
             raise RuntimeError(f"Client {client_id} is not part of active round {self.round_id}")
-        if client_id in self.seen_clients:
+        if client_id in self.seen_clients:              # Avoid accepting multiple contributions from the same client in the same round
             raise RuntimeError(f"Duplicate contribution from client {client_id} in round {self.round_id}")
 
         self.global_step += 1
@@ -266,8 +267,8 @@ class SplitLearningServerState:
         loss = self.criterion(preds, targets)
         raw_loss = float(loss.item())
         loss.backward()
-
-        grad_activations = activations.grad.detach().cpu()
+        # move gradients back to CPU for sending to client
+        grad_activations = activations.grad.detach().cpu() 
         if grad_activations.dim() == 3 and grad_activations.size(1) == 1:
             grad_activations = grad_activations.squeeze(1)
 
@@ -295,7 +296,7 @@ class SplitLearningServerState:
         }
 
     def validate_step(self, client_id: str, activations_cpu: torch.Tensor, targets_cpu: torch.Tensor) -> Dict[str, Any]:
-        self._flush_before_eval_if_needed(reason=f"before_validate:{client_id}")
+        self._flush_before_eval_if_needed(reason=f"before_validate:{client_id}") # apply any pending gradients first
         with torch.no_grad():
             activations = self._ensure_lstm_input_3d(activations_cpu.to(self.device))
             targets = targets_cpu.to(self.device)
@@ -306,7 +307,7 @@ class SplitLearningServerState:
             return {"predictions": preds.detach().cpu().numpy(), "loss": float(loss.item())}
 
     def inference_step(self, client_id: str, activations_cpu: torch.Tensor) -> Dict[str, Any]:
-        self._flush_before_eval_if_needed(reason=f"before_inference:{client_id}")
+        self._flush_before_eval_if_needed(reason=f"before_inference:{client_id}") # apply any pending gradients first
         with torch.no_grad():
             activations = self._ensure_lstm_input_3d(activations_cpu.to(self.device))
             preds = self.model(activations).detach().cpu()
@@ -365,7 +366,7 @@ class SplitLearningServerState:
         self._flush_before_eval_if_needed(reason="load_final")
         final_path = server_checkpoint_path(self.runtime_cfg.cluster_id, "final.pt")
         latest_path = server_checkpoint_path(self.runtime_cfg.cluster_id, "latest.pt")
-        target = final_path if os.path.exists(final_path) else latest_path
+        target = final_path if os.path.exists(final_path) else latest_path                  # fallback to latest if final doesn't exist
         extra, ok = try_load_server_checkpoint(self.model, self.optimizer, target, map_location=str(self.device))
         if not ok:
             raise FileNotFoundError(target)
@@ -449,7 +450,11 @@ def train_step():
 def validate_step():
     with state.lock:
         payload = _unpickle_request_data()
-        result = state.validate_step(str(payload["client_id"]), payload["activations"], payload["targets"])
+        result = state.validate_step(
+            str(payload["client_id"]), 
+            payload["activations"], 
+            payload["targets"]
+        )
         return _pickle_response(result)
 
 
@@ -457,7 +462,9 @@ def validate_step():
 def inference_step():
     with state.lock:
         payload = _unpickle_request_data()
-        result = state.inference_step(str(payload["client_id"]), payload["activations"])
+        result = state.inference_step(
+            str(payload["client_id"]), 
+            payload["activations"])
         return _pickle_response(result)
 
 

@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""Long-lived split-learning client worker.
-
-The process keeps model, optimizer, norm stats, and stream iterators in memory.
-The scheduler talks to it over HTTP instead of starting a fresh process per batch.
-"""
-
 import json
 import os
 import pickle

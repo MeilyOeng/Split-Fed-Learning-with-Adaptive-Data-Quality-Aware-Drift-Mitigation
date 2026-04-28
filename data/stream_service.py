@@ -61,18 +61,18 @@ def _get_split_bounds(num_values: int) -> Dict[str, Tuple[int, int]]:
 
 def _compute_norm_stats(values: torch.Tensor) -> Tuple[float, float]:
     split_bounds = _get_split_bounds(len(values))
-    _, train_end = split_bounds["train"]
+    _, train_end = split_bounds["train"] 
     train_value_end = min(len(values), train_end + WINDOW_SIZE + FORECAST_HORIZON)
-    train_values = values[:train_value_end]
+    train_values = values[:train_value_end] # only compute on the train set
     if train_values.numel() == 0:
         return 0.0, 1.0
     if NORMALIZE_METHOD == "minmax":
         min_v = float(train_values.min().item())
         max_v = float(train_values.max().item())
-        return min_v, max(max_v - min_v, NORMALIZE_EPS)
+        return min_v, max(max_v - min_v, NORMALIZE_EPS) # to avoid zero division
     mean = float(train_values.mean().item())
     scale = float(train_values.std().item())
-    if scale < NORMALIZE_EPS:
+    if scale < NORMALIZE_EPS: # to avoid zero division
         scale = 1.0
     return mean, scale
 
@@ -81,7 +81,7 @@ def _normalize_tensor(tensor: torch.Tensor, mean: float, scale: float) -> torch.
     return (tensor - mean) / scale
 
 
-def _prepare_from_dataframe(df: pd.DataFrame, cluster_id: str) -> None:
+def _prepare_from_dataframe(df: pd.DataFrame, cluster_id: str) -> None: # prepare client tensors, normalization stats, and split bounds from a cluster dataframe
     if "Fecha_Hora" in df.columns:
         df["Fecha_Hora"] = pd.to_datetime(df["Fecha_Hora"], errors="coerce")
         df = df.sort_values(["id", "Fecha_Hora"], kind="stable")
@@ -149,8 +149,8 @@ def health():
     })
 
 
-@app.route("/stream/norm_stats", methods=["GET"])
-def stream_norm_stats():
+@app.route("/stream/norm_stats", methods=["GET"]) 
+def stream_norm_stats():                            # send normalization stats to clients to invert predictions back to original scale 
     client_id = int(request.args["client_id"])
     cluster_id = str(request.args["cluster_id"])
     key = (cluster_id, client_id)
