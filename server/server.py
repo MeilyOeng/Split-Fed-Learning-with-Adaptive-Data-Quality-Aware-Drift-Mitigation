@@ -378,6 +378,21 @@ class SplitLearningServerState:
         self._reset_round_tracking(increment_round=False)
         return target
 
+    def load_weights(self, model_state_dict: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+        self._flush_before_eval_if_needed(reason="load_weights")
+        self.model.load_state_dict(model_state_dict)
+        # Reset optimizer state after broadcast so moments are consistent with
+        # the newly averaged global weights.
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.runtime_cfg.learning_rate)
+        self.optimizer.zero_grad(set_to_none=True)
+        self._reset_round_tracking(increment_round=False)
+        return {
+            "cluster_id": self.runtime_cfg.cluster_id,
+            "global_step": self.global_step,
+            "optimizer_step_count": self.optimizer_step_count,
+            "round_id": self.round_id,
+        }
+
 
 state = SplitLearningServerState()
 
@@ -515,6 +530,14 @@ def load_final_checkpoint():
     with state.lock:
         path = state._load_final()
         return jsonify({"path": path})
+
+
+@app.route("/load_weights", methods=["POST"])
+def load_weights():
+    with state.lock:
+        payload = _unpickle_request_data()
+        meta = state.load_weights(payload["model_state_dict"])
+        return jsonify({"status": "ok", **meta})
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ from typing import Dict, List
 
 import requests
 from dotenv import find_dotenv, load_dotenv
+from fed_server.fed_server import run_fedavg_round
 
 CLIENT_PATH = "client/client.py"
 STREAM_SERVICE_PATH = "data/stream_service.py"
@@ -476,6 +477,19 @@ def resolve_cluster_clients(detected_clusters):
     return cluster_ids, cluster_clients
 
 
+def cluster_train_sample_weights(cluster_ids, cluster_clients):
+    weights = {}
+    for cid in cluster_ids:
+        total = 0.0
+        for client_id in cluster_clients[cid]:
+            config = collect_client_config(cid, client_id)
+            total += float(config.get("normalization", {}).get("num_train_windows", 0) or 0)
+        if total <= 0:
+            total = float(len(cluster_clients[cid]))
+        weights[str(cid)] = total
+    return weights
+
+
 def ensure_final_client_checkpoints(cluster_ids, cluster_clients):
     for cid in cluster_ids:
         for client_id in cluster_clients[cid]:
@@ -582,12 +596,11 @@ def run_round(server_port: int, cluster_id: str, client_ports: Dict[str, int], r
     return results
 
 
-def run_training_schedule_for_cluster(cluster_id: str, client_ids: List[str], env: dict, cluster_idx: int, stop_event: Event):
+def run_single_scheduler_epoch_for_cluster(cluster_id: str, client_ids: List[str], env: dict, cluster_idx: int, scheduler_epoch: int, stop_event: Event):
     training_mode = env.get("TRAINING_MODE", "client_batch_random").strip().lower()
     if training_mode != "client_batch_random":
         raise ValueError("This persistent-worker scheduler supports TRAINING_MODE=client_batch_random only")
 
-    total_epochs = int(env.get("NUM_EPOCHS", "100"))
     rng = random.Random(int(env.get("RANDOM_SEED_SCHEDULE", env.get("RANDOM_SEED", "42"))) + cluster_idx)
     order_strategy = env.get("CLIENT_ORDER_STRATEGY", "random_per_round")
     accum_steps_server = max(1, int(env.get("ACCUM_STEPS_SERVER", "1")))
@@ -599,78 +612,94 @@ def run_training_schedule_for_cluster(cluster_id: str, client_ids: List[str], en
         if stop_event.is_set():
             raise RuntimeError(f"Cluster {cluster_id} cancelled due to failure in another cluster")
 
-    for scheduler_epoch in range(1, total_epochs + 1):
+    _ensure_not_cancelled()
+    total_epochs = int(env.get("NUM_EPOCHS", "100"))
+    log(f"\n=== Scheduler epoch {scheduler_epoch}/{total_epochs} cluster={cluster_id} ===")
+    round_idx = 0
+    while True:
         _ensure_not_cancelled()
-        log(f"\n=== Scheduler epoch {scheduler_epoch}/{total_epochs} cluster={cluster_id} ===")
-        round_idx = 0
-        while True:
-            _ensure_not_cancelled()
-            worker_status = {}
-            active_clients = []
-            ready_clients = []
-            exhausted_clients = []
-            for client_id in client_ids:
-                status = fetch_worker_status(client_ports[client_id])
-                worker_status[client_id] = status
-                if bool(status.get("is_done", False)):
-                    continue
-                active_clients.append(client_id)
-                if bool(status.get("has_next_train_batch", False)):
-                    ready_clients.append(client_id)
-                else:
-                    exhausted_clients.append(client_id)
+        worker_status = {}
+        active_clients = []
+        ready_clients = []
+        exhausted_clients = []
+        for client_id in client_ids:
+            status = fetch_worker_status(client_ports[client_id])
+            worker_status[client_id] = status
+            if bool(status.get("is_done", False)):
+                continue
+            active_clients.append(client_id)
+            if bool(status.get("has_next_train_batch", False)):
+                ready_clients.append(client_id)
+            else:
+                exhausted_clients.append(client_id)
 
-            if not active_clients:
-                log(f"[TRAIN] cluster={cluster_id} scheduler_epoch={scheduler_epoch} no active clients left")
-                break
+        if not active_clients:
+            log(f"[TRAIN] cluster={cluster_id} scheduler_epoch={scheduler_epoch} no active clients left")
+            break
 
-            if ready_clients:
-                ordered_ready = order_round_clients(ready_clients, order_strategy, rng, scheduler_epoch, round_idx + 1)
-                round_chunks = chunk_round_clients(ordered_ready, accum_steps_server)
-                progress_this_cycle = False
-                for round_chunk_idx, round_clients in enumerate(round_chunks, start=1):
-                    round_idx += 1
-                    results = run_round(server_port, cluster_id, client_ports, round_clients, scheduler_epoch, round_idx, round_chunk_idx, train_durations)
-                    for client_id, result in results.items():
-                        if result.get("status") == "batch_processed":
-                            progress_this_cycle = True
-                if not progress_this_cycle:
-                    raise RuntimeError(f"No batch progress detected in cluster {cluster_id} epoch {scheduler_epoch}")
+        if ready_clients:
+            ordered_ready = order_round_clients(ready_clients, order_strategy, rng, scheduler_epoch, round_idx + 1)
+            round_chunks = chunk_round_clients(ordered_ready, accum_steps_server)
+            progress_this_cycle = False
+            for round_chunk_idx, round_clients in enumerate(round_chunks, start=1):
+                round_idx += 1
+                results = run_round(server_port, cluster_id, client_ports, round_clients, scheduler_epoch, round_idx, round_chunk_idx, train_durations)
+                for client_id, result in results.items():
+                    if result.get("status") == "batch_processed":
+                        progress_this_cycle = True
+            if not progress_this_cycle:
+                raise RuntimeError(f"No batch progress detected in cluster {cluster_id} epoch {scheduler_epoch}")
 
-            if exhausted_clients:
-                finalize_results = finalize_epoch_boundaries(cluster_id, client_ports, exhausted_clients, train_durations)
-                for client_id, result in finalize_results.items():
-                    status = result.get("status")
-                    if status not in {"epoch_completed", "training_complete", "done"}:
-                        raise RuntimeError(
-                            f"Expected epoch boundary finalization for cluster={cluster_id}, client={client_id}, got status={status}"
-                        )
+        if exhausted_clients:
+            finalize_results = finalize_epoch_boundaries(cluster_id, client_ports, exhausted_clients, train_durations)
+            for client_id, result in finalize_results.items():
+                status = result.get("status")
+                if status not in {"epoch_completed", "training_complete", "done"}:
+                    raise RuntimeError(
+                        f"Expected epoch boundary finalization for cluster={cluster_id}, client={client_id}, got status={status}"
+                    )
 
-            all_reached = True
-            client_progress_snapshot = []
-            for client_id in client_ids:
-                path = progress_path(cluster_id, client_id)
-                if not path.exists():
-                    all_reached = False
-                    client_progress_snapshot.append({"client_id": client_id, "progress": "missing"})
-                    continue
-                prog = read_json(path)
-                completed_epochs = int(prog.get("completed_epochs", 0))
-                early_stopped = bool(prog.get("early_stopped", False))
-                client_progress_snapshot.append({
-                    "client_id": client_id,
-                    "completed_epochs": completed_epochs,
-                    "early_stopped": early_stopped,
-                    "epochs_without_improvement": prog.get("epochs_without_improvement"),
-                })
-                if not early_stopped and completed_epochs < scheduler_epoch:
-                    all_reached = False
-            log(f"[TRAIN][epoch_progress] cluster={cluster_id} scheduler_epoch={scheduler_epoch} rounds={round_idx} progress={client_progress_snapshot}")
-            if all_reached:
-                log(f"[TRAIN][epoch_complete] cluster={cluster_id} scheduler_epoch={scheduler_epoch} rounds={round_idx}")
-                break
-
+        all_reached = True
+        client_progress_snapshot = []
+        for client_id in client_ids:
+            path = progress_path(cluster_id, client_id)
+            if not path.exists():
+                all_reached = False
+                client_progress_snapshot.append({"client_id": client_id, "progress": "missing"})
+                continue
+            prog = read_json(path)
+            completed_epochs = int(prog.get("completed_epochs", 0))
+            early_stopped = bool(prog.get("early_stopped", False))
+            client_progress_snapshot.append({
+                "client_id": client_id,
+                "completed_epochs": completed_epochs,
+                "early_stopped": early_stopped,
+                "epochs_without_improvement": prog.get("epochs_without_improvement"),
+            })
+            if not early_stopped and completed_epochs < scheduler_epoch:
+                all_reached = False
+        log(f"[TRAIN][epoch_progress] cluster={cluster_id} scheduler_epoch={scheduler_epoch} rounds={round_idx} progress={client_progress_snapshot}")
+        if all_reached:
+            log(f"[TRAIN][epoch_complete] cluster={cluster_id} scheduler_epoch={scheduler_epoch} rounds={round_idx}")
+            break
     return train_durations
+
+
+def run_training_schedule_for_cluster(cluster_id: str, client_ids: List[str], env: dict, cluster_idx: int, stop_event: Event):
+    merged_durations = defaultdict(float)
+    total_epochs = int(env.get("NUM_EPOCHS", "100"))
+    for scheduler_epoch in range(1, total_epochs + 1):
+        cluster_durations = run_single_scheduler_epoch_for_cluster(
+            cluster_id,
+            client_ids,
+            env,
+            cluster_idx,
+            scheduler_epoch,
+            stop_event,
+        )
+        for key, value in cluster_durations.items():
+            merged_durations[key] += value
+    return merged_durations
 
 
 def run_training_schedule(cluster_ids, cluster_clients, env):
@@ -708,6 +737,110 @@ def run_training_schedule(cluster_ids, cluster_clients, env):
 
     if first_exception is not None:
         raise first_exception
+    return merged_durations
+
+
+def run_scheduler_epoch_across_clusters(cluster_ids, cluster_clients, env, scheduler_epoch: int, stop_event: Event):
+    run_parallel = parse_bool(env.get("RUN_CLUSTERS_IN_PARALLEL"), default=True) and len(cluster_ids) > 1
+    merged_durations = defaultdict(float)
+
+    if not run_parallel:
+        for cluster_idx, cluster_id in enumerate(cluster_ids):
+            cluster_durations = run_single_scheduler_epoch_for_cluster(
+                cluster_id,
+                cluster_clients[cluster_id],
+                env,
+                cluster_idx,
+                scheduler_epoch,
+                stop_event,
+            )
+            for key, value in cluster_durations.items():
+                merged_durations[key] += value
+        return merged_durations
+
+    first_exception = None
+    with ThreadPoolExecutor(max_workers=len(cluster_ids)) as executor:
+        futures = {
+            executor.submit(
+                run_single_scheduler_epoch_for_cluster,
+                cluster_id,
+                cluster_clients[cluster_id],
+                env,
+                cluster_idx,
+                scheduler_epoch,
+                stop_event,
+            ): cluster_id
+            for cluster_idx, cluster_id in enumerate(cluster_ids)
+        }
+        for future in as_completed(futures):
+            cluster_id = futures[future]
+            try:
+                cluster_durations = future.result()
+            except Exception as exc:
+                stop_event.set()
+                log(f"[TRAIN][epoch_barrier] cluster={cluster_id} failed at scheduler_epoch={scheduler_epoch}: {exc}")
+                if first_exception is None:
+                    first_exception = exc
+            else:
+                log(f"[TRAIN][epoch_barrier] cluster={cluster_id} reached scheduler_epoch={scheduler_epoch}")
+                for key, value in cluster_durations.items():
+                    merged_durations[key] += value
+
+    if first_exception is not None:
+        raise first_exception
+    return merged_durations
+
+
+def run_server_fedavg_after_epoch(cluster_ids, cluster_clients, scheduler_epoch: int):
+    cluster_weights = cluster_train_sample_weights(cluster_ids, cluster_clients)
+    server_urls = [f"http://localhost:{SERVER_BASE_PORT + cluster_idx}" for cluster_idx, _ in enumerate(cluster_ids)]
+    output_path = OUTPUT_DIR / "global" / "global_server_latest.pt"
+    client_output_path = OUTPUT_DIR / "global" / "global_client_latest.pt"
+    log(
+        f"[FEDAVG] scheduler_epoch={scheduler_epoch} cluster_weights={cluster_weights}"
+    )
+    record = run_fedavg_round(
+        cluster_ids=[str(cid) for cid in cluster_ids],
+        server_urls=server_urls,
+        checkpoint_dir=str(OUTPUT_DIR),
+        output_path=str(output_path),
+        client_output_path=str(client_output_path),
+        assignments_path=str(ASSIGNMENTS_PATH),
+        cluster_weights=cluster_weights,
+        aggregate_clients=False,
+    )
+    if record.error:
+        raise RuntimeError(f"FedAvg failed after scheduler_epoch={scheduler_epoch}: {record.error}")
+    if record.server_push_fail:
+        raise RuntimeError(
+            f"FedAvg broadcast failed after scheduler_epoch={scheduler_epoch} for clusters {record.server_push_fail}"
+        )
+    log(
+        f"[FEDAVG] scheduler_epoch={scheduler_epoch} duration_sec={record.duration_sec} "
+        f"server_push_ok={record.server_push_ok}"
+    )
+    return record
+
+
+def run_training_schedule_with_fedavg(cluster_ids, cluster_clients, env):
+    total_epochs = int(env.get("NUM_EPOCHS", "100"))
+    merged_durations = defaultdict(float)
+    stop_event = Event()
+
+    for scheduler_epoch in range(1, total_epochs + 1):
+        epoch_durations = run_scheduler_epoch_across_clusters(
+            cluster_ids,
+            cluster_clients,
+            env,
+            scheduler_epoch,
+            stop_event,
+        )
+        for key, value in epoch_durations.items():
+            merged_durations[key] += value
+
+        if len(cluster_ids) > 1:
+            run_server_fedavg_after_epoch(cluster_ids, cluster_clients, scheduler_epoch)
+
     return merged_durations
 
 
@@ -837,6 +970,8 @@ def main() -> int:
     log(f"Server LR: {env['SERVER_LR']}")
     log(f"Server round chunk size (ACCUM_STEPS_SERVER): {env['ACCUM_STEPS_SERVER']}")
     log(f"Checkpoint every rounds: {env['CHECKPOINT_EVERY_ROUNDS']}")
+    log(f"Cluster parallel local epochs: {parse_bool(env.get('RUN_CLUSTERS_IN_PARALLEL'), default=True) and len(cluster_ids) > 1}")
+    log(f"FedAvg after each local epoch: {len(cluster_ids) > 1}")
     log(f"STREAM_BASE_PORT={STREAM_BASE_PORT} SERVER_BASE_PORT={SERVER_BASE_PORT} CLIENT_WORKER_BASE_PORT={CLIENT_WORKER_BASE_PORT}")
     log(f"GPU_ENABLED={env.get('GPU_ENABLED', os.environ.get('GPU_ENABLED', 'true'))}")
     log(f"SERVER_GPU_ID={os.environ.get('SERVER_GPU_ID')} SERVER_GPU_IDS={os.environ.get('SERVER_GPU_IDS')}")
@@ -862,11 +997,7 @@ def main() -> int:
                 status = get_json(f"http://localhost:{worker_port}/status", timeout=20)
                 log(f"[worker_ready] cluster={cluster_id} client={client_id} port={worker_port} status={status}")
 
-        train_durations = defaultdict(float)
-        for cluster_idx, cluster_id in enumerate(cluster_ids):
-            cluster_durations = run_training_schedule_for_cluster(cluster_id, cluster_clients[cluster_id], env, cluster_idx, stop_event)
-            for key, value in cluster_durations.items():
-                train_durations[key] += value
+        train_durations = run_training_schedule_with_fedavg(cluster_ids, cluster_clients, env)
 
         for cluster_idx, cluster_id in enumerate(cluster_ids):
             post_json(f"http://localhost:{SERVER_BASE_PORT + cluster_idx}/save_final_checkpoint", {}, timeout=30)

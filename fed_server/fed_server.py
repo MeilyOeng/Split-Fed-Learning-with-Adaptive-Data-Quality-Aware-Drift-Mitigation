@@ -16,9 +16,6 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from models.split_lstm import LSTMConfig, build_split_lstm
-from server.server import build_lstm_config_from_env
-
 FED_SERVER_PORT = int(os.environ.get("FED_SERVER_PORT", "5010"))
 
 
@@ -50,7 +47,7 @@ def _load_state_dict(path: str) -> Dict[str, torch.Tensor]:
         raise FileNotFoundError(
             f"Checkpoint not found: {path}\n"
             f"  The server for this cluster has not saved yet.\n"
-            f"  Check that POST /save_checkpoint was called before /fedavg."
+            f"  Check that POST /save_latest_checkpoint was called before /fedavg."
         )
     ckpt  = torch.load(path, map_location="cpu")
     state = ckpt.get("model_state_dict", ckpt)
@@ -96,18 +93,6 @@ def _fedavg(
     return avg
 
 
-def _build_server_model() -> torch.nn.Module:
-    cfg, split_layer = build_lstm_config_from_env()
-    _, server = build_split_lstm(cfg, split_layer)
-    return server
-
-
-def _build_client_model() -> torch.nn.Module:
-    cfg, split_layer = build_lstm_config_from_env()
-    client, _ = build_split_lstm(cfg, split_layer)
-    return client
-
-
 def _load_client_ids(
     assignments_path: str,
     cluster_ids: List[str],
@@ -140,12 +125,12 @@ def _force_server_checkpoint(server_url: str) -> bool:
     """
     try:
         resp = requests.post(
-            server_url.rstrip("/") + "/save_checkpoint", timeout=10.0
+            server_url.rstrip("/") + "/save_latest_checkpoint", timeout=10.0
         )
         resp.raise_for_status()
         body = resp.json()
         print(f"[FedServer]   checkpoint saved on {server_url} "
-              f"(step={body.get('global_step','?')})")
+              f"(path={body.get('path','?')})")
         return True
     except Exception as e:
         print(f"[FedServer]   WARNING: could not force checkpoint on {server_url}: {e}")
@@ -198,8 +183,8 @@ def run_fedavg_round(
     1. Force fresh checkpoints on all cluster servers.
     2. Load, average, and save the global server model.
     3. Push averaged server weights to every live cluster server.
-    4. Load, average, and save the global client model (to disk only —
-       clients read this file at startup, not via HTTP push).
+    4. Optionally average client weights. The active split-learning path
+       keeps this disabled and only aggregates server weights.
     """
     t_start   = datetime.utcnow()
     push_ok:   List[str] = []
@@ -228,11 +213,9 @@ def run_fedavg_round(
             path = os.path.join(checkpoint_dir, f"cluster_{cid}", "server_latest.pt")
             server_states.append(_load_state_dict(path))
 
-        avg_server   = _fedavg(server_states, weights=weights_list)
-        server_model = _build_server_model()
-        server_model.load_state_dict(avg_server)
+        avg_server = _fedavg(server_states, weights=weights_list)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        torch.save({"model_state_dict": server_model.state_dict()}, output_path)
+        torch.save({"model_state_dict": avg_server}, output_path)
         print(f"[FedServer]   global server model → {output_path}")
 
         # ── 3. Push averaged weights back to live servers ────────────
@@ -265,12 +248,10 @@ def run_fedavg_round(
                     missing.append(path)
 
             if client_states:
-                client_avg   = _fedavg(client_states)
-                client_model = _build_client_model()
-                client_model.load_state_dict(client_avg)
+                client_avg = _fedavg(client_states)
                 os.makedirs(os.path.dirname(client_output_path), exist_ok=True)
                 torch.save(
-                    {"model_state_dict": client_model.state_dict()},
+                    {"model_state_dict": client_avg},
                     client_output_path,
                 )
                 client_out = client_output_path
@@ -343,7 +324,7 @@ def create_app() -> Flask:
           output_path        str               default "output/global/global_server_latest.pt"
           client_output_path str               default "output/global/global_client_latest.pt"
           assignments_path   str               default "dataset/cluster-assignment.csv"
-          aggregate_clients  bool              default true
+          aggregate_clients  bool              default false
           weights            dict[str, float]  optional  e.g. {"0": 1000, "1": 500, "2": 500}
 
         Returns 200 + round summary on success.
@@ -361,7 +342,7 @@ def create_app() -> Flask:
                                       "output/global/global_client_latest.pt")
         assignments_path   = body.get("assignments_path",
                                       "dataset/cluster-assignment.csv")
-        aggregate_clients  = bool(body.get("aggregate_clients", True))
+        aggregate_clients  = bool(body.get("aggregate_clients", False))
         raw_weights        = body.get("weights")
 
         if not cluster_ids:
