@@ -824,6 +824,7 @@ def run_server_fedavg_after_epoch(cluster_ids, cluster_clients, scheduler_epoch:
 
 def run_training_schedule_with_fedavg(cluster_ids, cluster_clients, env):
     total_epochs = int(env.get("NUM_EPOCHS", "100"))
+    local_epochs_per_global_round = max(1, int(env.get("LOCAL_EPOCHS_PER_GLOBAL_ROUND", "1")))
     merged_durations = defaultdict(float)
     stop_event = Event()
 
@@ -838,7 +839,14 @@ def run_training_schedule_with_fedavg(cluster_ids, cluster_clients, env):
         for key, value in epoch_durations.items():
             merged_durations[key] += value
 
-        if len(cluster_ids) > 1:
+        should_aggregate = (
+            len(cluster_ids) > 1
+            and (
+                scheduler_epoch % local_epochs_per_global_round == 0
+                or scheduler_epoch == total_epochs
+            )
+        )
+        if should_aggregate:
             run_server_fedavg_after_epoch(cluster_ids, cluster_clients, scheduler_epoch)
 
     return merged_durations
@@ -930,6 +938,7 @@ def main() -> int:
             "NORMALIZE_METHOD": os.environ.get("NORMALIZE_METHOD", "zscore"),
             "BATCH_SIZE": os.environ.get("BATCH_SIZE", "32"),
             "NUM_EPOCHS": os.environ.get("NUM_EPOCHS", "100"),
+            "LOCAL_EPOCHS_PER_GLOBAL_ROUND": os.environ.get("LOCAL_EPOCHS_PER_GLOBAL_ROUND", "1"),
             "CLIENT_LR": os.environ.get("CLIENT_LR", os.environ.get("LEARNING_RATE", "0.0005")),
             "SERVER_LR": os.environ.get("SERVER_LR", os.environ.get("LEARNING_RATE", "0.0005")),
             "ACCUM_STEPS_SERVER": os.environ.get("ACCUM_STEPS_SERVER", "1"),
@@ -971,7 +980,10 @@ def main() -> int:
     log(f"Server round chunk size (ACCUM_STEPS_SERVER): {env['ACCUM_STEPS_SERVER']}")
     log(f"Checkpoint every rounds: {env['CHECKPOINT_EVERY_ROUNDS']}")
     log(f"Cluster parallel local epochs: {parse_bool(env.get('RUN_CLUSTERS_IN_PARALLEL'), default=True) and len(cluster_ids) > 1}")
-    log(f"FedAvg after each local epoch: {len(cluster_ids) > 1}")
+    log(
+        f"Local epochs per global FedAvg round: {max(1, int(env['LOCAL_EPOCHS_PER_GLOBAL_ROUND']))} "
+        f"(enabled={len(cluster_ids) > 1})"
+    )
     log(f"STREAM_BASE_PORT={STREAM_BASE_PORT} SERVER_BASE_PORT={SERVER_BASE_PORT} CLIENT_WORKER_BASE_PORT={CLIENT_WORKER_BASE_PORT}")
     log(f"GPU_ENABLED={env.get('GPU_ENABLED', os.environ.get('GPU_ENABLED', 'true'))}")
     log(f"SERVER_GPU_ID={os.environ.get('SERVER_GPU_ID')} SERVER_GPU_IDS={os.environ.get('SERVER_GPU_IDS')}")
