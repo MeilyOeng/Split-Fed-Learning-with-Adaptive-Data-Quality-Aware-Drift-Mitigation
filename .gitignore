@@ -62,5 +62,5 @@ plots/
 *.pdf
 .dist/
 *.csv
-compare_lstm.py
-compare_run_outputs.py
+compare_*.py
+reports/

@@ -74,29 +74,60 @@ class SplitLSTMClient(nn.Module):
         return self.backbone(x)
 
 
+# class SplitLSTMServer(nn.Module):
+#     def __init__(self, config: LSTMConfig, split_layer: int) -> None:
+#         super().__init__()
+#         if not (1 <= split_layer < config.num_layers):
+#             raise ValueError(f"split_layer must be in [1, num_layers-1], got {split_layer} for num_layers={config.num_layers}")
+#         self.config = config
+#         self.split_layer = split_layer
+#         hidden_dim = config.hidden_size * (2 if config.bidirectional else 1)
+#         self.backbone = _StackedSingleLayerLSTM(
+#             hidden_dim,
+#             config.hidden_size,
+#             config.num_layers - split_layer,
+#             batch_first=config.batch_first,
+#             bidirectional=config.bidirectional,
+#             dropout=config.dropout,
+#         )
+#         self.fc = nn.Linear(hidden_dim, config.output_size)
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         out = self.backbone(x)
+#         last_timestep = out[:, -1, :]
+#         return self.fc(last_timestep)
 class SplitLSTMServer(nn.Module):
     def __init__(self, config: LSTMConfig, split_layer: int) -> None:
         super().__init__()
+
         if not (1 <= split_layer < config.num_layers):
-            raise ValueError(f"split_layer must be in [1, num_layers-1], got {split_layer} for num_layers={config.num_layers}")
-        self.config = config
-        self.split_layer = split_layer
+            raise ValueError(
+                f"split_layer must be in [1, num_layers-1], got {split_layer}"
+            )
+
         hidden_dim = config.hidden_size * (2 if config.bidirectional else 1)
+
         self.backbone = _StackedSingleLayerLSTM(
-            hidden_dim,
-            config.hidden_size,
-            config.num_layers - split_layer,
+            input_size=hidden_dim,
+            hidden_size=config.hidden_size,
+            num_layers=config.num_layers - split_layer,
             batch_first=config.batch_first,
             bidirectional=config.bidirectional,
             dropout=config.dropout,
         )
-        self.fc = nn.Linear(hidden_dim, config.output_size)
+
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(hidden_dim, config.output_size),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.backbone(x)
-        last_timestep = out[:, -1, :]
-        return self.fc(last_timestep)
-
+        out = self.backbone(x)          # server LSTM is really used
+        out = out[:, -1, :]             # last timestep
+        out = self.head(out)            # activation head
+        return out.squeeze(-1)
 
 def build_split_lstm(config: LSTMConfig, split_layer: int) -> Tuple[SplitLSTMClient, SplitLSTMServer]:
     return SplitLSTMClient(config, split_layer), SplitLSTMServer(config, split_layer)
