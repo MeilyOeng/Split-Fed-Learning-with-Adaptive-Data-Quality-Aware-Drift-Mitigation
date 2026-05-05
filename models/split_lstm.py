@@ -96,7 +96,6 @@ class SplitLSTMServer(nn.Module):
         out = self.backbone(x)
         last_timestep = out[:, -1, :]
         return self.fc(last_timestep)
-
 # class SplitLSTMServer(nn.Module):
 #     def __init__(self, config: LSTMConfig, split_layer: int) -> None:
 #         super().__init__()

@@ -79,6 +79,17 @@ def parse_csv_ids(raw: Optional[str]) -> Optional[List[str]]:
     return [x.strip() for x in str(raw).split(",") if x.strip()]
 
 
+def default_report_dir_for_output(output_dir: Path) -> Path:
+    name = output_dir.name.strip()
+    if name == "output":
+        return Path("report")
+    if name.startswith("output-"):
+        return Path("report-" + name[len("output-"):])
+    if name.startswith("output"):
+        return Path(name.replace("output", "report", 1))
+    return Path(f"report-{name}")
+
+
 def resolve_input_path(
     project_root: Path,
     explicit_path: Optional[Path],
@@ -1254,11 +1265,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run local prediction and fairness analysis from saved split-learning checkpoints.")
     p.add_argument("--project-root", type=Path, default=Path("."), help="Project root containing dataset/ and output/")
     p.add_argument("--dataset-dir", type=Path, default=Path("dataset"), help="Dataset directory")
-    p.add_argument("--output-dir", type=Path, default=Path("output"), help="Training output directory")
+    p.add_argument("--output-dir", type=Path, default=Path("output-fedavg-30EP5LEP"), help="Training output directory")
     p.add_argument("--test-report", type=Path, default=None, help="Per-client split-learning test report CSV. Defaults to output/results/test_report.csv with fallbacks.")
     p.add_argument("--baseline-report", type=Path, default=None, help="Baseline LSTM metrics CSV. Defaults to dataset/lstm_results_updated.csv with fallbacks.")
     p.add_argument("--assignments-path", type=Path, default=Path("dataset") / "cluster-assignment.csv", help="Cluster assignment CSV used to map baseline rows to clusters.")
-    p.add_argument("--report-dir", type=Path, default=Path("reports"), help="Directory for analysis outputs")
+    p.add_argument("--report-dir", type=Path, default=None, help="Directory for analysis outputs. Default: derived from output dir name, e.g. output-ep30-noES -> report-ep30-noES")
     p.add_argument("--clusters", type=str, default=None, help="Comma-separated cluster IDs. Default: discover from output/")
     p.add_argument("--clients", type=str, default=None, help="Comma-separated client IDs. Default: discover from output/")
     p.add_argument("--checkpoint-mode", type=str, default="auto", choices=["auto", "paired_best", "final_shared", "final", "latest"])
@@ -1298,7 +1309,8 @@ def main() -> int:
         if args.assignments_path.is_absolute()
         else (project_root / args.assignments_path).resolve()
     )
-    report_dir = (project_root / args.report_dir).resolve()
+    report_dir_arg = args.report_dir if args.report_dir is not None else default_report_dir_for_output(output_dir)
+    report_dir = (project_root / report_dir_arg).resolve()
     plots_dir = report_dir / "plots"
     predictions_dir = report_dir / "predictions"
     rankings_dir = report_dir / "rankings"
@@ -1336,7 +1348,7 @@ def main() -> int:
     per_client_rows: List[Dict] = metrics_df.to_dict(orient="records")
     payloads_by_cluster: Dict[str, List[Dict]] = {str(cluster_id): [] for cluster_id in cluster_ids}
     prediction_meta: Dict[Tuple[str, str], Dict] = {}
-    prediction_failures: List[Dict[str, str]] = []
+    prediction_failures = 0
     log(f"Device: {device}")
     log(f"Dataset dir: {dataset_dir}")
     log(f"Output dir: {output_dir}")
@@ -1381,13 +1393,7 @@ def main() -> int:
                     last_n_plot=args.last_n_plot,
                 )
             except Exception as exc:
-                prediction_failures.append(
-                    {
-                        "cluster_id": str(cluster_id),
-                        "client_id": str(client_id),
-                        "error": str(exc),
-                    }
-                )
+                prediction_failures += 1
                 log(f"     [WARN] skipped prediction plot: {exc}")
                 continue
 
@@ -1520,80 +1526,8 @@ def main() -> int:
             title="Per-client RMSE: SplitFed vs LSTM by cluster",
         )
 
-    report = {
-        "config": {
-            "project_root": str(project_root),
-            "dataset_dir": str(dataset_dir),
-            "output_dir": str(output_dir),
-            "test_report_path": str(test_report_path),
-            "baseline_report_path": str(baseline_report_path),
-            "assignments_path": str(assignments_path),
-            "report_dir": str(report_dir),
-            "checkpoint_mode": args.checkpoint_mode,
-            "window_size": args.window_size,
-            "forecast_horizon": args.forecast_horizon,
-            "train_ratio": args.train_ratio,
-            "val_ratio": args.val_ratio,
-            "test_ratio": args.test_ratio,
-            "batch_size": args.batch_size,
-            "device": str(device),
-            "ranking_metric": args.metric,
-            "top_k": args.top_k,
-        },
-        "clients": per_client_rows,
-        "clusters": cluster_rows,
-        "cluster_best_worst": cluster_best_worst_rows,
-        "global_summary": global_summary,
-        "rankings": ranking_report,
-        "splitfed_vs_lstm": comparison_rows,
-        "prediction_failures": prediction_failures,
-        "note": (
-            "Use worst-client, p90/p95, and worst_over_avg metrics to judge whether the "
-            "model is uniformly good across clients. Global averages alone can hide bad cells."
-        ),
-    }
-
-    save_json(report_dir / "prediction_report.json", report)
     save_json(report_dir / "global_summary.json", global_summary)
-    save_json(report_dir / "rankings.json", ranking_report)
     save_json(report_dir / "cluster_best_worst_clients.json", cluster_best_worst_rows)
-    save_json(report_dir / "prediction_failures.json", prediction_failures)
-
-    save_csv(
-        report_dir / "prediction_clients.csv",
-        per_client_rows,
-        [
-            "cluster_id",
-            "client_id",
-            "checkpoint_mode",
-            "artifact_eval_mode",
-            "num_test_samples",
-            "mae",
-            "rmse",
-            "mse",
-            "mape",
-            "smape",
-            "r2",
-            "test_duration_sec",
-            "num_test_batches",
-            "eval_mode",
-            "training_mode",
-            "client_order_strategy",
-            "random_seed_schedule",
-            "client_checkpoint_epoch",
-            "server_global_step",
-            "recomputed_mae",
-            "recomputed_rmse",
-            "recomputed_r2",
-            "recomputed_smape",
-            "delta_recomputed_vs_report_mae",
-            "delta_recomputed_vs_report_rmse",
-            "prediction_csv",
-            "plot_path",
-            "checkpoint_client",
-            "checkpoint_server",
-        ],
-    )
     save_csv(
         report_dir / "prediction_clusters.csv",
         cluster_rows,
@@ -1687,6 +1621,8 @@ def main() -> int:
         log(str(row))
     log("\nGlobal summary:")
     log(str(global_summary))
+    if prediction_failures:
+        log(f"\nPrediction plot failures: {prediction_failures}")
     log(f"\nSaved analysis to: {report_dir}")
     return 0
 

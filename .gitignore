@@ -64,3 +64,8 @@ plots/
 *.csv
 compare_*.py
 reports/
+report-*/
+simple_plots/
+simple_report_plots.py
+comparison_training_plots.py
+comparison_outputs/
