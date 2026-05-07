@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Efficient client-partitioned streaming service with precomputed client tensors."""
-
 import os
 import pickle
+import time
 from threading import Lock
 from typing import Dict, Tuple
 
 import pandas as pd
 import torch
 from flask import Flask, Response, jsonify, request
+from utils.comm_logging import append_comm_row, tensor_shape
 
 app = Flask(__name__)
 
@@ -25,6 +25,7 @@ NORMALIZE = os.environ.get("NORMALIZE", "false").lower() in ("1", "true", "yes",
 NORMALIZE_METHOD = os.environ.get("NORMALIZE_METHOD", "zscore").lower()
 NORMALIZE_EPS = float(os.environ.get("NORMALIZE_EPS", "1e-8"))
 SIGN_FLIP = os.environ.get("SIGN_FLIP", "true").lower() in ("1", "true", "yes", "y")
+COMM_LOG_STREAM = os.environ.get("COMM_LOG_STREAM", "false").lower() in ("1", "true", "yes", "y")
 
 if abs((TRAIN_RATIO + VAL_RATIO + TEST_RATIO) - 1.0) > 1e-6:
     raise ValueError("TRAIN_RATIO + VAL_RATIO + TEST_RATIO must sum to 1.0")
@@ -35,6 +36,17 @@ client_split_bounds: Dict[Tuple[str, int], Dict[str, Tuple[int, int]]] = {}
 client_window_counts: Dict[Tuple[str, int], Dict[str, int]] = {}
 client_offsets: Dict[Tuple[str, int, str], int] = {}
 offset_lock = Lock()
+
+
+def _stream_comm_log_path(cluster_id: str | None) -> str:
+    target_cluster = str(cluster_id) if cluster_id not in (None, "") else "global"
+    return os.path.join(BASE_DIR, "output", f"cluster_{target_cluster}", "stream_comm.csv")
+
+
+def _append_stream_comm(row: Dict[str, object], cluster_id: str | None) -> None:
+    if not COMM_LOG_STREAM:
+        return
+    append_comm_row(_stream_comm_log_path(cluster_id), row)
 
 
 def _transform_series(values) -> torch.Tensor:
@@ -151,6 +163,7 @@ def health():
 
 @app.route("/stream/norm_stats", methods=["GET"]) 
 def stream_norm_stats():                            # send normalization stats to clients to invert predictions back to original scale 
+    t0 = time.perf_counter()
     client_id = int(request.args["client_id"])
     cluster_id = str(request.args["cluster_id"])
     key = (cluster_id, client_id)
@@ -158,7 +171,7 @@ def stream_norm_stats():                            # send normalization stats t
         return jsonify({"error": f"Unknown cluster/client: {cluster_id}/{client_id}"}), 404
     mean, scale = client_norm_stats[key]
     counts = client_window_counts[key]
-    return jsonify({
+    response = {
         "cluster_id": cluster_id,
         "client_id": client_id,
         "normalize": NORMALIZE,
@@ -169,11 +182,30 @@ def stream_norm_stats():                            # send normalization stats t
         "num_train_windows": counts["train"],
         "num_val_windows": counts["val"],
         "num_test_windows": counts["test"],
-    })
+    }
+    if COMM_LOG_STREAM:
+        _append_stream_comm(
+            {
+                "level": "stream",
+                "observer": "stream",
+                "cluster_id": cluster_id,
+                "client_id": str(client_id),
+                "event": "norm_stats",
+                "route": "/stream/norm_stats",
+                "direction": "stream_to_client",
+                "payload_type": "norm_stats",
+                "payload_bytes": len(jsonify(response).get_data()),
+                "latency_ms": round((time.perf_counter() - t0) * 1000.0, 3),
+                "status": "ok",
+            },
+            cluster_id,
+        )
+    return jsonify(response)
 
 
 @app.route("/stream/reset", methods=["POST"])
 def stream_reset():
+    t0 = time.perf_counter()
     data = request.get_json() or {}
     client_id = int(data["client_id"])
     cluster_id = str(data["cluster_id"])
@@ -189,7 +221,7 @@ def stream_reset():
     with offset_lock:
         client_offsets[(cluster_id, client_id, mode)] = new_offset
     counts = client_window_counts[key]
-    return jsonify({
+    response = {
         "status": "reset",
         "cluster_id": cluster_id,
         "client_id": client_id,
@@ -200,7 +232,27 @@ def stream_reset():
         "num_train_windows": counts["train"],
         "num_val_windows": counts["val"],
         "num_test_windows": counts["test"],
-    })
+    }
+    if COMM_LOG_STREAM:
+        _append_stream_comm(
+            {
+                "level": "stream",
+                "observer": "stream",
+                "cluster_id": cluster_id,
+                "client_id": str(client_id),
+                "event": "stream_reset",
+                "route": "/stream/reset",
+                "direction": "client_to_stream",
+                "payload_type": "stream_reset",
+                "payload_bytes": 0,
+                "latency_ms": round((time.perf_counter() - t0) * 1000.0, 3),
+                "status": "ok",
+                "batch_size_requested": data.get("batch_size"),
+                "start_idx": new_offset,
+            },
+            cluster_id,
+        )
+    return jsonify(response)
 
 
 
@@ -229,6 +281,7 @@ def stream_status():
 
 @app.route("/stream/next", methods=["POST"])
 def stream_next():
+    t0 = time.perf_counter()
     data = request.get_json() or {}
     client_id = int(data["client_id"])
     cluster_id = str(data["cluster_id"])
@@ -264,6 +317,30 @@ def stream_next():
         y_batch = _normalize_tensor(y_batch, mean, scale)
 
     payload = pickle.dumps({"X": X_batch, "y": y_batch})
+    if COMM_LOG_STREAM:
+        _append_stream_comm(
+            {
+                "level": "stream",
+                "observer": "stream",
+                "cluster_id": cluster_id,
+                "client_id": str(client_id),
+                "event": "stream_next",
+                "route": "/stream/next",
+                "direction": "stream_to_client",
+                "payload_type": "stream_batch",
+                "payload_bytes": len(payload),
+                "latency_ms": round((time.perf_counter() - t0) * 1000.0, 3),
+                "status": "ok",
+                "batch_size_requested": batch_size,
+                "batch_size_returned": end_idx - start_idx,
+                "start_idx": start_idx,
+                "end_idx": end_idx,
+                "x_shape": tensor_shape(X_batch),
+                "y_shape": tensor_shape(y_batch),
+                "payload_shape": f"X={tensor_shape(X_batch)};y={tensor_shape(y_batch)}",
+            },
+            cluster_id,
+        )
     return Response(payload, content_type="application/octet-stream")
 
 

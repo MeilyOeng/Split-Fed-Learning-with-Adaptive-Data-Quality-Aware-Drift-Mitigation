@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-import json
 import os
 import pickle
 import random
 import sys
 import traceback
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Optional, Tuple
 import math
@@ -19,71 +19,21 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from data.data_streaming import StreamingIterableDataset
-from models.split_lstm import LSTMConfig, build_split_lstm
+from models.split_lstm import build_split_lstm
+from utils.comm_logging import append_comm_row, calc_bandwidth, should_log_index, tensor_nbytes, tensor_shape
+from utils.runtime_utils import (
+    _get_env,
+    build_lstm_config_from_env,
+    get_device_info,
+    parse_bool,
+    read_json,
+    resolve_device,
+    save_torch_checkpoint,
+    try_load_torch_checkpoint,
+    write_json,
+)
 
 app = Flask(__name__)
-
-
-def parse_bool(env_value: Optional[str], default: bool = False) -> bool:
-    if env_value is None:
-        return default
-    return env_value.strip().lower() in ("1", "true", "yes", "y")
-
-
-def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
-    val = os.environ.get(name)
-    if val is None or val.strip() == "":
-        return default
-    return val
-
-
-def resolve_device() -> torch.device:
-    gpu_enabled = parse_bool(_get_env("GPU_ENABLED", "true"), default=True)
-    gpu_id = _get_env("GPU_ID", "")
-    if gpu_enabled and torch.cuda.is_available():
-        if gpu_id not in (None, ""):
-            return torch.device(f"cuda:{gpu_id}")
-        return torch.device("cuda")
-    return torch.device("cpu")
-
-
-def get_device_info(device: torch.device) -> Dict[str, Any]:
-    info: Dict[str, Any] = {
-        "selected_device": str(device),
-        "gpu_enabled": parse_bool(_get_env("GPU_ENABLED", "true"), default=True),
-        "gpu_id_env": _get_env("GPU_ID", ""),
-        "cuda_visible_devices": _get_env("CUDA_VISIBLE_DEVICES", ""),
-        "cuda_available": torch.cuda.is_available(),
-        "cuda_device_count": torch.cuda.device_count(),
-        "process_role": _get_env("PROCESS_ROLE", "client"),
-    }
-    if device.type == "cuda" and torch.cuda.is_available():
-        idx = device.index if device.index is not None else torch.cuda.current_device()
-        props = torch.cuda.get_device_properties(idx)
-        info.update(
-            {
-                "cuda_index": idx,
-                "cuda_name": torch.cuda.get_device_name(idx),
-                "cuda_capability": f"{props.major}.{props.minor}",
-                "cuda_total_memory_gb": round(props.total_memory / (1024 ** 3), 3),
-            }
-        )
-    return info
-
-
-def build_lstm_config_from_env() -> Tuple[LSTMConfig, int]:
-    cfg = LSTMConfig(
-        input_size=int(_get_env("MODEL_INPUT_SIZE", "1")),
-        hidden_size=int(_get_env("MODEL_HIDDEN_SIZE", "128")),
-        num_layers=int(_get_env("MODEL_NUM_LAYERS", "3")),
-        output_size=int(_get_env("MODEL_OUTPUT_SIZE", "1")),
-        dropout=float(_get_env("MODEL_DROPOUT", "0.4")),
-        bidirectional=parse_bool(_get_env("MODEL_BIDIRECTIONAL", "false")),
-    )
-    split_layer = int(_get_env("MODEL_SPLIT_LAYER", "2"))
-    if split_layer <= 0 or split_layer >= cfg.num_layers:
-        raise ValueError(f"MODEL_SPLIT_LAYER must be in [1, num_layers-1], got split={split_layer}, num_layers={cfg.num_layers}")
-    return cfg, split_layer
 
 
 def _cluster_output_dir(cluster_id: str) -> str:
@@ -116,40 +66,8 @@ def client_progress_path(cluster_id: str, client_id: str) -> str:
     return os.path.join(_cluster_output_dir(cluster_id), f"client_{client_id}_progress.json")
 
 
-def write_json(path: str, obj: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2)
-
-
-def read_json(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_torch_checkpoint(model: nn.Module, optimizer: Optional[optim.Optimizer], epoch: int, path: str) -> None:
-    payload = {"model_state_dict": model.state_dict(), "epoch": epoch}
-    if optimizer is not None:
-        payload["optimizer_state_dict"] = optimizer.state_dict()
-    torch.save(payload, path)
-    print(f"[Client] Checkpoint -> {path}", flush=True)
-
-
-def try_load_model_checkpoint(model: nn.Module, optimizer: Optional[optim.Optimizer], path: str, *, strict: bool = True) -> Tuple[Optional[int], bool]:
-    if not os.path.exists(path):
-        return None, False
-    try:
-        ckpt = torch.load(path, map_location="cpu")
-        model.load_state_dict(ckpt["model_state_dict"], strict=strict)
-        if optimizer is not None and "optimizer_state_dict" in ckpt:
-            try:
-                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            except Exception as e:
-                print(f"[Client] WARNING: optimizer state incompatible for {path}: {e}", flush=True)
-        return int(ckpt.get("epoch", 0)), True
-    except Exception as e:
-        print(f"[Client] WARNING: skipping incompatible checkpoint {path}: {e}", flush=True)
-        return None, False
+def client_comm_log_path(cluster_id: str, client_id: str) -> str:
+    return os.path.join(_cluster_output_dir(cluster_id), f"client_{client_id}_comm.csv")
 
 
 @dataclass
@@ -191,7 +109,7 @@ class ClusteredClientRunner:
             server_port=int(_get_env("SERVER_PORT", "5002")),
         )
         self.device = resolve_device()
-        self.device_info = get_device_info(self.device)
+        self.device_info = get_device_info(self.device, process_role_default="client")
         seed = self.runtime_cfg.random_seed
         random.seed(seed)
         np.random.seed(seed)
@@ -202,6 +120,10 @@ class ClusteredClientRunner:
         self.current_server_url = f"http://localhost:{self.runtime_cfg.server_port}"
         self.session = requests.Session()
         self.norm_stats = self._fetch_norm_stats()
+        self.comm_log_train = parse_bool(_get_env("COMM_LOG_TRAIN", "true"), default=True)
+        self.comm_log_eval = parse_bool(_get_env("COMM_LOG_EVAL", "false"), default=False)
+        self.comm_log_every_n_batches = max(1, int(_get_env("COMM_LOG_EVERY_N_BATCHES", "1")))
+        self.comm_log_path = client_comm_log_path(self.runtime_cfg.cluster_id, self.runtime_cfg.client_id)
 
         self.client_model = self._build_model().to(self.device)
         self.optimizer = optim.Adam(self.client_model.parameters(), lr=self.runtime_cfg.learning_rate)
@@ -311,10 +233,15 @@ class ClusteredClientRunner:
 
     def _maybe_load_checkpoint(self) -> int:
         latest_path = client_checkpoint_path(self.runtime_cfg.cluster_id, self.runtime_cfg.client_id)
-        epoch, ok = try_load_model_checkpoint(self.client_model, self.optimizer, latest_path)
+        extra, ok = try_load_torch_checkpoint(
+            self.client_model,
+            self.optimizer,
+            latest_path,
+            strict=True,
+            log_prefix=f"Client {self.runtime_cfg.client_id}",
+        )
         if ok:
-            print(f"[Client {self.runtime_cfg.client_id}] Loaded latest checkpoint <- {latest_path}", flush=True)
-            return int(epoch or 0)
+            return int((extra or {}).get("epoch", 0) or 0)
         print(f"[Client {self.runtime_cfg.client_id}] No compatible checkpoint - random init.", flush=True)
         return 0
 
@@ -407,17 +334,128 @@ class ClusteredClientRunner:
             y = y.squeeze(-1)
         return X, y
 
-    def _pack_payload(self, client_id: str, activations: torch.Tensor, targets: Optional[torch.Tensor]) -> bytes:
+    def _pack_payload(
+        self,
+        client_id: str,
+        activations: torch.Tensor,
+        targets: Optional[torch.Tensor],
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> bytes:
         payload = {"client_id": str(client_id), "activations": activations.detach().cpu()}
         if targets is not None:
             payload["targets"] = targets.detach().cpu()
+        if meta:
+            payload.update(meta)
         return pickle.dumps(payload)
 
-    def _post_pickle(self, url: str, data: bytes):
-        resp = self.session.post(url, data=data, timeout=120.0)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
-        return pickle.loads(resp.content)
+    def _append_comm_row(self, row: Dict[str, Any]) -> None:
+        append_comm_row(self.comm_log_path, row)
+
+    def _post_pickle(self, url: str, data: bytes, *, log_meta: Optional[Dict[str, Any]] = None):
+        route = "/" + url.rstrip("/").split("/")[-1]
+        t0 = time.perf_counter()
+        response_bytes = None
+        latency_ms = None
+        status = "ok"
+        result = None
+        try:
+            resp = self.session.post(url, data=data, timeout=120.0)
+            response_bytes = len(resp.content)
+            latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+            if resp.status_code >= 400:
+                status = f"http_{resp.status_code}"
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+            result = pickle.loads(resp.content)
+            if log_meta and log_meta.get("log_enabled", False):
+                upload_MBps, upload_Mbps = calc_bandwidth(len(data), latency_ms)
+                download_MBps, download_Mbps = calc_bandwidth(response_bytes, latency_ms)
+                base_row = {
+                    "level": "split",
+                    "observer": "client",
+                    "cluster_id": self.runtime_cfg.cluster_id,
+                    "client_id": self.runtime_cfg.client_id,
+                    "scheduler_epoch": log_meta.get("scheduler_epoch"),
+                    "local_epoch": log_meta.get("local_epoch"),
+                    "round_id": log_meta.get("round_id"),
+                    "batch_id": log_meta.get("batch_id"),
+                    "event": log_meta.get("event"),
+                    "route": route,
+                    "status": status,
+                    "activation_shape": log_meta.get("activation_shape"),
+                    "activation_bytes": log_meta.get("activation_bytes"),
+                    "target_bytes": log_meta.get("target_bytes"),
+                    "loss": result.get("loss") if isinstance(result, dict) else None,
+                }
+                self._append_comm_row(
+                    {
+                        **base_row,
+                        "direction": "client_to_server",
+                        "payload_type": log_meta.get("request_payload_type"),
+                        "payload_shape": log_meta.get("activation_shape"),
+                        "payload_bytes": len(data),
+                        "latency_ms": latency_ms,
+                        "bandwidth_MBps": upload_MBps,
+                        "bandwidth_Mbps": upload_Mbps,
+                    }
+                )
+                response_payload_type = log_meta.get("response_payload_type")
+                grad = result.get("grad_activations") if isinstance(result, dict) else None
+                grad_shape = tensor_shape(grad)
+                grad_bytes = tensor_nbytes(grad)
+                response_shape = grad_shape
+                if response_payload_type == "prediction_payload" and isinstance(result, dict):
+                    preds = result.get("predictions")
+                    if preds is not None:
+                        try:
+                            response_shape = f"{len(preds)}"
+                        except Exception:
+                            response_shape = None
+                self._append_comm_row(
+                    {
+                        **base_row,
+                        "direction": "server_to_client",
+                        "payload_type": response_payload_type,
+                        "payload_shape": response_shape,
+                        "payload_bytes": response_bytes,
+                        "response_payload_bytes": response_bytes,
+                        "grad_shape": grad_shape,
+                        "grad_bytes": grad_bytes,
+                        "latency_ms": latency_ms,
+                        "bandwidth_MBps": download_MBps,
+                        "bandwidth_Mbps": download_Mbps,
+                    }
+                )
+            return result
+        except Exception:
+            if log_meta and log_meta.get("log_enabled", False):
+                latency_ms = round((time.perf_counter() - t0) * 1000.0, 3) if latency_ms is None else latency_ms
+                upload_MBps, upload_Mbps = calc_bandwidth(len(data), latency_ms)
+                self._append_comm_row(
+                    {
+                        "level": "split",
+                        "observer": "client",
+                        "cluster_id": self.runtime_cfg.cluster_id,
+                        "client_id": self.runtime_cfg.client_id,
+                        "scheduler_epoch": log_meta.get("scheduler_epoch"),
+                        "local_epoch": log_meta.get("local_epoch"),
+                        "round_id": log_meta.get("round_id"),
+                        "batch_id": log_meta.get("batch_id"),
+                        "event": log_meta.get("event"),
+                        "route": route,
+                        "direction": "client_to_server",
+                        "payload_type": log_meta.get("request_payload_type"),
+                        "payload_shape": log_meta.get("activation_shape"),
+                        "payload_bytes": len(data),
+                        "activation_shape": log_meta.get("activation_shape"),
+                        "activation_bytes": log_meta.get("activation_bytes"),
+                        "target_bytes": log_meta.get("target_bytes"),
+                        "latency_ms": latency_ms,
+                        "bandwidth_MBps": upload_MBps,
+                        "bandwidth_Mbps": upload_Mbps,
+                        "status": "error",
+                    }
+                )
+            raise
 
     def _inverse_tensor(self, arr: np.ndarray) -> np.ndarray:
         if not self.norm_stats or not bool(self.norm_stats.get("normalize", False)):
@@ -447,15 +485,33 @@ class ClusteredClientRunner:
         return {"mse": mse, "mae": mae, "rmse": rmse, "r2": r2, "smape": smape}
 
     def _save_best_pair(self, epoch: int) -> None:
-        save_torch_checkpoint(self.client_model, self.optimizer, epoch, client_best_checkpoint_path(self.runtime_cfg.cluster_id, self.runtime_cfg.client_id))
+        save_torch_checkpoint(
+            self.client_model,
+            self.optimizer,
+            client_best_checkpoint_path(self.runtime_cfg.cluster_id, self.runtime_cfg.client_id),
+            extra={"epoch": epoch},
+            log_prefix="Client",
+        )
         resp = self.session.post(f"{self.current_server_url}/save_best_checkpoint", timeout=30.0)
         resp.raise_for_status()
 
     def _save_latest(self, epoch: int) -> None:
-        save_torch_checkpoint(self.client_model, self.optimizer, epoch, client_checkpoint_path(self.runtime_cfg.cluster_id, self.runtime_cfg.client_id))
+        save_torch_checkpoint(
+            self.client_model,
+            self.optimizer,
+            client_checkpoint_path(self.runtime_cfg.cluster_id, self.runtime_cfg.client_id),
+            extra={"epoch": epoch},
+            log_prefix="Client",
+        )
 
     def _save_final(self, epoch: int) -> None:
-        save_torch_checkpoint(self.client_model, self.optimizer, epoch, client_final_checkpoint_path(self.runtime_cfg.cluster_id, self.runtime_cfg.client_id))
+        save_torch_checkpoint(
+            self.client_model,
+            self.optimizer,
+            client_final_checkpoint_path(self.runtime_cfg.cluster_id, self.runtime_cfg.client_id),
+            extra={"epoch": epoch},
+            log_prefix="Client",
+        )
 
     def _run_eval(self, mode: str, epoch: Optional[int] = None, save_json_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
         if mode not in {"val", "test"}:
@@ -470,17 +526,51 @@ class ClusteredClientRunner:
         num_batches = 0
         num_samples = 0
         with torch.no_grad():
+            batch_idx = 0
             for X, y in loader:
+                batch_idx += 1
                 X, y = self._prepare_batch_for_lstm(X, y)
                 activations = self.client_model(X)
                 if activations.dim() == 3:
                     activations = activations[:, -1, :]
+                log_enabled = self.comm_log_eval and should_log_index(batch_idx, self.comm_log_every_n_batches)
+                log_meta = {
+                    "log_enabled": log_enabled,
+                    "scheduler_epoch": epoch,
+                    "local_epoch": epoch,
+                    "round_id": None,
+                    "batch_id": batch_idx,
+                    "event": "validate_step" if mode == "val" else "inference_step",
+                    "request_payload_type": "validation_payload" if mode == "val" else "inference_payload",
+                    "response_payload_type": "prediction_payload",
+                    "activation_shape": tensor_shape(activations),
+                    "activation_bytes": tensor_nbytes(activations),
+                    "target_bytes": tensor_nbytes(y) if mode == "val" else None,
+                }
                 if mode == "val":
-                    result = self._post_pickle(f"{self.current_server_url}{route}", self._pack_payload(self.runtime_cfg.client_id, activations, y))
+                    result = self._post_pickle(
+                        f"{self.current_server_url}{route}",
+                        self._pack_payload(
+                            self.runtime_cfg.client_id,
+                            activations,
+                            y,
+                            meta={"scheduler_epoch": epoch, "local_epoch": epoch, "batch_id": batch_idx},
+                        ),
+                        log_meta=log_meta,
+                    )
                     total_server_loss += float(result["loss"])
                     batch_preds = np.asarray(result["predictions"], dtype=np.float32)
                 else:
-                    result = self._post_pickle(f"{self.current_server_url}{route}", self._pack_payload(self.runtime_cfg.client_id, activations, None))
+                    result = self._post_pickle(
+                        f"{self.current_server_url}{route}",
+                        self._pack_payload(
+                            self.runtime_cfg.client_id,
+                            activations,
+                            None,
+                            meta={"scheduler_epoch": epoch, "local_epoch": epoch, "batch_id": batch_idx},
+                        ),
+                        log_meta=log_meta,
+                    )
                     batch_preds = np.asarray(result["predictions"], dtype=np.float32)
                 batch_true = y.detach().cpu().numpy().astype(np.float32)
                 preds_norm.append(batch_preds.reshape(-1, 1))
@@ -573,6 +663,8 @@ class ClusteredClientRunner:
     def _train_single_batch(self, X: torch.Tensor, y: torch.Tensor) -> float:
         X, y = self._prepare_batch_for_lstm(X, y)
         self.optimizer.zero_grad(set_to_none=True)
+        local_epoch = int(self.progress.get("completed_epochs", 0)) + 1
+        batch_id = int(self.progress.get("current_epoch_batch_count", 0)) + 1
 
         use_cudnn = not (self.device.type == "cuda")
         with torch.backends.cudnn.flags(enabled=use_cudnn):
@@ -581,7 +673,25 @@ class ClusteredClientRunner:
                 activations = activations[:, -1, :]
             result = self._post_pickle(
                 f"{self.current_server_url}/train_step",
-                self._pack_payload(self.runtime_cfg.client_id, activations, y),
+                self._pack_payload(
+                    self.runtime_cfg.client_id,
+                    activations,
+                    y,
+                    meta={"scheduler_epoch": local_epoch, "local_epoch": local_epoch, "batch_id": batch_id},
+                ),
+                log_meta={
+                    "log_enabled": self.comm_log_train and should_log_index(batch_id, self.comm_log_every_n_batches),
+                    "scheduler_epoch": local_epoch,
+                    "local_epoch": local_epoch,
+                    "round_id": None,
+                    "batch_id": batch_id,
+                    "event": "train_step",
+                    "request_payload_type": "activation_payload",
+                    "response_payload_type": "gradient_payload",
+                    "activation_shape": tensor_shape(activations),
+                    "activation_bytes": tensor_nbytes(activations),
+                    "target_bytes": tensor_nbytes(y),
+                },
             )
             loss = float(result["loss"])
             if not math.isfinite(loss):
@@ -702,7 +812,13 @@ class ClusteredClientRunner:
 
         ok = False
         for client_path in client_paths:
-            _, ok = try_load_model_checkpoint(self.client_model, None, client_path)
+            _, ok = try_load_torch_checkpoint(
+                self.client_model,
+                None,
+                client_path,
+                strict=True,
+                log_prefix="Client",
+            )
             if ok:
                 break
         if not ok:

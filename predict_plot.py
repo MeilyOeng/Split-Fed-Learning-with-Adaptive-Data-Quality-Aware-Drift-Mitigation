@@ -79,16 +79,6 @@ def parse_csv_ids(raw: Optional[str]) -> Optional[List[str]]:
     return [x.strip() for x in str(raw).split(",") if x.strip()]
 
 
-def default_report_dir_for_output(output_dir: Path) -> Path:
-    name = output_dir.name.strip()
-    if name == "output":
-        return Path("report")
-    if name.startswith("output-"):
-        return Path("report-" + name[len("output-"):])
-    if name.startswith("output"):
-        return Path(name.replace("output", "report", 1))
-    return Path(f"report-{name}")
-
 
 def resolve_input_path(
     project_root: Path,
@@ -1265,7 +1255,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run local prediction and fairness analysis from saved split-learning checkpoints.")
     p.add_argument("--project-root", type=Path, default=Path("."), help="Project root containing dataset/ and output/")
     p.add_argument("--dataset-dir", type=Path, default=Path("dataset"), help="Dataset directory")
-    p.add_argument("--output-dir", type=Path, default=Path("output-fedavg-30EP5LEP"), help="Training output directory")
+    p.add_argument("--output-dir", type=Path, default=Path("output-new-best"), help="Training output directory")
     p.add_argument("--test-report", type=Path, default=None, help="Per-client split-learning test report CSV. Defaults to output/results/test_report.csv with fallbacks.")
     p.add_argument("--baseline-report", type=Path, default=None, help="Baseline LSTM metrics CSV. Defaults to dataset/lstm_results_updated.csv with fallbacks.")
     p.add_argument("--assignments-path", type=Path, default=Path("dataset") / "cluster-assignment.csv", help="Cluster assignment CSV used to map baseline rows to clusters.")
@@ -1309,8 +1299,7 @@ def main() -> int:
         if args.assignments_path.is_absolute()
         else (project_root / args.assignments_path).resolve()
     )
-    report_dir_arg = args.report_dir if args.report_dir is not None else default_report_dir_for_output(output_dir)
-    report_dir = (project_root / report_dir_arg).resolve()
+    report_dir = (output_dir / "predictions_plots").resolve()
     plots_dir = report_dir / "plots"
     predictions_dir = report_dir / "predictions"
     rankings_dir = report_dir / "rankings"

@@ -2,6 +2,8 @@
 import os
 import pickle
 import sys
+import time
+import json
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -14,55 +16,20 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from models.split_lstm import LSTMConfig, build_split_lstm
+from models.split_lstm import build_split_lstm
+from utils.comm_logging import append_comm_row, calc_bandwidth, tensor_nbytes, tensor_shape
+from utils.runtime_utils import (
+    _get_env,
+    build_lstm_config_from_env,
+    get_device_info,
+    parse_bool,
+    resolve_device,
+    save_torch_checkpoint,
+    try_load_torch_checkpoint,
+)
 
 
 app = Flask(__name__)
-
-
-def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
-    val = os.environ.get(name)
-    if val is None or val.strip() == "":
-        return default
-    return val
-
-
-def parse_bool(val: str) -> bool:
-    return str(val).strip().lower() in ("1", "true", "yes", "y")
-
-
-def resolve_device() -> torch.device:
-    gpu_enabled = parse_bool(_get_env("GPU_ENABLED", "true"))
-    gpu_id = _get_env("GPU_ID", "")
-    if gpu_enabled and torch.cuda.is_available():
-        if gpu_id not in (None, ""):
-            return torch.device(f"cuda:{gpu_id}")
-        return torch.device("cuda")
-    return torch.device("cpu")
-
-
-def get_device_info(device: torch.device) -> Dict[str, Any]:
-    info: Dict[str, Any] = {
-        "selected_device": str(device),
-        "gpu_enabled": parse_bool(_get_env("GPU_ENABLED", "true")),
-        "gpu_id_env": _get_env("GPU_ID", ""),
-        "cuda_visible_devices": _get_env("CUDA_VISIBLE_DEVICES", ""),
-        "cuda_available": torch.cuda.is_available(),
-        "cuda_device_count": torch.cuda.device_count(),
-        "process_role": _get_env("PROCESS_ROLE", "server"),
-    }
-    if device.type == "cuda" and torch.cuda.is_available():
-        idx = device.index if device.index is not None else torch.cuda.current_device()
-        props = torch.cuda.get_device_properties(idx)
-        info.update(
-            {
-                "cuda_index": idx,
-                "cuda_name": torch.cuda.get_device_name(idx),
-                "cuda_capability": f"{props.major}.{props.minor}",
-                "cuda_total_memory_gb": round(props.total_memory / (1024 ** 3), 3),
-            }
-        )
-    return info
 
 
 def server_output_dir(cluster_id: str) -> str:
@@ -75,29 +42,8 @@ def server_checkpoint_path(cluster_id: str, filename: str) -> str:
     return os.path.join(server_output_dir(cluster_id), f"server_{filename}")
 
 
-def save_torch_checkpoint(model: nn.Module, optimizer: optim.Optimizer, path: str, extra: Optional[Dict[str, Any]] = None) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    payload = {"model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict()}
-    if extra:
-        payload.update(extra)
-    torch.save(payload, path)
-    print(f"[Server] Saved -> {path}", flush=True)
-
-
-def try_load_server_checkpoint(model: nn.Module, optimizer: Optional[optim.Optimizer], path: str, map_location: str = "cpu") -> Tuple[Optional[Dict[str, Any]], bool]:
-    if not os.path.exists(path):
-        return None, False
-    try:
-        checkpoint = torch.load(path, map_location=map_location)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        if optimizer is not None and "optimizer_state_dict" in checkpoint:
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        print(f"[Server] Loaded <- {path}", flush=True)
-        extra = {k: v for k, v in checkpoint.items() if k not in ("model_state_dict", "optimizer_state_dict")}
-        return extra, True
-    except Exception as e:
-        print(f"[Server] WARNING: skipping incompatible checkpoint {path}: {e}", flush=True)
-        return None, False
+def server_comm_log_path(cluster_id: str) -> str:
+    return os.path.join(server_output_dir(cluster_id), "server_comm.csv")
 
 
 @dataclass
@@ -119,21 +65,16 @@ class SplitLearningServerState:
             output_dir=_get_env("OUTPUT_DIR", server_output_dir(_get_env("CLUSTER_ID", "0"))),
         )
         self.device = resolve_device()
-        self.device_info = get_device_info(self.device)
-        cfg = LSTMConfig(
-            input_size=int(_get_env("MODEL_INPUT_SIZE", "1")),
-            hidden_size=int(_get_env("MODEL_HIDDEN_SIZE", "128")),
-            num_layers=int(_get_env("MODEL_NUM_LAYERS", "3")),
-            output_size=int(_get_env("MODEL_OUTPUT_SIZE", "1")),
-            dropout=float(_get_env("MODEL_DROPOUT", "0.4")),
-            bidirectional=parse_bool(_get_env("MODEL_BIDIRECTIONAL", "false")),
-        )
-        split_layer = int(_get_env("MODEL_SPLIT_LAYER", "2"))
+        self.device_info = get_device_info(self.device, process_role_default="server")
+        cfg, split_layer = build_lstm_config_from_env()
         _, server_model = build_split_lstm(cfg, split_layer)
         self.model = server_model.to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.runtime_cfg.learning_rate)
         self.criterion = nn.MSELoss()
         self.lock = Lock()
+        self.comm_log_train = parse_bool(_get_env("COMM_LOG_TRAIN", "true"))
+        self.comm_log_eval = parse_bool(_get_env("COMM_LOG_EVAL", "false"))
+        self.comm_log_path = server_comm_log_path(self.runtime_cfg.cluster_id)
 
         self.global_step = 0
         self.optimizer_step_count = 0
@@ -145,7 +86,14 @@ class SplitLearningServerState:
         self.round_contrib_count = 0
         # try loading latest checkpoint on startup
         latest_path = server_checkpoint_path(self.runtime_cfg.cluster_id, "latest.pt") 
-        extra, ok = try_load_server_checkpoint(self.model, self.optimizer, latest_path, map_location=str(self.device))
+        extra, ok = try_load_torch_checkpoint(
+            self.model,
+            self.optimizer,
+            latest_path,
+            map_location=str(self.device),
+            strict=True,
+            log_prefix="Server",
+        )
         if ok and extra:
             self.global_step = int(extra.get("global_step", 0))
             self.optimizer_step_count = int(extra.get("optimizer_step_count", 0))
@@ -157,6 +105,9 @@ class SplitLearningServerState:
             f"server_lr={self.runtime_cfg.learning_rate} accum_steps_target={self.runtime_cfg.accum_steps_target} output_dir={self.runtime_cfg.output_dir}",
             flush=True,
         )
+
+    def _append_comm_row(self, row: Dict[str, Any]) -> None:
+        append_comm_row(self.comm_log_path, row)
 
     @staticmethod
     def _ensure_lstm_input_3d(x: torch.Tensor) -> torch.Tensor:
@@ -317,27 +268,34 @@ class SplitLearningServerState:
         if flush:
             self._flush_before_eval_if_needed(reason="save_latest")
         path = server_checkpoint_path(self.runtime_cfg.cluster_id, "latest.pt")
-        save_torch_checkpoint(self.model, self.optimizer, path, extra=self._checkpoint_extra())
+        save_torch_checkpoint(self.model, self.optimizer, path, extra=self._checkpoint_extra(), log_prefix="Server")
         return path
 
     def _save_best(self, flush: bool = True) -> str:
         if flush:
             self._flush_before_eval_if_needed(reason="save_best")
         path = server_checkpoint_path(self.runtime_cfg.cluster_id, "best.pt")
-        save_torch_checkpoint(self.model, self.optimizer, path, extra=self._checkpoint_extra())
+        save_torch_checkpoint(self.model, self.optimizer, path, extra=self._checkpoint_extra(), log_prefix="Server")
         return path
 
     def _save_final(self, flush: bool = True) -> str:
         if flush:
             self._flush_before_eval_if_needed(reason="save_final")
         path = server_checkpoint_path(self.runtime_cfg.cluster_id, "final.pt")
-        save_torch_checkpoint(self.model, self.optimizer, path, extra=self._checkpoint_extra())
+        save_torch_checkpoint(self.model, self.optimizer, path, extra=self._checkpoint_extra(), log_prefix="Server")
         return path
 
     def _load_best(self) -> str:
         self._flush_before_eval_if_needed(reason="load_best")
         path = server_checkpoint_path(self.runtime_cfg.cluster_id, "best.pt")
-        extra, ok = try_load_server_checkpoint(self.model, self.optimizer, path, map_location=str(self.device))
+        extra, ok = try_load_torch_checkpoint(
+            self.model,
+            self.optimizer,
+            path,
+            map_location=str(self.device),
+            strict=True,
+            log_prefix="Server",
+        )
         if not ok:
             raise FileNotFoundError(path)
         if extra:
@@ -351,7 +309,14 @@ class SplitLearningServerState:
     def _load_latest(self) -> str:
         self._flush_before_eval_if_needed(reason="load_latest")
         latest_path = server_checkpoint_path(self.runtime_cfg.cluster_id, "latest.pt")
-        extra, ok = try_load_server_checkpoint(self.model, self.optimizer, latest_path, map_location=str(self.device))
+        extra, ok = try_load_torch_checkpoint(
+            self.model,
+            self.optimizer,
+            latest_path,
+            map_location=str(self.device),
+            strict=True,
+            log_prefix="Server",
+        )
         if not ok:
             raise FileNotFoundError(latest_path)
         if extra:
@@ -367,7 +332,14 @@ class SplitLearningServerState:
         final_path = server_checkpoint_path(self.runtime_cfg.cluster_id, "final.pt")
         latest_path = server_checkpoint_path(self.runtime_cfg.cluster_id, "latest.pt")
         target = final_path if os.path.exists(final_path) else latest_path                  # fallback to latest if final doesn't exist
-        extra, ok = try_load_server_checkpoint(self.model, self.optimizer, target, map_location=str(self.device))
+        extra, ok = try_load_torch_checkpoint(
+            self.model,
+            self.optimizer,
+            target,
+            map_location=str(self.device),
+            strict=True,
+            log_prefix="Server",
+        )
         if not ok:
             raise FileNotFoundError(target)
         if extra:
@@ -448,6 +420,8 @@ def round_state():
 
 @app.route("/train_step", methods=["POST"])
 def train_step():
+    request_bytes = len(request.get_data(cache=True) or b"")
+    t0 = time.perf_counter()
     with state.lock:
         try:
             payload = _unpickle_request_data()
@@ -456,13 +430,73 @@ def train_step():
                 activations_cpu=payload["activations"],
                 targets_cpu=payload["targets"],
             )
-            return _pickle_response(result)
+            response_blob = pickle.dumps(result)
+            latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+            upload_MBps, upload_Mbps = calc_bandwidth(request_bytes, latency_ms)
+            download_MBps, download_Mbps = calc_bandwidth(len(response_blob), latency_ms)
+            if state.comm_log_train:
+                state._append_comm_row(
+                    {
+                        "level": "split",
+                        "observer": "server",
+                        "cluster_id": state.runtime_cfg.cluster_id,
+                        "client_id": str(payload["client_id"]),
+                        "scheduler_epoch": payload.get("scheduler_epoch"),
+                        "local_epoch": payload.get("local_epoch"),
+                        "round_id": result.get("finished_round_id", result.get("round_id")),
+                        "batch_id": payload.get("batch_id"),
+                        "event": "train_step",
+                        "route": "/train_step",
+                        "direction": "server_process",
+                        "payload_type": "activation_payload",
+                        "payload_shape": tensor_shape(payload.get("activations")),
+                        "payload_bytes": request_bytes,
+                        "latency_ms": latency_ms,
+                        "bandwidth_MBps": upload_MBps,
+                        "bandwidth_Mbps": upload_Mbps,
+                        "status": "ok",
+                        "activation_shape": tensor_shape(payload.get("activations")),
+                        "activation_bytes": tensor_nbytes(payload.get("activations")),
+                        "target_bytes": tensor_nbytes(payload.get("targets")),
+                        "response_payload_bytes": len(response_blob),
+                        "grad_shape": tensor_shape(result.get("grad_activations")),
+                        "grad_bytes": tensor_nbytes(result.get("grad_activations")),
+                        "loss": result.get("loss"),
+                        "round_complete": bool(result.get("round_complete")),
+                        "flush_triggered": bool(result.get("flush_info")),
+                        "effective_accum_steps": (
+                            result.get("flush_info", {}) or {}
+                        ).get("effective_accum_steps"),
+                        "server_compute_time_ms": latency_ms,
+                    }
+                )
+            return Response(response_blob, content_type="application/octet-stream")
         except Exception as e:
+            if state.comm_log_train:
+                latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+                state._append_comm_row(
+                    {
+                        "level": "split",
+                        "observer": "server",
+                        "cluster_id": state.runtime_cfg.cluster_id,
+                        "client_id": None,
+                        "event": "train_step",
+                        "route": "/train_step",
+                        "direction": "server_process",
+                        "payload_type": "activation_payload",
+                        "payload_bytes": request_bytes,
+                        "latency_ms": latency_ms,
+                        "status": f"error:{type(e).__name__}",
+                        "server_compute_time_ms": latency_ms,
+                    }
+                )
             return jsonify({"error": str(e), **state.round_state()}), 409
 
 
 @app.route("/validate_step", methods=["POST"])
 def validate_step():
+    request_bytes = len(request.get_data(cache=True) or b"")
+    t0 = time.perf_counter()
     with state.lock:
         payload = _unpickle_request_data()
         result = state.validate_step(
@@ -470,17 +504,79 @@ def validate_step():
             payload["activations"], 
             payload["targets"]
         )
-        return _pickle_response(result)
+        response_blob = pickle.dumps(result)
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+        if state.comm_log_eval:
+            upload_MBps, upload_Mbps = calc_bandwidth(request_bytes, latency_ms)
+            state._append_comm_row(
+                {
+                    "level": "split",
+                    "observer": "server",
+                    "cluster_id": state.runtime_cfg.cluster_id,
+                    "client_id": str(payload["client_id"]),
+                    "scheduler_epoch": payload.get("scheduler_epoch"),
+                    "local_epoch": payload.get("local_epoch"),
+                    "batch_id": payload.get("batch_id"),
+                    "event": "validate_step",
+                    "route": "/validate_step",
+                    "direction": "server_process",
+                    "payload_type": "validation_payload",
+                    "payload_shape": tensor_shape(payload.get("activations")),
+                    "payload_bytes": request_bytes,
+                    "latency_ms": latency_ms,
+                    "bandwidth_MBps": upload_MBps,
+                    "bandwidth_Mbps": upload_Mbps,
+                    "status": "ok",
+                    "activation_shape": tensor_shape(payload.get("activations")),
+                    "activation_bytes": tensor_nbytes(payload.get("activations")),
+                    "target_bytes": tensor_nbytes(payload.get("targets")),
+                    "response_payload_bytes": len(response_blob),
+                    "loss": result.get("loss"),
+                    "server_compute_time_ms": latency_ms,
+                }
+            )
+        return Response(response_blob, content_type="application/octet-stream")
 
 
 @app.route("/inference_step", methods=["POST"])
 def inference_step():
+    request_bytes = len(request.get_data(cache=True) or b"")
+    t0 = time.perf_counter()
     with state.lock:
         payload = _unpickle_request_data()
         result = state.inference_step(
             str(payload["client_id"]), 
             payload["activations"])
-        return _pickle_response(result)
+        response_blob = pickle.dumps(result)
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+        if state.comm_log_eval:
+            upload_MBps, upload_Mbps = calc_bandwidth(request_bytes, latency_ms)
+            state._append_comm_row(
+                {
+                    "level": "split",
+                    "observer": "server",
+                    "cluster_id": state.runtime_cfg.cluster_id,
+                    "client_id": str(payload["client_id"]),
+                    "scheduler_epoch": payload.get("scheduler_epoch"),
+                    "local_epoch": payload.get("local_epoch"),
+                    "batch_id": payload.get("batch_id"),
+                    "event": "inference_step",
+                    "route": "/inference_step",
+                    "direction": "server_process",
+                    "payload_type": "inference_payload",
+                    "payload_shape": tensor_shape(payload.get("activations")),
+                    "payload_bytes": request_bytes,
+                    "latency_ms": latency_ms,
+                    "bandwidth_MBps": upload_MBps,
+                    "bandwidth_Mbps": upload_Mbps,
+                    "status": "ok",
+                    "activation_shape": tensor_shape(payload.get("activations")),
+                    "activation_bytes": tensor_nbytes(payload.get("activations")),
+                    "response_payload_bytes": len(response_blob),
+                    "server_compute_time_ms": latency_ms,
+                }
+            )
+        return Response(response_blob, content_type="application/octet-stream")
 
 
 @app.route("/flush_gradients", methods=["POST"])
@@ -534,10 +630,34 @@ def load_final_checkpoint():
 
 @app.route("/load_weights", methods=["POST"])
 def load_weights():
+    request_bytes = len(request.get_data(cache=True) or b"")
+    t0 = time.perf_counter()
     with state.lock:
         payload = _unpickle_request_data()
         meta = state.load_weights(payload["model_state_dict"])
-        return jsonify({"status": "ok", **meta})
+        response_body = {"status": "ok", **meta}
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+        state._append_comm_row(
+            {
+                "level": "fed",
+                "observer": "server",
+                "cluster_id": state.runtime_cfg.cluster_id,
+                "event": "load_weights",
+                "route": "/load_weights",
+                "direction": "fed_to_server",
+                "payload_type": "avg_server_weights",
+                "payload_bytes": request_bytes,
+                "response_payload_bytes": len(json.dumps(response_body).encode("utf-8")),
+                "latency_ms": latency_ms,
+                "bandwidth_MBps": calc_bandwidth(request_bytes, latency_ms)[0],
+                "bandwidth_Mbps": calc_bandwidth(request_bytes, latency_ms)[1],
+                "status": "ok",
+                "num_tensors": len(payload["model_state_dict"]),
+                "num_parameters": sum(int(v.numel()) for v in payload["model_state_dict"].values()),
+                "server_compute_time_ms": latency_ms,
+            }
+        )
+        return jsonify(response_body)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import os
 import pickle
 import sys
 import threading
+import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -11,6 +12,7 @@ from typing import Dict, List, Optional, Tuple
 import requests
 import torch
 from flask import Flask, jsonify, request
+from utils.comm_logging import append_comm_row, calc_bandwidth
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
@@ -34,6 +36,8 @@ class RoundRecord:
     output_path:      str
     client_output:    Optional[str]
     duration_sec:     float
+    global_model_bytes: Optional[int] = None
+    fedavg_compute_time_ms: Optional[float] = None
     error:            Optional[str] = None
 
 
@@ -114,7 +118,22 @@ def _load_client_ids(
 # Server communication helpers
 # ---------------------------------------------------------------------------
 
-def _force_server_checkpoint(server_url: str) -> bool:
+def _fedavg_comm_log_path(checkpoint_dir: str) -> str:
+    return os.path.join(checkpoint_dir, "global", "fedavg_comm.csv")
+
+
+def _append_fed_row(log_path: str, row: Dict[str, object]) -> None:
+    append_comm_row(log_path, row)
+
+
+def _state_dict_stats(state_dict: Dict[str, torch.Tensor]) -> Tuple[int, int]:
+    return len(state_dict), sum(int(v.numel()) for v in state_dict.values())
+
+
+def _serialized_model_bytes(state_dict: Dict[str, torch.Tensor]) -> int:
+    return len(pickle.dumps({"model_state_dict": state_dict}))
+
+def _force_server_checkpoint(server_url: str, log_path: str, cluster_id: str) -> bool:
     """
     Ask a cluster server to flush its current weights to disk right now.
 
@@ -123,21 +142,59 @@ def _force_server_checkpoint(server_url: str) -> bool:
     steps stale. This call guarantees the checkpoint is epoch-fresh before
     fedavg reads it from disk.
     """
+    t0 = time.perf_counter()
     try:
         resp = requests.post(
             server_url.rstrip("/") + "/save_latest_checkpoint", timeout=10.0
         )
         resp.raise_for_status()
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
         body = resp.json()
+        response_bytes = len(resp.content)
+        download_MBps, download_Mbps = calc_bandwidth(response_bytes, latency_ms)
+        _append_fed_row(
+            log_path,
+            {
+                "level": "fed",
+                "observer": "fedavg",
+                "cluster_id": cluster_id,
+                "event": "force_server_checkpoint",
+                "route": "/save_latest_checkpoint",
+                "direction": "fed_to_server_control",
+                "payload_type": "checkpoint_request",
+                "payload_bytes": 0,
+                "response_payload_bytes": response_bytes,
+                "latency_ms": latency_ms,
+                "bandwidth_MBps": download_MBps,
+                "bandwidth_Mbps": download_Mbps,
+                "status": "ok",
+            },
+        )
         print(f"[FedServer]   checkpoint saved on {server_url} "
               f"(path={body.get('path','?')})")
         return True
     except Exception as e:
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+        _append_fed_row(
+            log_path,
+            {
+                "level": "fed",
+                "observer": "fedavg",
+                "cluster_id": cluster_id,
+                "event": "force_server_checkpoint",
+                "route": "/save_latest_checkpoint",
+                "direction": "fed_to_server_control",
+                "payload_type": "checkpoint_request",
+                "payload_bytes": 0,
+                "latency_ms": latency_ms,
+                "status": f"error:{type(e).__name__}",
+            },
+        )
         print(f"[FedServer]   WARNING: could not force checkpoint on {server_url}: {e}")
         return False
 
 
-def _push_weights(server_url: str, state_dict: Dict[str, torch.Tensor]) -> bool:
+def _push_weights(server_url: str, state_dict: Dict[str, torch.Tensor], log_path: str, cluster_id: str) -> bool:
     """
     POST averaged weights to a cluster server's /load_weights endpoint.
 
@@ -145,8 +202,10 @@ def _push_weights(server_url: str, state_dict: Dict[str, torch.Tensor]) -> bool:
     next training batch uses the globally averaged starting point.
     Without this push, servers only benefit from FedAvg after a restart.
     """
+    payload = pickle.dumps({"model_state_dict": state_dict})
+    num_tensors, num_parameters = _state_dict_stats(state_dict)
+    t0 = time.perf_counter()
     try:
-        payload = pickle.dumps({"model_state_dict": state_dict})
         resp    = requests.post(
             server_url.rstrip("/") + "/load_weights",
             data    = payload,
@@ -154,11 +213,50 @@ def _push_weights(server_url: str, state_dict: Dict[str, torch.Tensor]) -> bool:
             timeout = 30.0,
         )
         resp.raise_for_status()
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
         body = resp.json()
+        upload_MBps, upload_Mbps = calc_bandwidth(len(payload), latency_ms)
+        _append_fed_row(
+            log_path,
+            {
+                "level": "fed",
+                "observer": "fedavg",
+                "cluster_id": cluster_id,
+                "event": "broadcast_weights",
+                "route": "/load_weights",
+                "direction": "fed_to_server",
+                "payload_type": "avg_server_weights",
+                "payload_bytes": len(payload),
+                "latency_ms": latency_ms,
+                "bandwidth_MBps": upload_MBps,
+                "bandwidth_Mbps": upload_Mbps,
+                "status": "ok",
+                "num_tensors": num_tensors,
+                "num_parameters": num_parameters,
+            },
+        )
         print(f"[FedServer]   weights loaded on {server_url} "
               f"(step={body.get('global_step','?')})")
         return True
     except Exception as e:
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+        _append_fed_row(
+            log_path,
+            {
+                "level": "fed",
+                "observer": "fedavg",
+                "cluster_id": cluster_id,
+                "event": "broadcast_weights",
+                "route": "/load_weights",
+                "direction": "fed_to_server",
+                "payload_type": "avg_server_weights",
+                "payload_bytes": len(payload),
+                "latency_ms": latency_ms,
+                "status": f"error:{type(e).__name__}",
+                "num_tensors": num_tensors,
+                "num_parameters": num_parameters,
+            },
+        )
         print(f"[FedServer]   WARNING: could not push weights to {server_url}: {e}")
         return False
 
@@ -190,6 +288,10 @@ def run_fedavg_round(
     push_ok:   List[str] = []
     push_fail: List[str] = []
     error_msg: Optional[str] = None
+    client_out: Optional[str] = None
+    log_path = _fedavg_comm_log_path(checkpoint_dir)
+    global_model_bytes: Optional[int] = None
+    fedavg_compute_time_ms: Optional[float] = None
 
     weights_list = (
         [cluster_weights.get(cid, 1.0) for cid in cluster_ids]
@@ -203,25 +305,69 @@ def run_fedavg_round(
     try:
         # ── 1. Force checkpoints ─────────────────────────────────────
         print(f"[FedServer] Step 1/4  forcing checkpoints...")
-        for url in server_urls:
-            _force_server_checkpoint(url)
+        for cid, url in zip(cluster_ids, server_urls):
+            _force_server_checkpoint(url, log_path, cid)
 
         # ── 2. Average server weights ────────────────────────────────
         print(f"[FedServer] Step 2/4  averaging server weights for clusters {cluster_ids}...")
         server_states = []
         for cid in cluster_ids:
             path = os.path.join(checkpoint_dir, f"cluster_{cid}", "server_latest.pt")
-            server_states.append(_load_state_dict(path))
+            read_t0 = time.perf_counter()
+            state_dict = _load_state_dict(path)
+            read_ms = round((time.perf_counter() - read_t0) * 1000.0, 3)
+            logical_bytes = _serialized_model_bytes(state_dict)
+            num_tensors, num_parameters = _state_dict_stats(state_dict)
+            upload_MBps, upload_Mbps = calc_bandwidth(logical_bytes, read_ms)
+            _append_fed_row(
+                log_path,
+                {
+                    "level": "fed",
+                    "observer": "fedavg",
+                    "cluster_id": cid,
+                    "event": "load_server_checkpoint",
+                    "direction": "server_to_fed",
+                    "payload_type": "server_weights",
+                    "payload_bytes": logical_bytes,
+                    "latency_ms": read_ms,
+                    "bandwidth_MBps": upload_MBps,
+                    "bandwidth_Mbps": upload_Mbps,
+                    "status": "shared_checkpoint_read",
+                    "num_tensors": num_tensors,
+                    "num_parameters": num_parameters,
+                },
+            )
+            server_states.append(state_dict)
 
+        compute_t0 = time.perf_counter()
         avg_server = _fedavg(server_states, weights=weights_list)
+        fedavg_compute_time_ms = round((time.perf_counter() - compute_t0) * 1000.0, 3)
+        global_model_bytes = _serialized_model_bytes(avg_server)
+        num_tensors, num_parameters = _state_dict_stats(avg_server)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         torch.save({"model_state_dict": avg_server}, output_path)
+        _append_fed_row(
+            log_path,
+            {
+                "level": "fed",
+                "observer": "fedavg",
+                "cluster_id": "global",
+                "event": "fedavg_compute",
+                "direction": "local_compute",
+                "payload_type": "avg_server_weights",
+                "payload_bytes": global_model_bytes,
+                "latency_ms": fedavg_compute_time_ms,
+                "status": "ok",
+                "num_tensors": num_tensors,
+                "num_parameters": num_parameters,
+            },
+        )
         print(f"[FedServer]   global server model → {output_path}")
 
         # ── 3. Push averaged weights back to live servers ────────────
         print(f"[FedServer] Step 3/4  pushing to {len(server_urls)} live server(s)...")
         for cid, url in zip(cluster_ids, server_urls):
-            ok = _push_weights(url, avg_server)
+            ok = _push_weights(url, avg_server, log_path, cid)
             (push_ok if ok else push_fail).append(cid)
 
         if push_fail:
@@ -229,7 +375,6 @@ def run_fedavg_round(
                   f"Those servers will use averaged weights after next restart.")
 
         # ── 4. Average client weights (saved to disk) ────────────────
-        client_out: Optional[str] = None
         if aggregate_clients:
             print(f"[FedServer] Step 4/4  averaging client weights...")
             pairs  = _load_client_ids(assignments_path, cluster_ids)
@@ -279,6 +424,8 @@ def run_fedavg_round(
         output_path      = output_path,
         client_output    = client_out,
         duration_sec     = round(duration, 2),
+        global_model_bytes = global_model_bytes,
+        fedavg_compute_time_ms = fedavg_compute_time_ms,
         error            = error_msg,
     )
 

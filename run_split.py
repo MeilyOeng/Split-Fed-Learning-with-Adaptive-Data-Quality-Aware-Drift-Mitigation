@@ -18,6 +18,8 @@ from typing import Dict, List
 import requests
 from dotenv import find_dotenv, load_dotenv
 from fed_server.fed_server import run_fedavg_round
+from utils.comm_logging import COMM_LOG_FIELDNAMES
+from utils.runtime_utils import parse_bool, read_json, write_csv, write_json
 
 CLIENT_PATH = "client/client.py"
 STREAM_SERVICE_PATH = "data/stream_service.py"
@@ -32,12 +34,6 @@ CLIENT_WORKER_BASE_PORT = 6101
 
 def log(msg: str) -> None:
     print(msg, flush=True)
-
-
-def parse_bool(raw: str | None, default: bool = False) -> bool:
-    if raw is None:
-        return default
-    return str(raw).strip().lower() in ("1", "true", "yes", "y")
 
 
 def ensure_dir(path: Path) -> None:
@@ -108,26 +104,6 @@ def load_client_ids_for_cluster(cluster_id: str, path: Path) -> List[str]:
                 if client_id:
                     client_ids.append(client_id)
     return client_ids
-
-
-def read_json(path: Path):
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def write_json(path: Path, data) -> None:
-    ensure_dir(path.parent)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
-def write_csv(path: Path, rows, fieldnames) -> None:
-    ensure_dir(path.parent)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
 
 
 def _parse_optional_csv(raw: str | None) -> List[str]:
@@ -330,6 +306,189 @@ def safe_mean(values):
             continue
         cleaned.append(fv)
     return (sum(cleaned) / len(cleaned)) if cleaned else None
+
+
+def safe_percentile(values, q: float):
+    cleaned = []
+    for v in values:
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        if math.isnan(fv):
+            continue
+        cleaned.append(fv)
+    if not cleaned:
+        return None
+    cleaned.sort()
+    if len(cleaned) == 1:
+        return cleaned[0]
+    pos = (len(cleaned) - 1) * (q / 100.0)
+    lower = int(math.floor(pos))
+    upper = int(math.ceil(pos))
+    if lower == upper:
+        return cleaned[lower]
+    frac = pos - lower
+    return cleaned[lower] * (1.0 - frac) + cleaned[upper] * frac
+
+
+def safe_sum(values):
+    total = 0.0
+    found = False
+    for v in values:
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        if math.isnan(fv):
+            continue
+        total += fv
+        found = True
+    return total if found else None
+
+
+def read_csv_rows(path: Path):
+    if not path.exists():
+        return []
+    with path.open("r", newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def collect_raw_communication_rows(cluster_ids, cluster_clients):
+    rows = []
+    for cluster_id in cluster_ids:
+        rows.extend(read_csv_rows(cluster_dir(cluster_id) / "server_comm.csv"))
+        rows.extend(read_csv_rows(cluster_dir(cluster_id) / "stream_comm.csv"))
+        for client_id in cluster_clients[cluster_id]:
+            rows.extend(read_csv_rows(cluster_dir(cluster_id) / f"client_{client_id}_comm.csv"))
+    rows.extend(read_csv_rows(OUTPUT_DIR / "global" / "fedavg_comm.csv"))
+    rows.sort(key=lambda row: str(row.get("timestamp", "")))
+    return rows
+
+
+def _match_rows(rows, **filters):
+    out = []
+    for row in rows:
+        ok = True
+        for key, expected in filters.items():
+            if str(row.get(key, "")) != str(expected):
+                ok = False
+                break
+        if ok:
+            out.append(row)
+    return out
+
+
+def _summary_row(category: str, rows, *, cluster_id=None, scheduler_epoch=None, round_id=None):
+    payload_values = [row.get("payload_bytes") for row in rows]
+    latency_values = [row.get("latency_ms") for row in rows]
+    bandwidth_values = [row.get("bandwidth_MBps") for row in rows]
+    return {
+        "category": category,
+        "cluster_id": cluster_id,
+        "scheduler_epoch": scheduler_epoch,
+        "round_id": round_id,
+        "num_rows": len(rows),
+        "total_payload_bytes": safe_sum(payload_values),
+        "avg_latency_ms": safe_mean(latency_values),
+        "median_latency_ms": safe_percentile(latency_values, 50),
+        "p95_latency_ms": safe_percentile(latency_values, 95),
+        "avg_bandwidth_MBps": safe_mean(bandwidth_values),
+        "median_bandwidth_MBps": safe_percentile(bandwidth_values, 50),
+        "p95_bandwidth_MBps": safe_percentile(bandwidth_values, 95),
+    }
+
+
+def build_communication_reports(cluster_ids, cluster_clients):
+    raw_rows = collect_raw_communication_rows(cluster_ids, cluster_clients)
+    if not raw_rows:
+        return raw_rows, [], []
+
+    report_rows = []
+    split_upload_rows = _match_rows(
+        raw_rows,
+        observer="client",
+        direction="client_to_server",
+        payload_type="activation_payload",
+    )
+    split_download_rows = _match_rows(
+        raw_rows,
+        observer="client",
+        direction="server_to_client",
+        payload_type="gradient_payload",
+    )
+    fedavg_upload_rows = _match_rows(
+        raw_rows,
+        observer="fedavg",
+        direction="server_to_fed",
+        payload_type="server_weights",
+    )
+    fedavg_broadcast_rows = _match_rows(
+        raw_rows,
+        observer="fedavg",
+        direction="fed_to_server",
+        payload_type="avg_server_weights",
+    )
+    report_rows.append(_summary_row("split_upload_overall", split_upload_rows))
+    report_rows.append(_summary_row("split_download_overall", split_download_rows))
+    report_rows.append(_summary_row("fedavg_upload_overall", fedavg_upload_rows))
+    report_rows.append(_summary_row("fedavg_broadcast_overall", fedavg_broadcast_rows))
+
+    for cluster_id in cluster_ids:
+        report_rows.append(_summary_row("split_upload_cluster", [r for r in split_upload_rows if str(r.get("cluster_id")) == str(cluster_id)], cluster_id=cluster_id))
+        report_rows.append(_summary_row("split_download_cluster", [r for r in split_download_rows if str(r.get("cluster_id")) == str(cluster_id)], cluster_id=cluster_id))
+
+    epoch_keys = sorted(
+        {
+            str(row.get("scheduler_epoch"))
+            for row in split_upload_rows + split_download_rows
+            if str(row.get("scheduler_epoch", "")).strip() not in {"", "None"}
+        },
+        key=lambda x: int(x),
+    )
+    for scheduler_epoch in epoch_keys:
+        report_rows.append(
+            _summary_row(
+                "split_upload_epoch",
+                [r for r in split_upload_rows if str(r.get("scheduler_epoch")) == scheduler_epoch],
+                scheduler_epoch=scheduler_epoch,
+            )
+        )
+        report_rows.append(
+            _summary_row(
+                "split_download_epoch",
+                [r for r in split_download_rows if str(r.get("scheduler_epoch")) == scheduler_epoch],
+                scheduler_epoch=scheduler_epoch,
+            )
+        )
+
+    fedavg_report_rows = []
+    for event in sorted({str(row.get("event")) for row in fedavg_upload_rows + fedavg_broadcast_rows if row.get("event")}):
+        event_rows = [row for row in fedavg_upload_rows + fedavg_broadcast_rows if str(row.get("event")) == event]
+        fedavg_report_rows.append(_summary_row(f"fedavg_{event}", event_rows))
+
+    server_round_rows = _match_rows(raw_rows, observer="server", event="train_step")
+    round_groups = defaultdict(list)
+    for row in server_round_rows:
+        cluster_id = str(row.get("cluster_id", ""))
+        round_id = str(row.get("round_id", ""))
+        if cluster_id and round_id and round_id not in {"None", ""}:
+            round_groups[(cluster_id, round_id)].append(row)
+    for (cluster_id, round_id), rows in sorted(round_groups.items(), key=lambda item: (int(item[0][0]), int(item[0][1]))):
+        request_bytes = safe_sum([row.get("payload_bytes") for row in rows]) or 0.0
+        response_bytes = safe_sum([row.get("response_payload_bytes") for row in rows]) or 0.0
+        report_rows.append(
+            {
+                **_summary_row("split_round_total", rows, cluster_id=cluster_id, round_id=round_id),
+                "total_payload_bytes": request_bytes + response_bytes,
+            }
+        )
+
+    return raw_rows, report_rows, fedavg_report_rows
 
 
 def compute_cluster_train_summary(rows):
@@ -953,6 +1112,10 @@ def main() -> int:
             "EARLY_STOPPING_PATIENCE": os.environ.get("EARLY_STOPPING_PATIENCE", "15"),
             "EARLY_STOPPING_MIN_DELTA": os.environ.get("EARLY_STOPPING_MIN_DELTA", "0.00001"),
             "EARLY_STOPPING_METRIC": os.environ.get("EARLY_STOPPING_METRIC", "val_raw_mae"),
+            "COMM_LOG_TRAIN": os.environ.get("COMM_LOG_TRAIN", "true"),
+            "COMM_LOG_EVAL": os.environ.get("COMM_LOG_EVAL", "false"),
+            "COMM_LOG_STREAM": os.environ.get("COMM_LOG_STREAM", "false"),
+            "COMM_LOG_EVERY_N_BATCHES": os.environ.get("COMM_LOG_EVERY_N_BATCHES", "1"),
         }
     )
 
@@ -979,6 +1142,10 @@ def main() -> int:
     log(f"Server LR: {env['SERVER_LR']}")
     log(f"Server round chunk size (ACCUM_STEPS_SERVER): {env['ACCUM_STEPS_SERVER']}")
     log(f"Checkpoint every rounds: {env['CHECKPOINT_EVERY_ROUNDS']}")
+    log(
+        f"Communication logging: train={env['COMM_LOG_TRAIN']} eval={env['COMM_LOG_EVAL']} "
+        f"stream={env['COMM_LOG_STREAM']} every_n_batches={env['COMM_LOG_EVERY_N_BATCHES']}"
+    )
     log(f"Cluster parallel local epochs: {parse_bool(env.get('RUN_CLUSTERS_IN_PARALLEL'), default=True) and len(cluster_ids) > 1}")
     log(
         f"Local epochs per global FedAvg round: {max(1, int(env['LOCAL_EPOCHS_PER_GLOBAL_ROUND']))} "
@@ -1102,6 +1269,15 @@ def main() -> int:
             write_csv(RESULTS_DIR / "train_report.csv", train_client_rows, list(train_client_rows[0].keys()))
         if test_client_rows:
             write_csv(RESULTS_DIR / "test_report.csv", test_client_rows, list(test_client_rows[0].keys()))
+        comm_raw_rows, comm_report_rows, fedavg_report_rows = build_communication_reports(cluster_ids, cluster_clients)
+        if comm_raw_rows:
+            write_csv(RESULTS_DIR / "communication_log.csv", comm_raw_rows, COMM_LOG_FIELDNAMES)
+        if comm_report_rows:
+            write_csv(RESULTS_DIR / "communication_report.csv", comm_report_rows, list(comm_report_rows[0].keys()))
+            write_json(RESULTS_DIR / "communication_report.json", {"rows": comm_report_rows})
+        if fedavg_report_rows:
+            write_csv(RESULTS_DIR / "fedavg_report.csv", fedavg_report_rows, list(fedavg_report_rows[0].keys()))
+            write_json(RESULTS_DIR / "fedavg_report.json", {"rows": fedavg_report_rows})
 
         log("\nTRAIN SUMMARY")
         for row in train_cluster_summary:
