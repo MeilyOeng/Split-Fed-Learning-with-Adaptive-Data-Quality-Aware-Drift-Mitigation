@@ -530,9 +530,9 @@ class ClusteredClientRunner:
             for X, y in loader:
                 batch_idx += 1
                 X, y = self._prepare_batch_for_lstm(X, y)
+                # Preserve the full sequence across the split so the server-side
+                # LSTM continues the recurrent stack over all timesteps.
                 activations = self.client_model(X)
-                if activations.dim() == 3:
-                    activations = activations[:, -1, :]
                 log_enabled = self.comm_log_eval and should_log_index(batch_idx, self.comm_log_every_n_batches)
                 log_meta = {
                     "log_enabled": log_enabled,
@@ -668,9 +668,9 @@ class ClusteredClientRunner:
 
         use_cudnn = not (self.device.type == "cuda")
         with torch.backends.cudnn.flags(enabled=use_cudnn):
+            # Preserve the full sequence across the split so the server-side
+            # LSTM continues the recurrent stack over all timesteps.
             activations = self.client_model(X)
-            if activations.dim() == 3:
-                activations = activations[:, -1, :]
             result = self._post_pickle(
                 f"{self.current_server_url}/train_step",
                 self._pack_payload(

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import pickle
+import sys
 import time
 from threading import Lock
 from typing import Dict, Tuple
@@ -8,11 +9,14 @@ from typing import Dict, Tuple
 import pandas as pd
 import torch
 from flask import Flask, Response, jsonify, request
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
 from utils.comm_logging import append_comm_row, tensor_shape
 
 app = Flask(__name__)
-
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLUSTER_DIR = os.environ.get("CLUSTER_DIR", os.path.join(BASE_DIR, "dataset", "output"))
 STREAM_CLUSTER_ID = os.environ.get("STREAM_CLUSTER_ID")
 STREAM_PORT = int(os.environ.get("STREAM_PORT", "5001"))

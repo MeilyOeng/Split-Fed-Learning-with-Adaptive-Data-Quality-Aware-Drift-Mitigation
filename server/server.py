@@ -82,8 +82,10 @@ class SplitLearningServerState:
         self.round_id = 0
         self.expected_clients: List[str] = []
         self.expected_clients_set: Set[str] = set()
-        self.seen_clients: Set[str] = set()
-        self.round_contrib_count = 0
+        self.seen_clients_total: Set[str] = set()
+        self.seen_clients_window: Set[str] = set()
+        self.round_total_contrib_count = 0
+        self.window_contrib_count = 0
         # try loading latest checkpoint on startup
         latest_path = server_checkpoint_path(self.runtime_cfg.cluster_id, "latest.pt") 
         extra, ok = try_load_torch_checkpoint(
@@ -112,7 +114,11 @@ class SplitLearningServerState:
     @staticmethod
     def _ensure_lstm_input_3d(x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 2:
+            # Backward-compatibility path for older clients that still send only
+            # the final timestep. The active client should send [B, T, H].
             return x.unsqueeze(1)
+        if x.dim() != 3:
+            raise ValueError(f"Expected activations with 2 or 3 dims, got shape={tuple(x.shape)}")
         return x
     # saving training progress counters into a dict with checkpoint
     def _checkpoint_extra(self) -> Dict[str, Any]:
@@ -128,11 +134,19 @@ class SplitLearningServerState:
         for p in self.model.parameters():
             if p.grad is not None:
                 p.grad.div_(effective_accum_steps)
-    # just to reset the tracking of each round's progress after a flush
-    def _reset_round_tracking(self, increment_round: bool) -> None:
+
+    def _reset_window_tracking(self) -> None:
         self.pending_accum_steps = 0
-        self.seen_clients.clear()
-        self.round_contrib_count = 0
+        self.seen_clients_window.clear()
+        self.window_contrib_count = 0
+
+    # just to reset the tracking of each round's progress after a completed logical round
+    def _reset_round_tracking(self, increment_round: bool) -> None:
+        self.expected_clients = []
+        self.expected_clients_set = set()
+        self.seen_clients_total.clear()
+        self.round_total_contrib_count = 0
+        self._reset_window_tracking()
         if increment_round:
             self.round_id += 1
     # check for expected clients, track seen clients and contributions
@@ -142,10 +156,15 @@ class SplitLearningServerState:
             raise ValueError("expected_clients contains duplicates")
         if self.pending_accum_steps > 0:
             raise RuntimeError("cannot start a new round while gradients are pending")
+        if self.expected_clients_set or self.seen_clients_total or self.round_total_contrib_count > 0:
+            raise RuntimeError("cannot start a new round while previous logical round is still active")
         self.expected_clients = unique_clients
         self.expected_clients_set = set(unique_clients)
-        self.seen_clients.clear()
-        self.round_contrib_count = 0
+        self.seen_clients_total.clear()
+        self.seen_clients_window.clear()
+        self.round_total_contrib_count = 0
+        self.window_contrib_count = 0
+        self.pending_accum_steps = 0
         if round_id is not None:
             self.round_id = int(round_id)
         print(
@@ -159,8 +178,12 @@ class SplitLearningServerState:
             "cluster_id": self.runtime_cfg.cluster_id,
             "round_id": self.round_id,
             "expected_clients": list(self.expected_clients),
-            "seen_clients": sorted(self.seen_clients),
-            "round_contrib_count": self.round_contrib_count,
+            "seen_clients_total": sorted(self.seen_clients_total),
+            "seen_clients_window": sorted(self.seen_clients_window),
+            "seen_clients": sorted(self.seen_clients_total),
+            "round_total_contrib_count": self.round_total_contrib_count,
+            "window_contrib_count": self.window_contrib_count,
+            "round_contrib_count": self.round_total_contrib_count,
             "pending_accum_steps": self.pending_accum_steps,
             "optimizer_step_count": self.optimizer_step_count,
             "global_step": self.global_step,
@@ -175,11 +198,14 @@ class SplitLearningServerState:
         self.optimizer.zero_grad(set_to_none=True)
         self.optimizer_step_count += 1
         finished_round_id = self.round_id
-        seen_clients = sorted(self.seen_clients)
-        self._reset_round_tracking(increment_round=increment_round)
+        window_clients = sorted(self.seen_clients_window)
+        if increment_round:
+            self._reset_round_tracking(increment_round=increment_round)
+        else:
+            self._reset_window_tracking()
         print(
             f"[Server] flush reason={reason} cluster={self.runtime_cfg.cluster_id} round_id={finished_round_id} "
-            f"effective_accum_steps={effective_accum_steps} seen_clients={seen_clients} optimizer_steps={self.optimizer_step_count}",
+            f"effective_accum_steps={effective_accum_steps} window_clients={window_clients} optimizer_steps={self.optimizer_step_count}",
             flush=True,
         )
         if increment_round and self.runtime_cfg.save_every_rounds > 0 and finished_round_id % self.runtime_cfg.save_every_rounds == 0:
@@ -189,7 +215,7 @@ class SplitLearningServerState:
             "reason": reason,
             "finished_round_id": finished_round_id,
             "effective_accum_steps": effective_accum_steps,
-            "seen_clients": seen_clients,
+            "window_clients": window_clients,
             **self.round_state(),
         }
 
@@ -204,7 +230,7 @@ class SplitLearningServerState:
             raise RuntimeError("No active round configured. Call /round/start first.")
         if client_id not in self.expected_clients_set:  #Client must be in the expected list for this round
             raise RuntimeError(f"Client {client_id} is not part of active round {self.round_id}")
-        if client_id in self.seen_clients:              # Avoid accepting multiple contributions from the same client in the same round
+        if client_id in self.seen_clients_total:        # Avoid accepting multiple contributions from the same client in the same round
             raise RuntimeError(f"Duplicate contribution from client {client_id} in round {self.round_id}")
 
         self.global_step += 1
@@ -219,30 +245,46 @@ class SplitLearningServerState:
         raw_loss = float(loss.item())
         loss.backward()
         # move gradients back to CPU for sending to client
-        grad_activations = activations.grad.detach().cpu() 
-        if grad_activations.dim() == 3 and grad_activations.size(1) == 1:
-            grad_activations = grad_activations.squeeze(1)
+        grad_activations = activations.grad.detach().cpu()
 
         self.pending_accum_steps += 1
-        self.seen_clients.add(client_id)
-        self.round_contrib_count = len(self.seen_clients)
+        self.seen_clients_total.add(client_id)
+        self.seen_clients_window.add(client_id)
+        self.round_total_contrib_count = len(self.seen_clients_total)
+        self.window_contrib_count = len(self.seen_clients_window)
 
-        round_complete = self.seen_clients == self.expected_clients_set
+        seen_clients_total_snapshot = sorted(self.seen_clients_total)
+        seen_clients_window_snapshot = sorted(self.seen_clients_window)
+        window_complete = self.pending_accum_steps >= self.runtime_cfg.accum_steps_target
+        round_complete = self.seen_clients_total == self.expected_clients_set
         flush_info: Optional[Dict[str, Any]] = None
+        finished_round_id: Optional[int] = None
+
+        if window_complete:
+            flush_info = self.flush_accumulated_gradients(reason="window_complete", increment_round=False)
+
         if round_complete:
-            flush_info = self.flush_accumulated_gradients(reason="round_complete", increment_round=True)
+            finished_round_id = self.round_id
+            if self.pending_accum_steps > 0:
+                flush_info = self.flush_accumulated_gradients(reason="round_complete_tail", increment_round=False)
+            if self.runtime_cfg.save_every_rounds > 0 and finished_round_id % self.runtime_cfg.save_every_rounds == 0:
+                self._save_latest(flush=False)
+            self._reset_round_tracking(increment_round=True)
 
         print(
-            f"[Server] train_step cluster={self.runtime_cfg.cluster_id} round_id={self.round_id if not round_complete else flush_info['finished_round_id']} "
-            f"client={client_id} loss={raw_loss:.6f} seen={sorted(self.seen_clients) if not round_complete else flush_info['seen_clients']} "
-            f"pending_accum={self.pending_accum_steps}",
+            f"[Server] train_step cluster={self.runtime_cfg.cluster_id} round_id={finished_round_id if finished_round_id is not None else self.round_id} "
+            f"client={client_id} loss={raw_loss:.6f} seen_total={seen_clients_total_snapshot} "
+            f"seen_window={seen_clients_window_snapshot} pending_accum={self.pending_accum_steps} "
+            f"window_complete={window_complete} round_complete={round_complete}",
             flush=True,
         )
         return {
             "grad_activations": grad_activations,
             "loss": raw_loss,
+            "window_complete": window_complete,
             "round_complete": round_complete,
             "flush_info": flush_info,
+            "finished_round_id": finished_round_id,
             **self.round_state(),
         }
 
@@ -443,7 +485,7 @@ def train_step():
                         "client_id": str(payload["client_id"]),
                         "scheduler_epoch": payload.get("scheduler_epoch"),
                         "local_epoch": payload.get("local_epoch"),
-                        "round_id": result.get("finished_round_id", result.get("round_id")),
+                        "round_id": result.get("finished_round_id") or result.get("round_id"),
                         "batch_id": payload.get("batch_id"),
                         "event": "train_step",
                         "route": "/train_step",

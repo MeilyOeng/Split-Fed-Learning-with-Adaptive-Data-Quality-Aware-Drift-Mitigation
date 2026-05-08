@@ -176,7 +176,15 @@ def start_stream_service(cluster_id: str, env: dict, cluster_idx: int):
     log(f"[launch] stream cluster={cluster_id} port={port}")
     proc = subprocess.Popen([sys.executable, STREAM_SERVICE_PATH], env=proc_env, stdout=log_fh, stderr=subprocess.STDOUT, cwd=os.getcwd())
     if not wait_for_service(f"http://localhost:{port}/health"):
-        raise RuntimeError(f"Stream service failed to start for cluster {cluster_id}")
+        try:
+            log_fh.flush()
+        except Exception:
+            pass
+        stream_tail = tail_text_file(log_path, n=160)
+        raise RuntimeError(
+            f"Stream service failed to start for cluster {cluster_id}\n"
+            f"===== STREAM SERVICE LOG (tail) =====\n{stream_tail}"
+        )
     return proc, log_fh, port
 
 
@@ -750,7 +758,12 @@ def run_round(server_port: int, cluster_id: str, client_ports: Dict[str, int], r
 
     state = get_json(f"http://localhost:{server_port}/round/state")
     log(f"[ROUND][state] cluster={cluster_id} scheduler_epoch={scheduler_epoch} round={round_idx} chunk={round_chunk_idx} state={state}")
-    if state.get("round_contrib_count", 0) != 0 or state.get("pending_accum_steps", 0) != 0:
+    if (
+        state.get("pending_accum_steps", 0) != 0
+        or state.get("round_total_contrib_count", 0) != 0
+        or state.get("window_contrib_count", 0) != 0
+        or state.get("expected_clients")
+    ):
         raise RuntimeError(f"Round did not flush cleanly: {state}")
     return results
 
@@ -762,7 +775,6 @@ def run_single_scheduler_epoch_for_cluster(cluster_id: str, client_ids: List[str
 
     rng = random.Random(int(env.get("RANDOM_SEED_SCHEDULE", env.get("RANDOM_SEED", "42"))) + cluster_idx)
     order_strategy = env.get("CLIENT_ORDER_STRATEGY", "random_per_round")
-    accum_steps_server = max(1, int(env.get("ACCUM_STEPS_SERVER", "1")))
     server_port = SERVER_BASE_PORT + cluster_idx
     client_ports = {client_id: CLIENT_WORKER_BASE_PORT + cluster_idx * 100 + idx for idx, client_id in enumerate(client_ids)}
     train_durations = defaultdict(float)
@@ -798,14 +810,21 @@ def run_single_scheduler_epoch_for_cluster(cluster_id: str, client_ids: List[str
 
         if ready_clients:
             ordered_ready = order_round_clients(ready_clients, order_strategy, rng, scheduler_epoch, round_idx + 1)
-            round_chunks = chunk_round_clients(ordered_ready, accum_steps_server)
             progress_this_cycle = False
-            for round_chunk_idx, round_clients in enumerate(round_chunks, start=1):
-                round_idx += 1
-                results = run_round(server_port, cluster_id, client_ports, round_clients, scheduler_epoch, round_idx, round_chunk_idx, train_durations)
-                for client_id, result in results.items():
-                    if result.get("status") == "batch_processed":
-                        progress_this_cycle = True
+            round_idx += 1
+            results = run_round(
+                server_port,
+                cluster_id,
+                client_ports,
+                ordered_ready,
+                scheduler_epoch,
+                round_idx,
+                1,
+                train_durations,
+            )
+            for client_id, result in results.items():
+                if result.get("status") == "batch_processed":
+                    progress_this_cycle = True
             if not progress_this_cycle:
                 raise RuntimeError(f"No batch progress detected in cluster {cluster_id} epoch {scheduler_epoch}")
 
