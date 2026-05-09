@@ -16,10 +16,25 @@ from pathlib import Path
 from typing import Dict, List
 
 import requests
-from dotenv import find_dotenv, load_dotenv
 from fed_server.fed_server import run_fedavg_round
 from utils.comm_logging import COMM_LOG_FIELDNAMES
-from utils.runtime_utils import parse_bool, read_json, write_csv, write_json
+from utils.runtime_utils import (
+    client_progress_path,
+    client_test_metrics_path,
+    client_train_metrics_path,
+    cluster_dir,
+    ensure_dir,
+    get_json,
+    load_env_file,
+    log,
+    parse_bool,
+    parse_csv_ids,
+    post_json,
+    read_json,
+    wait_for_service,
+    write_csv,
+    write_json,
+)
 
 CLIENT_PATH = "client/client.py"
 STREAM_SERVICE_PATH = "data/stream_service.py"
@@ -31,52 +46,11 @@ STREAM_BASE_PORT = 5101
 SERVER_BASE_PORT = 5002
 CLIENT_WORKER_BASE_PORT = 6101
 
-
-def log(msg: str) -> None:
-    print(msg, flush=True)
-
-
-def ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-
-
-def cluster_dir(cluster_id: str) -> Path:
-    return OUTPUT_DIR / f"cluster_{cluster_id}"
-
-
-def parse_csv_ids(raw: str) -> List[str]:
-    return [x.strip() for x in raw.split(",") if x.strip()]
-
-
-def load_env_file() -> Path | None:
-    dotenv_path = find_dotenv(".env", usecwd=True)
-    if dotenv_path:
-        load_dotenv(dotenv_path, override=False)
-        return Path(dotenv_path)
-    fallback = Path(".env")
-    if fallback.exists():
-        load_dotenv(fallback, override=False)
-        return fallback.resolve()
-    return None
-
-
 def refresh_runtime_settings_from_env() -> None:
     global STREAM_BASE_PORT, SERVER_BASE_PORT, CLIENT_WORKER_BASE_PORT
     STREAM_BASE_PORT = int(os.environ.get("STREAM_BASE_PORT", str(STREAM_BASE_PORT)))
     SERVER_BASE_PORT = int(os.environ.get("SERVER_BASE_PORT", str(SERVER_BASE_PORT)))
     CLIENT_WORKER_BASE_PORT = int(os.environ.get("CLIENT_WORKER_BASE_PORT", str(CLIENT_WORKER_BASE_PORT)))
-
-
-def wait_for_service(url: str, max_attempts: int = 60, delay_sec: float = 1.0) -> bool:
-    for _ in range(max_attempts):
-        try:
-            r = requests.get(url, timeout=2)
-            if r.status_code == 200:
-                return True
-        except Exception:
-            pass
-        time.sleep(delay_sec)
-    return False
 
 
 def load_cluster_ids(path: Path) -> List[str]:
@@ -159,7 +133,7 @@ def apply_gpu_env(env: dict, role: str, cluster_idx: int, client_idx: int | None
 
 def start_stream_service(cluster_id: str, env: dict, cluster_idx: int):
     port = STREAM_BASE_PORT + cluster_idx
-    cdir = cluster_dir(cluster_id)
+    cdir = cluster_dir(OUTPUT_DIR, cluster_id)
     ensure_dir(cdir)
     log_path = cdir / "stream_service.log"
     log_fh = log_path.open("w", encoding="utf-8")
@@ -190,7 +164,7 @@ def start_stream_service(cluster_id: str, env: dict, cluster_idx: int):
 
 def start_split_server(cluster_id: str, env: dict, cluster_idx: int):
     port = SERVER_BASE_PORT + cluster_idx
-    cdir = cluster_dir(cluster_id)
+    cdir = cluster_dir(OUTPUT_DIR, cluster_id)
     ensure_dir(cdir)
     log_path = cdir / "server.log"
     log_fh = log_path.open("w", encoding="utf-8")
@@ -212,7 +186,7 @@ def start_split_server(cluster_id: str, env: dict, cluster_idx: int):
 
 def start_client_worker(cluster_id: str, client_id: str, server_port: int, stream_port: int, env: dict, cluster_idx: int, client_idx: int):
     port = CLIENT_WORKER_BASE_PORT + cluster_idx * 100 + client_idx
-    cdir = cluster_dir(cluster_id)
+    cdir = cluster_dir(OUTPUT_DIR, cluster_id)
     ensure_dir(cdir)
     log_path = cdir / f"client_{client_id}_worker.log"
     log_fh = log_path.open("w", encoding="utf-8")
@@ -256,7 +230,7 @@ def tail_text_file(path: Path, n: int = 120) -> str:
 
 
 def dump_failure_context(cluster_id: str, client_id: str | None = None) -> None:
-    cdir = cluster_dir(cluster_id)
+    cdir = cluster_dir(OUTPUT_DIR, cluster_id)
     if client_id is not None:
         log("\n===== CLIENT WORKER LOG (tail) =====")
         log(tail_text_file(cdir / f"client_{client_id}_worker.log"))
@@ -266,28 +240,16 @@ def dump_failure_context(cluster_id: str, client_id: str | None = None) -> None:
     log(tail_text_file(cdir / "stream_service.log"))
 
 
-def post_json(url: str, payload: dict | None = None, timeout: float = 120.0):
-    resp = requests.post(url, json=payload or {}, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def get_json(url: str, timeout: float = 30.0):
-    resp = requests.get(url, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()
-
-
 def progress_path(cluster_id: str, client_id: str) -> Path:
-    return cluster_dir(cluster_id) / f"client_{client_id}_progress.json"
+    return client_progress_path(OUTPUT_DIR, cluster_id, client_id)
 
 
 def train_metrics_path(cluster_id: str, client_id: str) -> Path:
-    return cluster_dir(cluster_id) / f"client_{client_id}_train_metrics.json"
+    return client_train_metrics_path(OUTPUT_DIR, cluster_id, client_id)
 
 
 def test_metrics_path(cluster_id: str, client_id: str) -> Path:
-    return cluster_dir(cluster_id) / f"client_{client_id}_test_metrics.json"
+    return client_test_metrics_path(OUTPUT_DIR, cluster_id, client_id)
 
 
 def client_done(cluster_id: str, client_id: str, total_epochs: int) -> bool:
@@ -369,10 +331,10 @@ def read_csv_rows(path: Path):
 def collect_raw_communication_rows(cluster_ids, cluster_clients):
     rows = []
     for cluster_id in cluster_ids:
-        rows.extend(read_csv_rows(cluster_dir(cluster_id) / "server_comm.csv"))
-        rows.extend(read_csv_rows(cluster_dir(cluster_id) / "stream_comm.csv"))
+        rows.extend(read_csv_rows(cluster_dir(OUTPUT_DIR, cluster_id) / "server_comm.csv"))
+        rows.extend(read_csv_rows(cluster_dir(OUTPUT_DIR, cluster_id) / "stream_comm.csv"))
         for client_id in cluster_clients[cluster_id]:
-            rows.extend(read_csv_rows(cluster_dir(cluster_id) / f"client_{client_id}_comm.csv"))
+            rows.extend(read_csv_rows(cluster_dir(OUTPUT_DIR, cluster_id) / f"client_{client_id}_comm.csv"))
     rows.extend(read_csv_rows(OUTPUT_DIR / "global" / "fedavg_comm.csv"))
     rows.sort(key=lambda row: str(row.get("timestamp", "")))
     return rows
@@ -549,7 +511,7 @@ def collect_server_config(server_port: int, cluster_id: str):
 
 
 def collect_client_config(cluster_id: str, client_id: str):
-    cdir = cluster_dir(cluster_id)
+    cdir = cluster_dir(OUTPUT_DIR, cluster_id)
     path = cdir / f"client_{client_id}_config.json"
     config = {
         "cluster_id": cluster_id,
@@ -660,8 +622,8 @@ def cluster_train_sample_weights(cluster_ids, cluster_clients):
 def ensure_final_client_checkpoints(cluster_ids, cluster_clients):
     for cid in cluster_ids:
         for client_id in cluster_clients[cid]:
-            latest = cluster_dir(cid) / f"client_{client_id}_checkpoint.pt"
-            final = cluster_dir(cid) / f"client_{client_id}_final.pt"
+            latest = cluster_dir(OUTPUT_DIR, cid) / f"client_{client_id}_checkpoint.pt"
+            final = cluster_dir(OUTPUT_DIR, cid) / f"client_{client_id}_final.pt"
             if (not final.exists()) and latest.exists():
                 shutil.copy2(latest, final)
                 log(f"[finalize] cluster={cid} client={client_id} copied latest -> final")
@@ -694,17 +656,6 @@ def chunk_round_clients(clients: List[str], accum_steps_server: int) -> List[Lis
 
 
 def finalize_epoch_boundaries(cluster_id: str, client_ports: Dict[str, int], exhausted_clients: List[str], train_durations) -> Dict[str, dict]:
-    """
-    Finalize clients that have already been identified as epoch-exhausted.
-
-    Important: do NOT call /command/train_one_batch here. Those clients are at an epoch
-    boundary already, so asking them to train again can re-enter the train path, trigger
-    validation side-effects at the wrong time, or surface a 500 from a worker that is no
-    longer expected to contribute a batch.
-
-    Instead, call the dedicated finalize endpoint. For compatibility with an older worker,
-    fall back to /command/train_one_batch only if /command/finalize_epoch returns 404.
-    """
     results: Dict[str, dict] = {}
     for client_id in exhausted_clients:
         t0 = time.time()
@@ -1184,7 +1135,7 @@ def main() -> int:
 
     try:
         for cluster_idx, cluster_id in enumerate(cluster_ids):
-            ensure_dir(cluster_dir(cluster_id))
+            ensure_dir(cluster_dir(OUTPUT_DIR, cluster_id))
             sp, sfh, stream_port = start_stream_service(cluster_id, env, cluster_idx)
             started.append((sp, sfh))
             srv, srvfh, server_port = start_split_server(cluster_id, env, cluster_idx)

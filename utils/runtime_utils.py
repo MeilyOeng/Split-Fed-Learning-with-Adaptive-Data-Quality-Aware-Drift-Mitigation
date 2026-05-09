@@ -3,10 +3,13 @@ from __future__ import annotations
 import csv
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+import requests
 import torch
+from dotenv import find_dotenv, load_dotenv
 from torch import nn, optim
 
 from models.split_lstm import LSTMConfig
@@ -27,6 +30,70 @@ def get_env(name: str, default: Optional[str] = None) -> Optional[str]:
 
 def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
     return get_env(name, default)
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def ensure_dir(path: str | Path) -> None:
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+
+def cluster_dir(output_dir: str | Path, cluster_id: str) -> Path:
+    return Path(output_dir) / f"cluster_{cluster_id}"
+
+
+def parse_csv_ids(raw: str) -> list[str]:
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def load_env_file(filename: str = ".env") -> Path | None:
+    dotenv_path = find_dotenv(filename, usecwd=True)
+    if dotenv_path:
+        load_dotenv(dotenv_path, override=False)
+        return Path(dotenv_path)
+    fallback = Path(filename)
+    if fallback.exists():
+        load_dotenv(fallback, override=False)
+        return fallback.resolve()
+    return None
+
+
+def wait_for_service(url: str, max_attempts: int = 60, delay_sec: float = 1.0) -> bool:
+    for _ in range(max_attempts):
+        try:
+            response = requests.get(url, timeout=2.0)
+            if response.status_code == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(delay_sec)
+    return False
+
+
+def post_json(url: str, payload: Optional[Dict[str, Any]] = None, timeout: float = 120.0):
+    response = requests.post(url, json=payload or {}, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def get_json(url: str, timeout: float = 30.0):
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def client_progress_path(output_dir: str | Path, cluster_id: str, client_id: str) -> Path:
+    return cluster_dir(output_dir, cluster_id) / f"client_{client_id}_progress.json"
+
+
+def client_train_metrics_path(output_dir: str | Path, cluster_id: str, client_id: str) -> Path:
+    return cluster_dir(output_dir, cluster_id) / f"client_{client_id}_train_metrics.json"
+
+
+def client_test_metrics_path(output_dir: str | Path, cluster_id: str, client_id: str) -> Path:
+    return cluster_dir(output_dir, cluster_id) / f"client_{client_id}_test_metrics.json"
 
 
 def resolve_device() -> torch.device:

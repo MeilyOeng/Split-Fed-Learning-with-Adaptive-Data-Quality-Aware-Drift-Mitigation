@@ -32,7 +32,7 @@ CLIENT_ARTIFACT_RE = re.compile(
     r"client_(.+?)_(?:config\.json|best_checkpoint\.pt|checkpoint\.pt|final\.pt|test_metrics\.json|train_metrics\.json)$"
 )
 
-ERROR_METRICS = ("mae", "rmse", "mse", "mape", "smape", "wape")
+ERROR_METRICS = ("mae", "rmse", "mse", "mape", "smape")
 SCORE_METRICS = ("r2",)
 DEFAULT_TEST_REPORT_CANDIDATES = (
     Path("output") / "results" / "test_report.csv",
@@ -133,6 +133,20 @@ def safe_quantile(values: Iterable[Optional[float]], q: float) -> Optional[float
     return float(np.quantile(np.asarray(vals, dtype=np.float64), q))
 
 
+def safe_variance(values: Iterable[Optional[float]]) -> Optional[float]:
+    vals = [float(v) for v in values if v is not None and not (isinstance(v, float) and math.isnan(v))]
+    if not vals:
+        return None
+    return float(np.var(np.asarray(vals, dtype=np.float64)))
+
+
+def safe_std(values: Iterable[Optional[float]]) -> Optional[float]:
+    vals = [float(v) for v in values if v is not None and not (isinstance(v, float) and math.isnan(v))]
+    if not vals:
+        return None
+    return float(np.std(np.asarray(vals, dtype=np.float64)))
+
+
 def metric_higher_is_better(metric: str) -> bool:
     return metric in SCORE_METRICS
 
@@ -206,6 +220,10 @@ def client_config_path(output_dir: Path, cluster_id: str, client_id: str) -> Pat
 
 def client_test_metrics_path(output_dir: Path, cluster_id: str, client_id: str) -> Path:
     return output_dir / f"cluster_{cluster_id}" / f"client_{client_id}_test_metrics.json"
+
+
+def client_train_metrics_path(output_dir: Path, cluster_id: str, client_id: str) -> Path:
+    return output_dir / f"cluster_{cluster_id}" / f"client_{client_id}_train_metrics.json"
 
 
 def client_checkpoint_candidates(output_dir: Path, cluster_id: str, client_id: str, checkpoint_mode: str) -> List[Path]:
@@ -398,7 +416,7 @@ def compute_metrics(preds: np.ndarray, targets: np.ndarray) -> Dict[str, Optiona
     preds = preds.reshape(-1)
     targets = targets.reshape(-1)
     if preds.size == 0:
-        return {metric: None for metric in ("mse", "mae", "rmse", "mape", "smape", "wape", "r2")}
+        return {metric: None for metric in ("mse", "mae", "rmse", "mape", "smape", "r2")}
     err = preds - targets
     mse = float(np.mean(np.square(err)))
     mae = float(np.mean(np.abs(err)))
@@ -409,9 +427,6 @@ def compute_metrics(preds: np.ndarray, targets: np.ndarray) -> Dict[str, Optiona
 
     smape_denom = np.abs(preds) + np.abs(targets)
     smape = float(np.nanmean(np.where(smape_denom < 1e-8, np.nan, 2.0 * np.abs(err) / smape_denom)) * 100.0) if np.any(smape_denom >= 1e-8) else None
-
-    target_abs_sum = float(np.sum(np.abs(targets)))
-    wape = float(np.sum(np.abs(err)) / target_abs_sum * 100.0) if target_abs_sum >= 1e-8 else None
 
     ss_res = float(np.sum(np.square(err)))
     target_mean = float(np.mean(targets))
@@ -424,7 +439,6 @@ def compute_metrics(preds: np.ndarray, targets: np.ndarray) -> Dict[str, Optiona
         "rmse": rmse,
         "mape": mape,
         "smape": smape,
-        "wape": wape,
         "r2": r2,
         "num_samples": int(targets.shape[0]),
         "target_mean": float(np.mean(targets)),
@@ -493,8 +507,6 @@ def run_local_inference(
             batch = X_norm[start : start + batch_size]
             X = torch.tensor(batch, dtype=torch.float32, device=device).unsqueeze(-1)
             activations = client_model(X)
-            if activations.dim() == 3:
-                activations = activations[:, -1, :]
             if activations.dim() == 2:
                 activations = activations.unsqueeze(1)
             preds = server_model(activations)
@@ -607,12 +619,13 @@ def plot_client_forecast(
     plt.figure(figsize=(12, 4.8))
     plt.plot(ts_plot, yt, label="True", linewidth=1.4)
     plt.plot(ts_plot, yp, label="Pred", linewidth=1.2)
-    title = (
-        f"Cluster {cluster_id} | Client {client_id} | MAE={metrics.get('mae'):.4f} "
-        f"RMSE={metrics.get('rmse'):.4f} WAPE={metrics.get('wape'):.2f}% R2={metrics.get('r2'):.4f}"
-        if metrics.get("mae") is not None and metrics.get("rmse") is not None and metrics.get("wape") is not None and metrics.get("r2") is not None
-        else f"Cluster {cluster_id} | Client {client_id}"
-    )
+    title = f"Cluster {cluster_id} | Client {client_id}"
+    if metrics.get("mae") is not None and metrics.get("rmse") is not None and metrics.get("smape") is not None and metrics.get("r2") is not None:
+        title = (
+            f"Cluster {cluster_id} | Client {client_id} | "
+            f"MAE={metrics.get('mae'):.4f} RMSE={metrics.get('rmse'):.4f} "
+            f"SMAPE={metrics.get('smape'):.2f}% R2={metrics.get('r2'):.4f}"
+        )
     plt.title(title)
     plt.xlabel("Timestamp")
     plt.ylabel("Value")
@@ -751,10 +764,34 @@ def plot_metric_ecdf(save_path: Path, rows: List[Dict], metric: str) -> None:
     plt.close()
 
 
+def plot_train_val_curve(save_path: Path, epoch_rows: List[Dict], *, title: str) -> None:
+    ensure_dir(save_path.parent)
+    if not epoch_rows:
+        return
+
+    epochs = [int(row["epoch"]) for row in epoch_rows]
+    train_loss = [float(row["avg_train_loss"]) for row in epoch_rows]
+    val_loss = [float(row["avg_val_loss"]) for row in epoch_rows]
+
+    plt.figure(figsize=(10.5, 4.8))
+    plt.plot(epochs, train_loss, label="Train loss", linewidth=1.8, color="#2E6F95")
+    plt.plot(epochs, val_loss, label="Val loss", linewidth=1.8, color="#C84C09")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title(title)
+    plt.grid(axis="y", alpha=0.25, linestyle=":")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=180, bbox_inches="tight")
+    plt.close()
+
+
 def summarize_error_metric(rows: List[Dict], metric: str) -> Dict[str, Optional[float]]:
     values = [get_metric_value(row, metric) for row in rows]
     mean = safe_mean(values)
     median = safe_quantile(values, 0.50)
+    variance = safe_variance(values)
+    std = safe_std(values)
     p90 = safe_quantile(values, 0.90)
     p95 = safe_quantile(values, 0.95)
     best = None
@@ -768,6 +805,8 @@ def summarize_error_metric(rows: List[Dict], metric: str) -> Dict[str, Optional[
     return {
         f"avg_{metric}": mean,
         f"median_{metric}": median,
+        f"var_{metric}": variance,
+        f"std_{metric}": std,
         f"p90_{metric}": p90,
         f"p95_{metric}": p95,
         f"best_{metric}": best,
@@ -780,6 +819,8 @@ def summarize_score_metric(rows: List[Dict], metric: str) -> Dict[str, Optional[
     values = [get_metric_value(row, metric) for row in rows]
     mean = safe_mean(values)
     median = safe_quantile(values, 0.50)
+    variance = safe_variance(values)
+    std = safe_std(values)
     p10 = safe_quantile(values, 0.10)
     p05 = safe_quantile(values, 0.05)
     best = None
@@ -793,6 +834,8 @@ def summarize_score_metric(rows: List[Dict], metric: str) -> Dict[str, Optional[
     return {
         f"avg_{metric}": mean,
         f"median_{metric}": median,
+        f"var_{metric}": variance,
+        f"std_{metric}": std,
         f"p10_{metric}": p10,
         f"p05_{metric}": p05,
         f"best_{metric}": best,
@@ -821,7 +864,8 @@ def summarize_cluster_rows(rows: List[Dict]) -> List[Dict]:
         }
         cluster_row.update(summarize_error_metric(items, "mae"))
         cluster_row.update(summarize_error_metric(items, "rmse"))
-        cluster_row.update(summarize_error_metric(items, "wape"))
+        cluster_row.update(summarize_error_metric(items, "mse"))
+        cluster_row.update(summarize_error_metric(items, "mape"))
         cluster_row.update(summarize_error_metric(items, "smape"))
         cluster_row.update(summarize_score_metric(items, "r2"))
 
@@ -844,7 +888,8 @@ def build_global_summary(rows: List[Dict]) -> Dict:
     }
     summary.update(summarize_error_metric(rows, "mae"))
     summary.update(summarize_error_metric(rows, "rmse"))
-    summary.update(summarize_error_metric(rows, "wape"))
+    summary.update(summarize_error_metric(rows, "mse"))
+    summary.update(summarize_error_metric(rows, "mape"))
     summary.update(summarize_error_metric(rows, "smape"))
     summary.update(summarize_score_metric(rows, "r2"))
     return summary
@@ -859,7 +904,8 @@ def build_rank_report(rows: List[Dict], metric: str, top_k: int) -> Dict[str, Li
         "num_test_samples",
         "mae",
         "rmse",
-        "wape",
+        "mse",
+        "mape",
         "smape",
         "r2",
         "prediction_csv",
@@ -960,6 +1006,54 @@ def build_cluster_best_worst_rows(rows: List[Dict]) -> List[Dict]:
                 "best_rmse": None if best_rmse is None else best_rmse.get("rmse"),
                 "worst_client_by_rmse": None if worst_rmse is None else worst_rmse["client_id"],
                 "worst_rmse": None if worst_rmse is None else worst_rmse.get("rmse"),
+            }
+        )
+    return out
+
+
+def maybe_load_saved_train_metrics(output_dir: Path, cluster_id: str, client_id: str) -> Optional[Dict]:
+    path = client_train_metrics_path(output_dir, cluster_id, client_id)
+    if not path.exists():
+        return None
+    try:
+        return load_json(path)
+    except Exception:
+        return None
+
+
+def build_train_val_curve_rows(output_dir: Path, rows: List[Dict]) -> List[Dict]:
+    epoch_values: Dict[int, Dict[str, List[float]]] = {}
+    for row in rows:
+        train_metrics = maybe_load_saved_train_metrics(output_dir, str(row["cluster_id"]), str(row["client_id"]))
+        if not train_metrics:
+            continue
+        history = train_metrics.get("history", [])
+        if not isinstance(history, list):
+            continue
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            epoch = item.get("epoch")
+            train_loss = clean_metric_value(item.get("train_loss"))
+            val_loss = clean_metric_value(item.get("val_loss"))
+            if epoch is None or train_loss is None or val_loss is None:
+                continue
+            epoch_i = int(epoch)
+            bucket = epoch_values.setdefault(epoch_i, {"train": [], "val": []})
+            bucket["train"].append(float(train_loss))
+            bucket["val"].append(float(val_loss))
+
+    out: List[Dict] = []
+    for epoch in sorted(epoch_values.keys()):
+        bucket = epoch_values[epoch]
+        out.append(
+            {
+                "epoch": epoch,
+                "avg_train_loss": safe_mean(bucket["train"]),
+                "avg_val_loss": safe_mean(bucket["val"]),
+                "std_train_loss": safe_std(bucket["train"]),
+                "std_val_loss": safe_std(bucket["val"]),
+                "num_clients": len(bucket["train"]),
             }
         )
     return out
@@ -1255,15 +1349,15 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run local prediction and fairness analysis from saved split-learning checkpoints.")
     p.add_argument("--project-root", type=Path, default=Path("."), help="Project root containing dataset/ and output/")
     p.add_argument("--dataset-dir", type=Path, default=Path("dataset"), help="Dataset directory")
-    p.add_argument("--output-dir", type=Path, default=Path("output-new-best"), help="Training output directory")
+    p.add_argument("--output-dir", type=Path, default=Path("output"), help="Training output directory")
     p.add_argument("--test-report", type=Path, default=None, help="Per-client split-learning test report CSV. Defaults to output/results/test_report.csv with fallbacks.")
     p.add_argument("--baseline-report", type=Path, default=None, help="Baseline LSTM metrics CSV. Defaults to dataset/lstm_results_updated.csv with fallbacks.")
     p.add_argument("--assignments-path", type=Path, default=Path("dataset") / "cluster-assignment.csv", help="Cluster assignment CSV used to map baseline rows to clusters.")
-    p.add_argument("--report-dir", type=Path, default=None, help="Directory for analysis outputs. Default: derived from output dir name, e.g. output-ep30-noES -> report-ep30-noES")
+    p.add_argument("--report-dir", type=Path, default=None, help="Directory for analysis outputs. Default: <output-dir>/report")
     p.add_argument("--clusters", type=str, default=None, help="Comma-separated cluster IDs. Default: discover from output/")
     p.add_argument("--clients", type=str, default=None, help="Comma-separated client IDs. Default: discover from output/")
     p.add_argument("--checkpoint-mode", type=str, default="auto", choices=["auto", "paired_best", "final_shared", "final", "latest"])
-    p.add_argument("--metric", type=str, default="mae", choices=["mae", "rmse", "wape", "smape", "r2"], help="Metric used for best/worst ranking plots")
+    p.add_argument("--metric", type=str, default="mae", choices=["mae", "rmse", "mse", "smape", "r2"], help="Metric used for best/worst ranking plots")
     p.add_argument("--top-k", type=int, default=5, help="How many best/worst clients to export in ranking tables")
     p.add_argument("--window-size", type=int, default=int(os.environ.get("WINDOW_SIZE", "24")))
     p.add_argument("--forecast-horizon", type=int, default=int(os.environ.get("FORECAST_HORIZON", "1")))
@@ -1299,7 +1393,14 @@ def main() -> int:
         if args.assignments_path.is_absolute()
         else (project_root / args.assignments_path).resolve()
     )
-    report_dir = (output_dir / "predictions_plots").resolve()
+    if args.report_dir is None:
+        report_dir = (output_dir / "report").resolve()
+    else:
+        report_dir = (
+            args.report_dir.resolve()
+            if args.report_dir.is_absolute()
+            else (output_dir / args.report_dir).resolve()
+        )
     plots_dir = report_dir / "plots"
     predictions_dir = report_dir / "predictions"
     rankings_dir = report_dir / "rankings"
@@ -1405,10 +1506,13 @@ def main() -> int:
         row["checkpoint_server"] = None
         row["client_checkpoint_epoch"] = None
         row["server_global_step"] = None
+        row["recomputed_mse"] = None
         row["recomputed_mae"] = None
         row["recomputed_rmse"] = None
+        row["recomputed_mape"] = None
         row["recomputed_r2"] = None
         row["recomputed_smape"] = None
+        row["delta_recomputed_vs_report_mse"] = None
         row["delta_recomputed_vs_report_mae"] = None
         row["delta_recomputed_vs_report_rmse"] = None
         if meta is None:
@@ -1419,10 +1523,17 @@ def main() -> int:
         row["checkpoint_server"] = meta.get("checkpoint_server")
         row["client_checkpoint_epoch"] = meta.get("client_checkpoint_epoch")
         row["server_global_step"] = meta.get("server_global_step")
+        for metric_name in ("mse", "mae", "rmse", "mape", "smape", "r2"):
+            if meta.get(metric_name) is not None:
+                row[metric_name] = meta.get(metric_name)
+        row["recomputed_mse"] = meta.get("mse")
         row["recomputed_mae"] = meta.get("mae")
         row["recomputed_rmse"] = meta.get("rmse")
+        row["recomputed_mape"] = meta.get("mape")
         row["recomputed_r2"] = meta.get("r2")
         row["recomputed_smape"] = meta.get("smape")
+        if meta.get("mse") is not None and row.get("mse") is not None:
+            row["delta_recomputed_vs_report_mse"] = float(meta["mse"] - row["mse"])
         if meta.get("mae") is not None and row.get("mae") is not None:
             row["delta_recomputed_vs_report_mae"] = float(meta["mae"] - row["mae"])
         if meta.get("rmse") is not None and row.get("rmse") is not None:
@@ -1433,6 +1544,7 @@ def main() -> int:
     ranking_report = build_rank_report(per_client_rows, args.metric, args.top_k)
     cluster_best_worst_rows = build_cluster_best_worst_rows(per_client_rows)
     comparison_rows = build_splitfed_vs_baseline_rows(per_client_rows, baseline_df)
+    train_val_curve_rows = build_train_val_curve_rows(output_dir, per_client_rows)
 
     for cluster_id, payloads in payloads_by_cluster.items():
         if not payloads:
@@ -1514,11 +1626,16 @@ def main() -> int:
             baseline_label="LSTM",
             title="Per-client RMSE: SplitFed vs LSTM by cluster",
         )
+    if train_val_curve_rows:
+        plot_train_val_curve(
+            plots_dir / "training" / "train_val_curve.png",
+            train_val_curve_rows,
+            title="Average train vs validation loss across analyzed clients",
+        )
 
     save_json(report_dir / "global_summary.json", global_summary)
-    save_json(report_dir / "cluster_best_worst_clients.json", cluster_best_worst_rows)
     save_csv(
-        report_dir / "prediction_clusters.csv",
+        report_dir / "cluster_summary.csv",
         cluster_rows,
         [
             "cluster_id",
@@ -1526,6 +1643,8 @@ def main() -> int:
             "avg_num_test_samples",
             "avg_mae",
             "median_mae",
+            "var_mae",
+            "std_mae",
             "p90_mae",
             "p95_mae",
             "worst_mae",
@@ -1533,21 +1652,44 @@ def main() -> int:
             "worst_over_avg_mae",
             "avg_rmse",
             "median_rmse",
+            "var_rmse",
+            "std_rmse",
             "p90_rmse",
             "p95_rmse",
             "worst_rmse",
             "best_rmse",
             "worst_over_avg_rmse",
-            "avg_wape",
-            "p90_wape",
-            "worst_wape",
-            "worst_over_avg_wape",
+            "avg_mse",
+            "median_mse",
+            "var_mse",
+            "std_mse",
+            "p90_mse",
+            "p95_mse",
+            "worst_mse",
+            "best_mse",
+            "worst_over_avg_mse",
+            "avg_mape",
+            "median_mape",
+            "var_mape",
+            "std_mape",
+            "p90_mape",
+            "p95_mape",
+            "worst_mape",
+            "best_mape",
+            "worst_over_avg_mape",
             "avg_smape",
+            "median_smape",
+            "var_smape",
+            "std_smape",
             "p90_smape",
+            "p95_smape",
             "worst_smape",
+            "best_smape",
             "worst_over_avg_smape",
             "avg_r2",
             "median_r2",
+            "var_r2",
+            "std_r2",
             "p10_r2",
             "p05_r2",
             "worst_r2",
@@ -1557,22 +1699,6 @@ def main() -> int:
             "worst_client_by_mae",
             "best_client_by_r2",
             "worst_client_by_r2",
-        ],
-    )
-    save_csv(
-        report_dir / "cluster_best_worst_clients.csv",
-        cluster_best_worst_rows,
-        [
-            "cluster_id",
-            "num_clients",
-            "best_client_by_mae",
-            "best_mae",
-            "worst_client_by_mae",
-            "worst_mae",
-            "best_client_by_rmse",
-            "best_rmse",
-            "worst_client_by_rmse",
-            "worst_rmse",
         ],
     )
     if comparison_rows:

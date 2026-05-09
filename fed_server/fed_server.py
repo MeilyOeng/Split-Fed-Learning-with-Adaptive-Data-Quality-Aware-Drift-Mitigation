@@ -21,10 +21,6 @@ if project_root not in sys.path:
 FED_SERVER_PORT = int(os.environ.get("FED_SERVER_PORT", "5010"))
 
 
-# ---------------------------------------------------------------------------
-# Round history dataclass
-# ---------------------------------------------------------------------------
-
 @dataclass
 class RoundRecord:
     round_num:        int
@@ -41,10 +37,7 @@ class RoundRecord:
     error:            Optional[str] = None
 
 
-# ---------------------------------------------------------------------------
 # FedAvg maths
-# ---------------------------------------------------------------------------
-
 def _load_state_dict(path: str) -> Dict[str, torch.Tensor]:
     """Load model_state_dict from a checkpoint file."""
     if not os.path.exists(path):
@@ -260,10 +253,6 @@ def _push_weights(server_url: str, state_dict: Dict[str, torch.Tensor], log_path
         print(f"[FedServer]   WARNING: could not push weights to {server_url}: {e}")
         return False
 
-
-# ---------------------------------------------------------------------------
-# Core round function
-# ---------------------------------------------------------------------------
 
 def run_fedavg_round(
     cluster_ids:        List[str],
