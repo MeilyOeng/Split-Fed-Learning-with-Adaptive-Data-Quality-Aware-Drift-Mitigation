@@ -51,21 +51,18 @@ Thumbs.db
 *.log
 tests/
 dataset/
-output/
-output-*/
-output-1/
-output-2/
-output-3/
-output-4/
+outputs/
 plots/
-*.md
+notes/
 *.pdf
 .dist/
 *.csv
-compare_*.py
-reports/
-report-*/
+plotting/
+# compare_*.py
+# reports/
+# report-*/
 simple_plots/
-simple_report_plots.py
-comparison_training_plots.py
-comparison_outputs/
+# simple_report_plots.py
+# comparison_training_plots.py
+# comparison_outputs/
+simple_plots_clean_vs_faulty/

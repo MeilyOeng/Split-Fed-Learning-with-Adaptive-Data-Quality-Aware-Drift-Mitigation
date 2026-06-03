@@ -1,0 +1,87 @@
+# If fault_fraction is set, use simple mode.
+# If empty/null, use detailed mode under faults:.
+fault_fraction:
+
+# Simple mode only: possible fault types and their probabilities.
+simple_fault_types: [missing, out_of_range, inconsistent, timeliness]
+simple_fault_probabilities:
+
+# Simple mode severity settings.
+simple_out_of_range_range: [1.5, 3.0]      # multiply values beyond normal range
+simple_inconsistent_range: [4.0, 8.0]     # stronger multiplier for inconsistent values
+simple_timeliness_steps: [-1, 1]          # shift values by previous/next row
+simple_noise_std_fraction: 0.05           # noise size relative to client scale
+simple_spike_multiplier: 4.0              # spike size relative to client scale
+
+# Detailed mode: master intensity knob.
+# 1.0 means use the configured rates as-is.
+global_fault_rate: 0.2
+
+# Optional per-client multiplier.
+# Example: client_1: 0.5 means half intensity for that client.
+per_client_fault_rate: {}
+
+clients:
+  selected: ["9906537", "9906758", "9904576", "9907460", "9901304", "9904765", "9904965", "9907871", "9901455", "9907567", "9903322", "9902195", "9904296", "9901649", "9904555", "9905539", "9901819", "9906735", "9907872", "9902771", "9904304", "9904324", "9903803", "9907921", "9902188", "9904510", "9908088", "9903560", "9902484", "9904933", "9906883", "9902735", "9907159", "9902389", "9906881", "9902073", "9901509", "9905509", "9903134", "9902928", "9901969", "9905441", "9901708", "9905456", "9902590", "9900803", "9902170", "9908013", "9906096", "9902373", "9900554", "9906633", "9901738", "9901528", "9901620", "9901075", "9900076", "9902565", "9906922", "9901743", "9902641", "9902139", "9905675", "9902059", "9901588", "9907563", "9904353", "9900684", "9905119", "9900070", "9907282", "9902475", "9903290", "9901306", "9902821", "9905148", "9901143", "9902723", "9904490", "9904545", "9901474", "9903928", "9903042", "9901204"]          # explicit clients to corrupt; empty means use random selection
+  random_fraction: 1.0  # fraction of clients selected when selected is empty
+  random_count:         # fixed number of random clients; overrides random_fraction if set
+
+faults:
+  completeness:
+    client_dropout_fraction: 0.0        # wipe entire client series to missing
+    random_missing_rate: 0.02           # random individual missing values
+    dropped_timestamp_rows_fraction: 0.01 # remove shared timestamps from all clients
+    block_missing:
+      events_per_client: 1              # number of missing blocks per client
+      min_length: 4                     # shortest missing block
+      max_length: 12                    # longest missing block
+
+  accuracy:
+    negative_rate: 0.005                # force values below zero
+    impossible_high_rate: 0.005         # force unrealistically high values
+    high_multiplier: 3.0                # strength of impossible high values
+    spike_rate: 0.01                    # random sudden spikes
+    spike_multiplier: 4.0               # spike strength
+    noise_rate: 0.02                    # random Gaussian noise points
+    noise_std_fraction: 0.05            # noise size relative to client scale
+    jump_rate: 0.01                     # abrupt jump from previous value
+    jump_multiplier: 6.0                # jump strength
+    stuck_segments_per_client: 1        # frozen-value blocks per client
+    stuck_min_length: 4                 # shortest stuck block
+    stuck_max_length: 12                # longest stuck block
+
+  temporal_consistency:
+    stale_blocks_per_client: 1          # blocks copied from older values
+    stale_min_length: 3                 # shortest stale block
+    stale_max_length: 8                 # longest stale block
+    lag_choices: [1, 2, 24]             # copy from 1, 2, or 24 rows ago
+    lag_probabilities: [0.5, 0.3, 0.2]  # probability weights for lag choices
+    duplicated_timestamp_fraction: 0.0  # duplicate shared timestamps
+    calendar_hole_fraction: 0.03        # remove weekday-hour pattern cells within a local window
+    calendar_hole_min_length: 72        # 3 days for hourly data
+    calendar_hole_max_length: 336       # 14 days for hourly data
+    phase_shift_client_fraction: 0.15   # clients with shifted time pattern
+    phase_shift_steps_choices: [6, 12]  # shift by 6 or 12 rows
+    phase_shift_start_fraction: 0.5     # start shift halfway through series
+    mid_window_regime_shift_fraction: 0.2 # clients with second-half level shift
+    mid_window_regime_shift_strength: 0.25 # level shift size
+    mid_window_regime_start_fraction: 0.5  # start regime shift halfway through
+
+  skewness:
+    mean_shift_client_fraction: 0.02    # clients with temporary local mean shift
+    mean_shift_std_multiplier: 1.0      # mean shift size in std units
+    mean_shift_min_length: 72           # 3 days for hourly data
+    mean_shift_max_length: 168          # 14 days for hourly data
+    variance_shift_client_fraction: 0.02 # clients with temporary local variance change
+    variance_scale_range: [1.5, 2.0]    # variance scaling range
+    variance_shift_min_length: 72       # 3 days for hourly data
+    variance_shift_max_length: 336      # 14 days for hourly data
+    peak_shift_client_fraction: 0.25    # clients with altered peak hours in a local window
+    peak_shift_multiplier: 1.5          # peak-hour scaling strength
+    peak_shift_min_length: 72           # 3 days for hourly data
+    peak_shift_max_length: 168          # 14 days for hourly data
+    peak_hours: [17, 18, 19, 20, 21]    # hours treated as peak demand
+    long_term_shift_client_fraction: 0.02 # clients with partial-month behavioral drift
+    long_term_shift_multiplier: 0.5     # drift size relative to scale
+    long_term_shift_min_length: 336     # 14 days for hourly data
+    long_term_shift_max_length: 720     # 30 days for hourly data

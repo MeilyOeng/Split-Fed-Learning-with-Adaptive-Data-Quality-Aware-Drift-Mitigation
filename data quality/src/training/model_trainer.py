@@ -1,0 +1,295 @@
+import os, time, json, hashlib
+from pathlib import Path
+import joblib, optuna, pandas as pd, numpy as np, xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
+import subprocess
+
+from common.constants import MAIN_CONFIG  # loads config/config.yaml  :contentReference[oaicite:2]{index=2}
+
+CFG = MAIN_CONFIG.get("ML_Training", {})
+DATA_FILE   = Path(CFG.get("data_file", "data/processed/training/v0/train_labels.parquet"))
+LABEL_COL   = CFG.get("label_col", "label")
+DROP_COLS   = list(CFG.get("drop_cols", ["window_id"]))
+USE_SCALER  = bool(CFG.get("use_scaler", True))
+MAX_TRIALS  = int(CFG.get("max_trials", 50))
+TARGET_MAE  = float(CFG.get("min_target_mae", 0.05))
+OUT_ROOT    = Path(CFG.get("out_root", "./data/artifacts/models"))
+VER = str(CFG.get("model_version", "0.0.0"))
+UPDATE_LATEST = bool(CFG.get("update_latest_symlink", True))
+
+
+
+if not DATA_FILE.exists():
+    raise FileNotFoundError(f"Dataset not found: {DATA_FILE}")
+
+# --- load dataset ---
+df = pd.read_parquet(DATA_FILE) if DATA_FILE.suffix==".parquet" else pd.read_csv(DATA_FILE)
+
+if "meta_end_time" in df.columns:
+    # meta_end_time is usually ISO string; parse once & reuse
+    df["_meta_end_dt"] = pd.to_datetime(df["meta_end_time"], utc=True, errors="coerce")
+    sort_col = "_meta_end_dt"
+elif "meta_start_time" in df.columns:
+    df["_meta_start_dt"] = pd.to_datetime(df["meta_start_time"], utc=True, errors="coerce")
+    sort_col = "_meta_start_dt"
+else:
+    # fallback: derive from window_id if it encodes time, else keep original order
+    sort_col = None
+
+if sort_col is not None:
+    df = df.sort_values(sort_col).reset_index(drop=True)
+if LABEL_COL not in df.columns:
+    raise ValueError(f"Label column '{LABEL_COL}' not found")
+y = df[LABEL_COL].astype(float)
+X = df.drop(columns=[LABEL_COL]+DROP_COLS, errors="ignore")
+X = X.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+print("before drop: ",df.columns)
+print("after drop: ",X.columns)
+#X = X.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+#bad_cols = [c for c in X.columns if X[c].isna().all() or X[c].nunique(dropna=True) <= 1]
+for c in X.columns:
+    if pd.api.types.is_timedelta64_dtype(X[c]):
+        X[c] = X[c].dt.total_seconds().astype(float)
+
+# 2) Identify numeric vs non-numeric
+num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+non_numeric_cols = [c for c in X.columns if c not in num_cols]
+
+# 3) (Optional but recommended) drop non-numeric from X now (model needs numeric only)
+if non_numeric_cols:
+    print(f"[INFO] Dropping non-numeric columns from features: {non_numeric_cols[:10]}{'...' if len(non_numeric_cols)>10 else ''}")
+    X = X.drop(columns=non_numeric_cols)
+
+
+# Identify problematic columns WITH REASONS
+# all_nan_cols = [c for c in X.columns if X[c].isna().all()]
+# constant_cols = [c for c in X.columns if X[c].nunique(dropna=True) <= 1]
+# near_zero_var_cols = [c for c in X.columns if X[c].std(skipna=True) < 1e-10]
+# print(f"\n[FEATURE DROP ANALYSIS]")
+# print(f"  All-NaN columns: {len(all_nan_cols)} - {all_nan_cols[:5]}")
+# print(f"  Constant columns: {len(constant_cols)} - {constant_cols[:5]}")
+# print(f"  Near-zero variance: {len(near_zero_var_cols)} - {near_zero_var_cols[:5]}")
+# # Drop ONLY truly problematic ones
+# bad_cols = list(set(all_nan_cols + constant_cols))
+
+# if bad_cols:
+#     X = X.drop(columns=bad_cols)
+#     print(f"Dropping non-informative  {len(bad_cols)} total cols:", bad_cols)
+
+# 1) Coerce to numeric first (keep legit numeric that arrived as strings), then split to avoid leakage
+X = X.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+# 2) Split first; detect drops on TRAIN ONLY (avoid peeking at validation)
+X_tr, X_va, y_tr, y_va = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# 3) Identify problematic columns (TRAIN split only)
+all_nan_cols = [c for c in X_tr.columns if X_tr[c].isna().all()]
+constant_cols = [c for c in X_tr.columns if X_tr[c].nunique(dropna=True) <= 1]
+near_zero_var_cols = [c for c in X_tr.columns if X_tr[c].std(skipna=True) < 1e-10]
+
+print(f"\n[FEATURE DROP ANALYSIS] (train split)")
+print(f"  All-NaN columns: {len(all_nan_cols)} - {all_nan_cols[:5]}")
+print(f"  Constant columns: {len(constant_cols)} - {constant_cols[:5]}")
+print(f"  Near-zero variance: {len(near_zero_var_cols)} - {near_zero_var_cols[:5]}")
+
+# Drop ONLY truly problematic ones (on both train & val, based on TRAIN detection)
+bad_cols = list(set(all_nan_cols + constant_cols))
+if bad_cols:
+    X_tr = X_tr.drop(columns=bad_cols)
+    X_va  = X_va.drop(columns=bad_cols)
+    print(f"Dropping non-informative {len(bad_cols)} total cols (train-based):", bad_cols)   
+
+# --- split + optional scaling ---
+#X_tr, X_va, y_tr, y_va = train_test_split(X, y, test_size=0.2, random_state=42)
+
+n = len(df)
+split_idx = int(n * 0.80)  # 80/20 time holdout
+
+train_idx = np.arange(0, split_idx)
+test_idx  = np.arange(split_idx, n)
+
+X_tr = X.iloc[train_idx].copy()
+y_tr = y.iloc[train_idx].copy()
+X_va   = X.iloc[test_idx].copy()   # using "val" nomenclature already present in your code
+y_va   = y.iloc[test_idx].copy()
+
+# If you keep window IDs for later joins, capture them now (optional but recommended):
+win_ids_train = df.loc[train_idx, "window_id"].tolist() if "window_id" in df.columns else []
+win_ids_val   = df.loc[test_idx,  "window_id"].tolist() if "window_id" in df.columns else []
+
+scaler = None
+if USE_SCALER:
+    med = X_tr.median(numeric_only=True)
+    X_tr = X_tr.fillna(med)
+    X_va  = X_va.fillna(med)
+    scaler = StandardScaler().fit(X_tr)
+    X_tr = scaler.transform(X_tr)
+    X_va = scaler.transform(X_va)
+else:
+    scaler = None    
+
+dtr = xgb.DMatrix(X_tr, label=y_tr)
+dva = xgb.DMatrix(X_va, label=y_va)
+
+def objective(trial):
+    params = {
+        "verbosity": 0,
+        "objective": "reg:squarederror",
+        "booster": trial.suggest_categorical("booster", ["gbtree","dart"]),
+        "lambda": trial.suggest_float("lambda", 1e-8, 1.0, log=True),
+        "alpha": trial.suggest_float("alpha", 1e-8, 1.0, log=True),
+        "max_depth": trial.suggest_int("max_depth", 3, 6),
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3),
+        "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+    }
+    if CFG.get("tree_method"): params["tree_method"] = CFG["tree_method"]
+    params["seed"] = 42
+    params["random_state"] = 42
+
+    num_round = trial.suggest_int("num_boost_round", 100, 600, step=50)
+    esr = 50
+
+    model = xgb.train(
+        params, dtr, num_boost_round=num_round,
+        evals=[(dva, "valid")],
+        early_stopping_rounds=esr
+    )
+    preds = model.predict(dva, iteration_range=(0, model.best_iteration + 1))
+    mae = mean_absolute_error(y_va, preds)
+    val_rmse = float(np.sqrt(mean_squared_error(y_va, preds)))
+    val_r2  = float(r2_score(y_va, preds))
+
+    print(f"[VAL] MAE: {mae:.5f} | R²: {val_r2:.5f}")
+    print(f"[VAL] RMSE: {val_rmse:.5f}")
+    trial.set_user_attr("model", model)
+    trial.set_user_attr("r2", val_r2)
+
+    return mae
+
+study = optuna.create_study(direction="minimize")
+for _ in range(MAX_TRIALS):
+    study.optimize(objective, n_trials=1)
+    if study.best_value <= TARGET_MAE:
+        print(f"[OK] Target MAE reached: {study.best_value:.5f} ≤ {TARGET_MAE:.5f}")
+        break
+
+best = study.best_trial
+best_model = best.user_attrs["model"]
+y_pred = best_model.predict(dva, iteration_range=(0, best_model.best_iteration + 1))
+val_mae  = float(mean_absolute_error(y_va, y_pred))
+val_r2   = float(r2_score(y_va, y_pred))
+val_rmse = float(np.sqrt(mean_squared_error(y_va, y_pred)))
+print(f"[VAL*] MAE: {val_mae:.5f} | R²: {val_r2:.5f} | RMSE: {val_rmse:.5f}")
+
+split_meta = {
+    "mode": "time",
+    "train_windows": int(len(y_tr)),
+    "test_windows":  int(len(y_va)),
+}
+# If meta times exist, record boundaries for traceability
+if "meta_start_time" in df.columns and "meta_end_time" in df.columns:
+    split_meta.update({
+        "train_start": str(df.loc[0, "meta_start_time"]),
+        "train_end":   str(df.loc[split_idx-1, "meta_end_time"]) if split_idx>0 else None,
+        "test_start":  str(df.loc[split_idx, "meta_start_time"]) if split_idx < n else None,
+        "test_end":    str(df.loc[n-1, "meta_end_time"]),
+    })
+
+time_holdout_metrics = {
+    "mae":  float(val_mae),
+    "rmse": float(val_rmse),
+    "r2":   float(val_r2),
+    "n_windows": int(len(y_va)),
+}
+
+
+
+# --- make run folder ---
+ts = time.strftime("%Y%m%d_%H%M%S")
+finger = hashlib.md5(str(best.params).encode()).hexdigest()[:10]
+RUN_DIR = OUT_ROOT / f"v{VER}" / f"{ts}_{finger}"
+OUT_ROOT.mkdir(parents=True, exist_ok=True)
+RUN_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- persist artifacts ---
+bin_path    = RUN_DIR / "model.bin"
+pkl_path    = RUN_DIR / "model.joblib"
+scaler_path = RUN_DIR / "scaler.joblib"
+meta_path   = RUN_DIR / "meta.json"
+
+best_model.save_model(str(bin_path))     # native .bin
+joblib.dump(best_model, pkl_path)        # joblib Booster
+if scaler is not None:
+    joblib.dump(scaler, scaler_path)
+
+
+meta = {
+    "best_params": best.params,
+    "optuna_best_trial_mae": float(study.best_value),
+    "optuna_best_trial_r2":  float(best.user_attrs.get("r2", float("nan"))),
+    "final_val_mae": val_mae,
+    "final_val_r2":  val_r2,
+    "final_val_rmse": val_rmse,
+    "data_file": str(DATA_FILE),
+    "features": list(X.columns),
+    "drop_cols": DROP_COLS,
+    "label_col": LABEL_COL,
+    "use_scaler": USE_SCALER,
+    "run_dir": str(RUN_DIR),
+    "timestamp": ts,
+    "fingerprint": finger
+}
+
+meta["split"] = split_meta
+meta.setdefault("metrics", {})
+meta["metrics"]["time_holdout"] = time_holdout_metrics
+
+
+def _file_md5(p: Path) -> str:
+    import hashlib
+    h = hashlib.md5()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1<<20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+git_commit = subprocess.getoutput("git rev-parse --short HEAD") or "NA"
+data_md5   = _file_md5(DATA_FILE)
+feat_md5   = hashlib.md5("|".join(X.columns).encode()).hexdigest()
+
+meta.update({
+    "version": VER,
+    "git_commit": git_commit,
+    "data_md5": data_md5,
+    "features_md5": feat_md5
+})
+
+with open(meta_path, "w") as f:
+    json.dump(meta, f, indent=2)
+assert Path(meta_path).exists(), f"meta.json not found at {meta_path}"
+print("[OK] meta.json:", Path(meta_path).resolve())    
+
+print("\nSaved artifacts:")
+print("  ", bin_path)
+print("  ", pkl_path)
+if scaler is not None:
+    print("  ", scaler_path)
+print("  ", meta_path)
+
+if UPDATE_LATEST:
+    latest = OUT_ROOT / "latest"
+    try:
+        target_rel = RUN_DIR.relative_to(OUT_ROOT) 
+    except Exception:
+        target_rel = RUN_DIR.resolve()
+    try:
+        if latest.exists() or latest.is_symlink():
+            latest.unlink()
+        latest.symlink_to(target_rel, target_is_directory=True)
+        print("↪ updated symlink:", latest, "->", RUN_DIR)
+    except Exception as e:
+        print("symlink update skipped:", e)
+
