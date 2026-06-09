@@ -37,7 +37,7 @@ app = Flask(__name__)
 
 
 def _cluster_output_dir(cluster_id: str) -> str:
-    path = os.path.join("output", f"cluster_{cluster_id}")
+    path = _get_env("OUTPUT_DIR", os.path.join("output", f"cluster_{cluster_id}"))
     os.makedirs(path, exist_ok=True)
     return path
 

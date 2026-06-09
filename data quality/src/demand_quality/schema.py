@@ -29,6 +29,29 @@ class WideDemandDataset:
     timestamp_col: str
     client_cols: list[str]
     frequency: pd.Timedelta
+    diagnostics: "WideDemandDiagnostics"
+
+
+@dataclass(frozen=True)
+class WideDemandDiagnostics:
+    """Raw-load diagnostics preserved for later data-quality scoring."""
+
+    raw_row_count: int
+    timestamp_col_present: bool
+    schema_required_columns_present: bool
+    timestamp_valid_count: int
+    timestamp_invalid_count: int
+    timestamp_valid_ratio: float
+    unique_timestamp_count: int
+    duplicate_timestamp_count: int
+    duplicate_timestamp_score: float
+    monotonic_non_decreasing_score: float
+    interval_regularity_score: float
+    client_column_present: dict[str, bool]
+    client_raw_non_null_count: dict[str, int]
+    client_raw_non_null_ratio: dict[str, float]
+    client_numeric_parseable_count: dict[str, int]
+    client_numeric_parseable_ratio: dict[str, float]
 
 
 def detect_timestamp_column(
@@ -58,6 +81,26 @@ def detect_timestamp_column(
     )
 
 
+def candidate_value_columns(
+    df: pd.DataFrame,
+    timestamp_col: str,
+    ignore_cols: Optional[Iterable[str]] = None,
+) -> list[str]:
+    """Return non-timestamp, non-ignored columns that may contain client values."""
+    ignore = {timestamp_col}
+    if ignore_cols:
+        ignore.update(ignore_cols)
+
+    out: list[str] = []
+    for col in df.columns:
+        if col in ignore:
+            continue
+        if str(col).startswith("Unnamed:"):
+            continue
+        out.append(str(col))
+    return out
+
+
 def coerce_timestamp_series(series: pd.Series) -> pd.Series:
     """Parse a timestamp series while preserving local calendar semantics."""
     parsed = pd.to_datetime(series, errors="coerce")
@@ -73,16 +116,8 @@ def detect_client_columns(
     min_numeric_fraction: float = 0.5,
 ) -> list[str]:
     """Detect numeric client columns in a wide demand table."""
-    ignore = {timestamp_col}
-    if ignore_cols:
-        ignore.update(ignore_cols)
-
     client_cols: list[str] = []
-    for col in df.columns:
-        if col in ignore:
-            continue
-        if str(col).startswith("Unnamed:"):
-            continue
+    for col in candidate_value_columns(df, timestamp_col=timestamp_col, ignore_cols=ignore_cols):
         if pd.api.types.is_numeric_dtype(df[col]):
             client_cols.append(str(col))
             continue

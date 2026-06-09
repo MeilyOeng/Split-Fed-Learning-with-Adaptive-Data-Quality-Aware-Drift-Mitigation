@@ -4,7 +4,7 @@ import pickle
 import sys
 import time
 from threading import Lock
-from typing import Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 import torch
@@ -30,14 +30,20 @@ NORMALIZE_METHOD = os.environ.get("NORMALIZE_METHOD", "zscore").lower()
 NORMALIZE_EPS = float(os.environ.get("NORMALIZE_EPS", "1e-8"))
 SIGN_FLIP = os.environ.get("SIGN_FLIP", "true").lower() in ("1", "true", "yes", "y")
 COMM_LOG_STREAM = os.environ.get("COMM_LOG_STREAM", "false").lower() in ("1", "true", "yes", "y")
+USE_STATIC_FEATURES = os.environ.get("USE_STATIC_FEATURES", "false").lower() in ("1", "true", "yes", "y")
+STATIC_FEATURE_COLUMNS_RAW = os.environ.get("STATIC_FEATURE_COLUMNS", "")
+STATIC_FEATURE_GROUPS_RAW = os.environ.get("STATIC_FEATURE_GROUPS", "")
 
 if abs((TRAIN_RATIO + VAL_RATIO + TEST_RATIO) - 1.0) > 1e-6:
     raise ValueError("TRAIN_RATIO + VAL_RATIO + TEST_RATIO must sum to 1.0")
 
 client_series: Dict[Tuple[str, int], torch.Tensor] = {}
+client_static_features: Dict[Tuple[str, int], torch.Tensor] = {}
 client_norm_stats: Dict[Tuple[str, int], Tuple[float, float]] = {}
 client_split_bounds: Dict[Tuple[str, int], Dict[str, Tuple[int, int]]] = {}
 client_window_counts: Dict[Tuple[str, int], Dict[str, int]] = {}
+client_input_sizes: Dict[Tuple[str, int], int] = {}
+client_sign_flipped: Dict[Tuple[str, int], bool] = {}
 client_offsets: Dict[Tuple[str, int, str], int] = {}
 offset_lock = Lock()
 
@@ -53,11 +59,77 @@ def _append_stream_comm(row: Dict[str, object], cluster_id: str | None) -> None:
     append_comm_row(_stream_comm_log_path(cluster_id), row)
 
 
-def _transform_series(values) -> torch.Tensor:
+def _normalize_client_id(value: object) -> str:
+    text = str(value).strip()
+    if text.endswith(".0"):
+        text = text[:-2]
+    return text
+
+
+def _parse_optional_csv(raw: str | None) -> List[str]:
+    if raw in (None, ""):
+        return []
+    return [part.strip() for part in str(raw).split(",") if part.strip()]
+
+
+def _feature_columns_for_groups(available_columns: list[str], groups: list[str]) -> list[str]:
+    normalized_groups = [group.strip().lower() for group in groups if group.strip()]
+    if not normalized_groups:
+        return []
+    if "all" in normalized_groups:
+        return list(available_columns)
+
+    selected: list[str] = []
+    for column in available_columns:
+        if "numeric" in normalized_groups and column.startswith("meta_num_"):
+            selected.append(column)
+            continue
+        if "category" in normalized_groups and column.startswith("meta_cat_categoria_"):
+            selected.append(column)
+            continue
+        if "subcategory" in normalized_groups and column.startswith("meta_cat_subcategoria_"):
+            selected.append(column)
+            continue
+        if "categorical" in normalized_groups and column.startswith("meta_cat_"):
+            selected.append(column)
+            continue
+    return selected
+
+
+def _resolve_static_feature_columns(available_columns: list[str]) -> list[str]:
+    if not USE_STATIC_FEATURES:
+        return []
+    requested_columns = _parse_optional_csv(STATIC_FEATURE_COLUMNS_RAW)
+    if not requested_columns:
+        requested_groups = _parse_optional_csv(STATIC_FEATURE_GROUPS_RAW)
+        if requested_groups:
+            selected_columns = _feature_columns_for_groups(available_columns, requested_groups)
+            if not selected_columns:
+                raise ValueError(
+                    "STATIC_FEATURE_GROUPS did not match any available columns: "
+                    + ", ".join(requested_groups)
+                )
+            return selected_columns
+        return list(available_columns)
+    missing = [col for col in requested_columns if col not in available_columns]
+    if missing:
+        raise ValueError(
+            "Requested STATIC_FEATURE_COLUMNS were not found in the cluster payload: "
+            + ", ".join(missing)
+        )
+    return requested_columns
+
+
+def _transform_series(values) -> tuple[torch.Tensor, bool]:
     out = torch.as_tensor(values, dtype=torch.float32)
+    should_flip = False
     if SIGN_FLIP:
+        finite = torch.isfinite(out)
+        valid = out[finite]
+        should_flip = bool(valid.numel() > 0 and torch.all(valid < 0).item())
+    if should_flip:
         out = -out
-    return out
+    return out, should_flip
 
 
 def _num_windows(num_values: int) -> int:
@@ -97,23 +169,84 @@ def _normalize_tensor(tensor: torch.Tensor, mean: float, scale: float) -> torch.
     return (tensor - mean) / scale
 
 
-def _prepare_from_dataframe(df: pd.DataFrame, cluster_id: str) -> None: # prepare client tensors, normalization stats, and split bounds from a cluster dataframe
-    if "Fecha_Hora" in df.columns:
-        df["Fecha_Hora"] = pd.to_datetime(df["Fecha_Hora"], errors="coerce")
-        df = df.sort_values(["id", "Fecha_Hora"], kind="stable")
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+def _prepare_from_dataframe(
+    df: pd.DataFrame,
+    cluster_id: str,
+    *,
+    timestamp_col: str = "Fecha_Hora",
+    value_col: str = "value",
+    client_metadata: pd.DataFrame | None = None,
+    static_feature_columns: list[str] | None = None,
+) -> None:
+    # prepare client tensors, static features, normalization stats, and split bounds from a cluster dataframe
+    if timestamp_col in df.columns:
+        df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
+        df = df.sort_values(["id", timestamp_col], kind="stable")
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+
+    feature_lookup: dict[str, torch.Tensor] = {}
+    source_sign_flipped_lookup: dict[str, bool] = {}
+    static_feature_columns = _resolve_static_feature_columns(list(static_feature_columns or []))
+    if client_metadata is not None and not client_metadata.empty:
+        meta = client_metadata.copy()
+        meta["id"] = meta["id"].map(_normalize_client_id)
+        selected_static_feature_columns = [col for col in static_feature_columns if col in meta.columns]
+        if selected_static_feature_columns:
+            meta[selected_static_feature_columns] = meta[selected_static_feature_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        for _, row in meta.iterrows():
+            raw_id = row.get("id")
+            if raw_id is None:
+                continue
+            normalized_id = _normalize_client_id(raw_id)
+            source_sign_flipped_lookup[normalized_id] = bool(row.get("sign_flipped", False))
+            if selected_static_feature_columns:
+                values = row.loc[selected_static_feature_columns].to_numpy(dtype=float, copy=True)
+                feature_lookup[normalized_id] = torch.as_tensor(values, dtype=torch.float32)
+            else:
+                feature_lookup[normalized_id] = torch.empty(0, dtype=torch.float32)
 
     for client_id, rows in df.groupby("id", sort=False):
         rows = rows.copy()
-        rows["value"] = rows["value"].ffill().bfill()
-        if rows["value"].isna().any():
+        rows[value_col] = rows[value_col].ffill().bfill()
+        if rows[value_col].isna().any():
             raise ValueError(f"NaNs remain after fill for cluster={cluster_id}, client={client_id}")
-        key = (str(cluster_id), int(client_id))
-        values = _transform_series(rows["value"].to_numpy(dtype=float))
+        normalized_client_id = _normalize_client_id(client_id)
+        key = (str(cluster_id), int(normalized_client_id))
+        values, sign_flipped = _transform_series(rows[value_col].to_numpy(dtype=float))
         client_series[key] = values.contiguous()
+        client_sign_flipped[key] = bool(source_sign_flipped_lookup.get(normalized_client_id, False) or sign_flipped)
         client_split_bounds[key] = _get_split_bounds(len(values))
         client_window_counts[key] = {k: max(0, end - start) for k, (start, end) in client_split_bounds[key].items()}
         client_norm_stats[key] = _compute_norm_stats(values)
+        static_features = feature_lookup.get(normalized_client_id, torch.empty(0, dtype=torch.float32))
+        client_static_features[key] = static_features
+        client_input_sizes[key] = 1 + int(static_features.numel())
+
+
+def _prepare_from_payload(payload: Any, cluster_id: str) -> None:
+    if isinstance(payload, pd.DataFrame):
+        _prepare_from_dataframe(payload, cluster_id)
+        return
+    if not isinstance(payload, dict):
+        raise TypeError(f"Unsupported cluster pickle payload type: {type(payload).__name__}")
+
+    timeseries = payload.get("timeseries")
+    if not isinstance(timeseries, pd.DataFrame):
+        raise ValueError("Cluster pickle payload must contain a pandas DataFrame under 'timeseries'.")
+    client_metadata = payload.get("client_metadata")
+    if client_metadata is not None and not isinstance(client_metadata, pd.DataFrame):
+        raise ValueError("Cluster pickle payload field 'client_metadata' must be a pandas DataFrame when present.")
+    static_feature_columns = payload.get("static_feature_columns", []) or []
+    timestamp_col = str(payload.get("timestamp_col", "Fecha_Hora"))
+    value_col = str(payload.get("value_col", "value"))
+    _prepare_from_dataframe(
+        timeseries,
+        cluster_id,
+        timestamp_col=timestamp_col,
+        value_col=value_col,
+        client_metadata=client_metadata,
+        static_feature_columns=[str(col) for col in static_feature_columns],
+    )
 
 
 def load_cluster_data() -> None:
@@ -125,8 +258,8 @@ def load_cluster_data() -> None:
             cluster_id = file.split("_")[1].split(".")[0]
             if STREAM_CLUSTER_ID and str(cluster_id) != str(STREAM_CLUSTER_ID):
                 continue
-            df = pd.read_pickle(os.path.join(CLUSTER_DIR, file))
-            _prepare_from_dataframe(df, str(cluster_id))
+            payload = pd.read_pickle(os.path.join(CLUSTER_DIR, file))
+            _prepare_from_payload(payload, str(cluster_id))
             loaded_any = True
     if loaded_any:
         return
@@ -152,6 +285,7 @@ load_cluster_data()
 @app.route("/health", methods=["GET"])
 def health():
     cluster_ids = sorted({cluster_id for cluster_id, _ in client_series.keys()})
+    input_sizes = sorted({input_size for input_size in client_input_sizes.values()})
     return jsonify({
         "status": "healthy",
         "clusters_loaded": len(cluster_ids),
@@ -162,6 +296,11 @@ def health():
         "normalize": NORMALIZE,
         "normalize_method": NORMALIZE_METHOD,
         "sign_flip": SIGN_FLIP,
+        "sign_flip_rule": "flip_only_when_all_non_null_values_are_strictly_negative",
+        "use_static_features": USE_STATIC_FEATURES,
+        "requested_static_feature_groups": _parse_optional_csv(STATIC_FEATURE_GROUPS_RAW),
+        "requested_static_feature_columns": _parse_optional_csv(STATIC_FEATURE_COLUMNS_RAW),
+        "input_sizes": input_sizes,
     })
 
 
@@ -175,6 +314,7 @@ def stream_norm_stats():                            # send normalization stats t
         return jsonify({"error": f"Unknown cluster/client: {cluster_id}/{client_id}"}), 404
     mean, scale = client_norm_stats[key]
     counts = client_window_counts[key]
+    static_feature_count = int(client_static_features.get(key, torch.empty(0)).numel())
     response = {
         "cluster_id": cluster_id,
         "client_id": client_id,
@@ -183,6 +323,13 @@ def stream_norm_stats():                            # send normalization stats t
         "mean": mean,
         "scale": scale,
         "sign_flip": SIGN_FLIP,
+        "sign_flipped_client": bool(client_sign_flipped.get(key, False)),
+        "sign_flip_rule": "flip_only_when_all_non_null_values_are_strictly_negative",
+        "use_static_features": USE_STATIC_FEATURES,
+        "requested_static_feature_groups": _parse_optional_csv(STATIC_FEATURE_GROUPS_RAW),
+        "requested_static_feature_columns": _parse_optional_csv(STATIC_FEATURE_COLUMNS_RAW),
+        "input_size": int(client_input_sizes.get(key, 1)),
+        "static_feature_count": static_feature_count,
         "num_train_windows": counts["train"],
         "num_val_windows": counts["val"],
         "num_test_windows": counts["test"],
@@ -313,11 +460,16 @@ def stream_next():
     windows = [values[i : i + WINDOW_SIZE] for i in range(start_idx, end_idx)]
     targets = [values[i + WINDOW_SIZE + FORECAST_HORIZON - 1] for i in range(start_idx, end_idx)]
     X_batch = torch.stack(windows).unsqueeze(-1).float()
+    static_features = client_static_features.get(key, torch.empty(0, dtype=torch.float32))
+    if static_features.numel() > 0:
+        static_block = static_features.view(1, 1, -1).expand(X_batch.size(0), X_batch.size(1), -1)
+        X_batch = torch.cat([X_batch, static_block], dim=-1)
     y_batch = torch.stack(targets).float()
 
     if NORMALIZE:
         mean, scale = client_norm_stats[key]
-        X_batch = _normalize_tensor(X_batch, mean, scale)
+        X_batch = X_batch.clone()
+        X_batch[:, :, 0] = _normalize_tensor(X_batch[:, :, 0], mean, scale)
         y_batch = _normalize_tensor(y_batch, mean, scale)
 
     payload = pickle.dumps({"X": X_batch, "y": y_batch})

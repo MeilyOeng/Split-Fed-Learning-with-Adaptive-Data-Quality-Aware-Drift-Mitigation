@@ -4,23 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 
-from common.utils import calculate_jsd
-
 from .io import WideDemandDataset, load_wide_demand_csv, save_csv
 from .schema import expected_timestamp_index
 from .statistics import (
-    autocorrelation_at_lags,
-    calendar_coverage_score,
-    make_histogram_bin_edges,
-    peak_offpeak_ratio,
+    median_absolute_deviation,
     rolling_median_mad_anomaly_mask,
-    segment_mean_std,
-    safe_mean,
     safe_std,
     seasonal_naive_anomaly_mask,
     stuck_segment_mask,
@@ -36,19 +29,25 @@ class DimensionScores:
     C2: float
     C3: float
     completeness: float
+    V1: float
+    V2: float
+    V3: float
+    V4: float
+    validity: float
+    CS1: float
+    CS2: float
+    CS3: float
+    CS4: float
+    CS5: float
+    consistency: float
     A1: float
     A2: float
     A3: float
     accuracy: float
-    TC1: float
-    TC2: float
-    TC3: float
-    TC4: float
-    temporal_consistency: float
-    SK1: float
-    SK2: float
-    SK3: float
-    skewness: float
+    F1: float
+    F2: float
+    F3: float
+    freshness: float
     sample_count: int
 
 
@@ -64,6 +63,28 @@ def _weighted_average(scores: dict[str, float], weights: dict[str, float]) -> fl
     return float(total / total_weight)
 
 
+def _get_numeric_series(dataset: WideDemandDataset, client_id: str) -> pd.Series:
+    if client_id in dataset.frame.columns:
+        return pd.to_numeric(dataset.frame[client_id], errors="coerce")
+    return pd.Series(np.nan, index=dataset.frame.index, dtype=float)
+
+
+def _get_timestamp_series(dataset: WideDemandDataset) -> pd.Series:
+    return pd.to_datetime(dataset.frame[dataset.timestamp_col], errors="coerce")
+
+
+def _series_upper_bound(clean_series: pd.Series, cfg: dict) -> float:
+    lower_bound = float(cfg.get("lower_bound", 0.0))
+    fixed_upper = cfg.get("upper_bound")
+    upper_multiplier = float(cfg.get("upper_multiplier", 1.5))
+    clean_valid = pd.to_numeric(clean_series, errors="coerce").dropna()
+    if fixed_upper is not None:
+        return float(fixed_upper)
+    if not clean_valid.empty:
+        return float(max(lower_bound, clean_valid.quantile(0.999) * upper_multiplier))
+    return float(max(lower_bound, upper_multiplier))
+
+
 class CompletenessScorer:
     """Completeness scoring for one wide-format client series."""
 
@@ -76,26 +97,139 @@ class CompletenessScorer:
         clean: WideDemandDataset,
         client_id: str,
     ) -> dict[str, float]:
-        series = current.frame[client_id] if client_id in current.frame.columns else pd.Series(np.nan, index=current.frame.index)
-        valid = series.notna()
-        sample_count = int(valid.sum())
-        c1 = float(sample_count / max(1, len(series)))
-        c2 = 1.0 if client_id in current.frame.columns and sample_count > 0 else 0.0
+        diag = current.diagnostics
+        column_present = bool(diag.client_column_present.get(client_id, False))
+        parseable_count = int(diag.client_numeric_parseable_count.get(client_id, 0))
 
-        expected_index = expected_timestamp_index(current.frame[current.timestamp_col], current.frequency)
-        expected_intervals = max(1, len(expected_index) - 1)
-        ts = pd.to_datetime(current.frame[current.timestamp_col], errors="coerce")
-        deltas = ts.diff()
-        matched = valid & valid.shift(1, fill_value=False) & (deltas == current.frequency)
-        c3 = float(matched.sum() / expected_intervals)
+        c1 = float(diag.client_raw_non_null_ratio.get(client_id, 0.0)) if column_present else 0.0
+        c2 = 1.0 if column_present and parseable_count > 0 else 0.0
+
+        expected_count = len(expected_timestamp_index(clean.frame[clean.timestamp_col], clean.frequency))
+        coverage = float(diag.unique_timestamp_count / max(1, expected_count))
+        c3 = float(min(1.0, coverage)) if column_present and diag.timestamp_col_present else 0.0
 
         weights = dict((self.config.get("subcheck_weights", {}) or {}).get("completeness", {}) or {})
         completeness = _weighted_average({"C1": c1, "C2": c2, "C3": c3}, weights)
-        return {"C1": c1, "C2": c2, "C3": c3, "completeness": completeness, "sample_count": sample_count}
+        return {
+            "C1": c1,
+            "C2": c2,
+            "C3": c3,
+            "completeness": completeness,
+        }
+
+
+class ValidityScorer:
+    """Validity scoring for wide-format client data."""
+
+    def __init__(self, config: Optional[dict] = None):
+        self.config = config or {}
+        self.validity_cfg = dict((self.config.get("validity", {}) or {}))
+
+    def score_client(
+        self,
+        current: WideDemandDataset,
+        clean: WideDemandDataset,
+        client_id: str,
+    ) -> dict[str, float]:
+        diag = current.diagnostics
+        current_series = _get_numeric_series(current, client_id)
+        clean_series = _get_numeric_series(clean, client_id)
+        column_present = bool(diag.client_column_present.get(client_id, False))
+
+        if column_present:
+            v1 = float(diag.client_numeric_parseable_ratio.get(client_id, 1.0))
+        else:
+            v1 = 0.0
+
+        v2 = float(diag.timestamp_valid_ratio) if diag.timestamp_col_present else 0.0
+
+        lower_bound = float(self.validity_cfg.get("lower_bound", 0.0))
+        upper_bound = _series_upper_bound(clean_series, self.validity_cfg)
+        valid_mask = current_series.notna()
+        if valid_mask.any():
+            in_range = current_series.loc[valid_mask].between(lower_bound, upper_bound, inclusive="both")
+            v3 = float(in_range.mean())
+        else:
+            v3 = 0.0
+
+        v4 = 1.0 if (diag.timestamp_col_present and diag.schema_required_columns_present and column_present) else 0.0
+
+        weights = dict((self.config.get("subcheck_weights", {}) or {}).get("validity", {}) or {})
+        validity = _weighted_average({"V1": v1, "V2": v2, "V3": v3, "V4": v4}, weights)
+        return {
+            "V1": v1,
+            "V2": v2,
+            "V3": v3,
+            "V4": v4,
+            "validity": validity,
+        }
+
+
+class ConsistencyScorer:
+    """Consistency scoring for time ordering and dynamic behavior."""
+
+    def __init__(self, config: Optional[dict] = None):
+        self.config = config or {}
+        self.consistency_cfg = dict((self.config.get("consistency", {}) or {}))
+
+    def score_client(
+        self,
+        current: WideDemandDataset,
+        clean: WideDemandDataset,
+        client_id: str,
+    ) -> dict[str, float]:
+        diag = current.diagnostics
+        current_series = _get_numeric_series(current, client_id)
+        clean_series = _get_numeric_series(clean, client_id)
+        column_present = bool(diag.client_column_present.get(client_id, False))
+
+        cs1 = float(diag.interval_regularity_score) if column_present and diag.timestamp_col_present else 0.0
+        cs2 = float(diag.monotonic_non_decreasing_score) if column_present and diag.timestamp_col_present else 0.0
+        cs3 = float(diag.duplicate_timestamp_score) if column_present and diag.timestamp_col_present else 0.0
+
+        valid = current_series.notna()
+        if valid.any():
+            freeze_mask = stuck_segment_mask(
+                current_series,
+                min_len=int(self.consistency_cfg.get("freeze_min_len", 6)),
+                atol=float(self.consistency_cfg.get("freeze_atol", 0.0)),
+            )
+            cs4 = float(max(0.0, 1.0 - freeze_mask.loc[valid].mean()))
+        else:
+            cs4 = 0.0
+
+        diffs = current_series.diff().abs()
+        clean_diffs = clean_series.diff().abs().dropna()
+        fixed_delta = self.consistency_cfg.get("rate_of_change_threshold")
+        if fixed_delta is not None:
+            delta_max = float(fixed_delta)
+        elif not clean_diffs.empty:
+            delta_max = float(clean_diffs.quantile(0.99) * float(self.consistency_cfg.get("roc_multiplier", 1.5)))
+        else:
+            delta_max = float(self.consistency_cfg.get("roc_multiplier", 1.5))
+        applicable = diffs.notna() & valid & valid.shift(1, fill_value=False)
+        if applicable.any():
+            cs5 = float((diffs.loc[applicable] <= delta_max).mean())
+        else:
+            cs5 = 1.0 if valid.any() else 0.0
+
+        weights = dict((self.config.get("subcheck_weights", {}) or {}).get("consistency", {}) or {})
+        consistency = _weighted_average(
+            {"CS1": cs1, "CS2": cs2, "CS3": cs3, "CS4": cs4, "CS5": cs5},
+            weights,
+        )
+        return {
+            "CS1": cs1,
+            "CS2": cs2,
+            "CS3": cs3,
+            "CS4": cs4,
+            "CS5": cs5,
+            "consistency": consistency,
+        }
 
 
 class AccuracyScorer:
-    """Accuracy scoring for one wide-format client series."""
+    """Accuracy and plausibility scoring for local abnormal behavior."""
 
     def __init__(self, config: Optional[dict] = None):
         self.config = config or {}
@@ -107,45 +241,20 @@ class AccuracyScorer:
         clean: WideDemandDataset,
         client_id: str,
     ) -> dict[str, float]:
-        current_series = current.frame[client_id] if client_id in current.frame.columns else pd.Series(np.nan, index=current.frame.index)
-        clean_series = clean.frame[client_id] if client_id in clean.frame.columns else pd.Series(np.nan, index=clean.frame.index)
+        current_series = _get_numeric_series(current, client_id)
+        clean_series = _get_numeric_series(clean, client_id)
 
-        lower_bound = float(self.accuracy_cfg.get("lower_bound", 0.0))
-        fixed_upper = self.accuracy_cfg.get("upper_bound")
-        upper_multiplier = float(self.accuracy_cfg.get("upper_multiplier", 1.5))
-        clean_valid = pd.to_numeric(clean_series, errors="coerce").dropna()
-        if fixed_upper is not None:
-            upper_bound = float(fixed_upper)
-        elif not clean_valid.empty:
-            upper_bound = float(clean_valid.quantile(0.999) * upper_multiplier)
-        else:
-            upper_bound = float(upper_multiplier)
+        a1 = self._score_local_anomaly(current_series)
+        a2 = self._score_robust_deviation(current_series)
+        a3 = self._score_noise_instability(current_series, clean_series)
 
-        current_valid = pd.to_numeric(current_series, errors="coerce")
-        valid_mask = current_valid.notna()
-        if valid_mask.any():
-            in_range = current_valid[valid_mask].between(lower_bound, upper_bound, inclusive="both")
-            a1 = float(in_range.mean())
-        else:
-            a1 = 0.0
-
-        a2 = self._score_local_anomaly(current_valid)
-        a3 = self._score_context_rules(current_valid, clean_valid)
         weights = dict((self.config.get("subcheck_weights", {}) or {}).get("accuracy", {}) or {})
         accuracy = _weighted_average({"A1": a1, "A2": a2, "A3": a3}, weights)
         return {"A1": a1, "A2": a2, "A3": a3, "accuracy": accuracy}
 
     def _score_local_anomaly(self, current_series: pd.Series) -> float:
-        method = str(self.accuracy_cfg.get("deviation_method", "rolling_median")).lower()
-        if method == "seasonal_naive":
-            period = int(self.accuracy_cfg.get("seasonal_period", 24))
-            anomaly, applicable, _ = seasonal_naive_anomaly_mask(
-                current_series,
-                period=period,
-                threshold_multiplier=float(self.accuracy_cfg.get("seasonal_threshold_multiplier", 3.0)),
-                min_threshold_abs=float(self.accuracy_cfg.get("min_threshold_abs", 0.0)),
-            )
-        else:
+        method = str(self.accuracy_cfg.get("local_anomaly_method", "seasonal_naive")).lower()
+        if method == "rolling_median":
             anomaly, applicable, _ = rolling_median_mad_anomaly_mask(
                 current_series,
                 window=int(self.accuracy_cfg.get("rolling_window", 24)),
@@ -153,50 +262,60 @@ class AccuracyScorer:
                 min_history=int(self.accuracy_cfg.get("min_history", 6)),
                 min_threshold_abs=float(self.accuracy_cfg.get("min_threshold_abs", 0.0)),
             )
+        else:
+            anomaly, applicable, _ = seasonal_naive_anomaly_mask(
+                current_series,
+                period=int(self.accuracy_cfg.get("seasonal_period", 24)),
+                threshold_multiplier=float(self.accuracy_cfg.get("seasonal_threshold_multiplier", 3.0)),
+                min_threshold_abs=float(self.accuracy_cfg.get("min_threshold_abs", 0.0)),
+            )
 
         if int(applicable.sum()) == 0:
             return 1.0 if current_series.notna().any() else 0.0
-        anomaly_fraction = float(anomaly.loc[applicable].mean())
-        return float(max(0.0, 1.0 - anomaly_fraction))
+        return float(max(0.0, 1.0 - anomaly.loc[applicable].mean()))
 
-    def _score_context_rules(self, current_series: pd.Series, clean_valid: pd.Series) -> float:
+    def _score_robust_deviation(self, current_series: pd.Series) -> float:
+        anomaly, applicable, _ = rolling_median_mad_anomaly_mask(
+            current_series,
+            window=int(self.accuracy_cfg.get("rolling_window", 24)),
+            mad_multiplier=float(self.accuracy_cfg.get("mad_multiplier", 4.0)),
+            min_history=int(self.accuracy_cfg.get("min_history", 6)),
+            min_threshold_abs=float(self.accuracy_cfg.get("min_threshold_abs", 0.0)),
+        )
+        if int(applicable.sum()) == 0:
+            return 1.0 if current_series.notna().any() else 0.0
+        return float(max(0.0, 1.0 - anomaly.loc[applicable].mean()))
+
+    def _score_noise_instability(self, current_series: pd.Series, clean_series: pd.Series) -> float:
         values = pd.to_numeric(current_series, errors="coerce")
-        valid = values.notna()
-        if not valid.any():
-            return 0.0
+        clean_values = pd.to_numeric(clean_series, errors="coerce")
+        cur_diffs = values.diff().dropna().to_numpy(dtype=float)
+        clean_diffs = clean_values.diff().dropna().to_numpy(dtype=float)
+        cur_diffs = cur_diffs[np.isfinite(cur_diffs)]
+        clean_diffs = clean_diffs[np.isfinite(clean_diffs)]
+        if cur_diffs.size == 0:
+            return 0.0 if values.notna().sum() == 0 else 1.0
 
-        nonneg = float((values.loc[valid] >= 0).mean())
-
-        diffs = values.diff().abs()
-        clean_diffs = clean_valid.diff().abs().dropna()
-        fixed_delta = self.accuracy_cfg.get("rate_of_change_threshold")
-        if fixed_delta is not None:
-            delta_max = float(fixed_delta)
-        elif not clean_diffs.empty:
-            delta_max = float(clean_diffs.quantile(0.99) * float(self.accuracy_cfg.get("roc_multiplier", 1.5)))
-        else:
-            delta_max = float(self.accuracy_cfg.get("roc_multiplier", 1.5))
-        roc_applicable = diffs.notna() & valid & valid.shift(1, fill_value=False)
-        if roc_applicable.any():
-            roc = float((diffs.loc[roc_applicable] <= delta_max).mean())
-        else:
-            roc = 1.0
-
-        freeze_mask = stuck_segment_mask(
-            values,
-            min_len=int(self.accuracy_cfg.get("max_stuck_len", 6)),
-            atol=float(self.accuracy_cfg.get("freeze_atol", 0.0)),
-        )
-        freeze = float(max(0.0, 1.0 - freeze_mask.loc[valid].mean()))
-        return float((nonneg + roc + freeze) / 3.0)
+        cur_noise = median_absolute_deviation(cur_diffs)
+        if cur_noise <= 0:
+            cur_noise = safe_std(cur_diffs)
+        ref_noise = median_absolute_deviation(clean_diffs)
+        if ref_noise <= 0:
+            ref_noise = safe_std(clean_diffs)
+        epsilon = float(self.accuracy_cfg.get("epsilon", 1e-6))
+        ref_noise = max(ref_noise, epsilon)
+        ratio = cur_noise / ref_noise
+        allowed_ratio = float(self.accuracy_cfg.get("allowed_noise_ratio", 2.0))
+        excess = max(0.0, ratio - 1.0)
+        return float(max(0.0, 1.0 - min(1.0, excess / max(allowed_ratio, epsilon))))
 
 
-class TemporalConsistencyScorer:
-    """Temporal consistency scoring for one client series."""
+class FreshnessScorer:
+    """Freshness scoring for recency-based quality checks."""
 
     def __init__(self, config: Optional[dict] = None):
         self.config = config or {}
-        self.tc_cfg = dict((self.config.get("temporal_consistency", {}) or {}))
+        self.freshness_cfg = dict((self.config.get("freshness", {}) or {}))
 
     def score_client(
         self,
@@ -204,104 +323,51 @@ class TemporalConsistencyScorer:
         clean: WideDemandDataset,
         client_id: str,
     ) -> dict[str, float]:
-        current_series = current.frame[client_id] if client_id in current.frame.columns else pd.Series(np.nan, index=current.frame.index)
-        clean_series = clean.frame[client_id] if client_id in clean.frame.columns else pd.Series(np.nan, index=clean.frame.index)
-        current_valid = pd.to_numeric(current_series, errors="coerce")
-        clean_valid = pd.to_numeric(clean_series, errors="coerce")
-        valid_mask = current_valid.notna()
+        current_series = _get_numeric_series(current, client_id)
+        current_ts = _get_timestamp_series(current)
+        clean_ts = _get_timestamp_series(clean)
+        valid = current_series.notna() & current_ts.notna()
 
-        tau = pd.to_timedelta(self.tc_cfg.get("staleness_tau", "48h"))
-        if valid_mask.any():
-            latest_valid_ts = pd.to_datetime(current.frame.loc[valid_mask, current.timestamp_col], errors="coerce").max()
-            ref_time = pd.to_datetime(current.frame[current.timestamp_col], errors="coerce").max()
+        ref_time = clean_ts.max()
+        if valid.any() and pd.notna(ref_time):
+            latest_valid_ts = current_ts.loc[valid].max()
             age = ref_time - latest_valid_ts
-            tc1 = float(max(0.0, 1.0 - age / tau))
+            tau = pd.to_timedelta(self.freshness_cfg.get("staleness_tau", "48h"))
+            f1 = float(max(0.0, 1.0 - (age / tau))) if tau > pd.Timedelta(0) else 1.0
         else:
-            tc1 = 0.0
+            f1 = 0.0
 
-        epsilon = float(self.tc_cfg.get("epsilon", 1e-6))
-        lags = list(self.tc_cfg.get("autocorr_lags", [1, 24, 168]))
-        autocorr_threshold = float(self.tc_cfg.get("autocorr_threshold", 0.25))
-        ref_autocorr = autocorrelation_at_lags(clean_valid, lags)
-        cur_autocorr = autocorrelation_at_lags(current_valid, lags)
-        common_lags = [lag for lag in lags if int(lag) in ref_autocorr and int(lag) in cur_autocorr]
-        if common_lags:
-            diffs = [
-                abs(cur_autocorr[int(lag)] - ref_autocorr[int(lag)])
-                for lag in common_lags
-            ]
-            mean_diff = float(np.mean(diffs))
-            tc2 = float(max(0.0, 1.0 - min(1.0, mean_diff / max(autocorr_threshold, epsilon))))
+        recency_window = pd.to_timedelta(self.freshness_cfg.get("window_recency_span", "168h"))
+        if pd.isna(ref_time) or recency_window <= pd.Timedelta(0):
+            f2 = 0.0
         else:
-            tc2 = 1.0 if current_valid.notna().any() and clean_valid.notna().any() else 0.0
+            recent_start = ref_time - recency_window
+            expected_recent = expected_timestamp_index(clean.frame[clean.timestamp_col], clean.frequency)
+            expected_recent_count = int(((expected_recent >= recent_start) & (expected_recent <= ref_time)).sum())
+            current_recent_valid = valid & (current_ts >= recent_start) & (current_ts <= ref_time)
+            f2 = float(current_recent_valid.sum() / max(1, expected_recent_count))
+            f2 = float(min(1.0, max(0.0, f2)))
 
-        tc3 = calendar_coverage_score(
-            current.frame[current.timestamp_col],
-            valid_mask,
-            n_min=int(self.tc_cfg.get("calendar_n_min", 1)),
-        )
-
-        n_segments = int(self.tc_cfg.get("stationarity_segments", 4))
-        stationarity_tolerance = float(self.tc_cfg.get("stationarity_tolerance", 1.0))
-        sigma_ref = segment_mean_std(clean_valid, n_segments=n_segments)
-        sigma_cur = segment_mean_std(current_valid, n_segments=n_segments)
-        if current_valid.notna().any() and clean_valid.notna().any():
-            ref_scale = max(sigma_ref, safe_std(clean_valid), epsilon)
-            excess = max(0.0, sigma_cur - sigma_ref)
-            tc4 = float(max(0.0, 1.0 - min(1.0, excess / max(ref_scale * stationarity_tolerance, epsilon))))
+        reporting_delay_enabled = bool(self.freshness_cfg.get("reporting_delay_enabled", False))
+        if not reporting_delay_enabled:
+            f3 = 1.0
         else:
-            tc4 = 0.0
+            reporting_ref = self.freshness_cfg.get("reporting_reference_time")
+            delay_tau = pd.to_timedelta(self.freshness_cfg.get("reporting_delay_tau", "24h"))
+            if reporting_ref is None or delay_tau <= pd.Timedelta(0) or not valid.any():
+                f3 = 1.0
+            else:
+                reference_time = pd.to_datetime(reporting_ref, errors="coerce")
+                if pd.isna(reference_time):
+                    f3 = 1.0
+                else:
+                    latest_valid_ts = current_ts.loc[valid].max()
+                    delay = reference_time - latest_valid_ts
+                    f3 = float(max(0.0, 1.0 - (delay / delay_tau)))
 
-        weights = dict((self.config.get("subcheck_weights", {}) or {}).get("temporal_consistency", {}) or {})
-        temporal = _weighted_average({"TC1": tc1, "TC2": tc2, "TC3": tc3, "TC4": tc4}, weights)
-        return {"TC1": tc1, "TC2": tc2, "TC3": tc3, "TC4": tc4, "temporal_consistency": temporal}
-
-
-class SkewnessScorer:
-    """Distribution-shift scoring for one client series."""
-
-    def __init__(self, config: Optional[dict] = None):
-        self.config = config or {}
-        self.sk_cfg = dict((self.config.get("skewness", {}) or {}))
-
-    def score_client(
-        self,
-        current: WideDemandDataset,
-        clean: WideDemandDataset,
-        client_id: str,
-    ) -> dict[str, float]:
-        current_series = current.frame[client_id] if client_id in current.frame.columns else pd.Series(np.nan, index=current.frame.index)
-        clean_series = clean.frame[client_id] if client_id in clean.frame.columns else pd.Series(np.nan, index=clean.frame.index)
-        current_valid = pd.to_numeric(current_series, errors="coerce").dropna()
-        clean_valid = pd.to_numeric(clean_series, errors="coerce").dropna()
-        if current_valid.empty or clean_valid.empty:
-            sk1 = 0.0
-            sk2 = 0.0
-            sk3 = 0.0
-        else:
-            bins = int(self.sk_cfg.get("jsd_bins", 20))
-            strategy = str(self.sk_cfg.get("histogram_strategy", "quantile"))
-            epsilon = float(self.sk_cfg.get("epsilon", 1e-6))
-            edges = make_histogram_bin_edges(clean_valid.to_numpy(dtype=float), bins=bins, strategy=strategy)
-            ref_probs = np.histogram(clean_valid.to_numpy(dtype=float), bins=edges)[0].astype(float) + epsilon
-            cur_probs = np.histogram(current_valid.to_numpy(dtype=float), bins=edges)[0].astype(float) + epsilon
-            jsd = calculate_jsd(ref_probs, cur_probs, base=np.e)
-            sk1 = float(max(0.0, 1.0 - min(1.0, jsd / np.log(2.0))))
-
-            peak_hours = list(self.sk_cfg.get("peak_hours", [17, 18, 19, 20, 21]))
-            cur_ratio = peak_offpeak_ratio(current_series, current.frame[current.timestamp_col], peak_hours, epsilon=epsilon)
-            ref_ratio = peak_offpeak_ratio(clean_series, clean.frame[clean.timestamp_col], peak_hours, epsilon=epsilon)
-            allowed_shift = float(self.sk_cfg.get("allowed_peak_ratio_shift", 0.5))
-            sk2 = float(max(0.0, 1.0 - min(1.0, abs(cur_ratio - ref_ratio) / max(allowed_shift, epsilon))))
-
-            mean_shift = abs(safe_mean(current_valid) - safe_mean(clean_valid)) / max(safe_std(clean_valid), epsilon)
-            std_shift = abs(safe_std(current_valid) - safe_std(clean_valid)) / max(safe_std(clean_valid), epsilon)
-            threshold = float(self.sk_cfg.get("moment_shift_threshold", 3.0))
-            sk3 = float(max(0.0, 1.0 - min(1.0, (mean_shift + std_shift) / max(threshold, epsilon))))
-
-        weights = dict((self.config.get("subcheck_weights", {}) or {}).get("skewness", {}) or {})
-        skewness = _weighted_average({"SK1": sk1, "SK2": sk2, "SK3": sk3}, weights)
-        return {"SK1": sk1, "SK2": sk2, "SK3": sk3, "skewness": skewness}
+        weights = dict((self.config.get("subcheck_weights", {}) or {}).get("freshness", {}) or {})
+        freshness = _weighted_average({"F1": f1, "F2": f2, "F3": f3}, weights)
+        return {"F1": f1, "F2": f2, "F3": f3, "freshness": freshness}
 
 
 class WideDemandQualityScorer:
@@ -310,9 +376,10 @@ class WideDemandQualityScorer:
     def __init__(self, config: Optional[dict] = None):
         self.config = config or {}
         self.completeness = CompletenessScorer(config=self.config)
+        self.validity = ValidityScorer(config=self.config)
+        self.consistency = ConsistencyScorer(config=self.config)
         self.accuracy = AccuracyScorer(config=self.config)
-        self.temporal = TemporalConsistencyScorer(config=self.config)
-        self.skewness = SkewnessScorer(config=self.config)
+        self.freshness = FreshnessScorer(config=self.config)
 
     def score(
         self,
@@ -324,9 +391,11 @@ class WideDemandQualityScorer:
         rows: list[DimensionScores] = []
         for client_id in selected:
             comp = self.completeness.score_client(current, clean, client_id)
+            val = self.validity.score_client(current, clean, client_id)
+            cons = self.consistency.score_client(current, clean, client_id)
             acc = self.accuracy.score_client(current, clean, client_id)
-            temp = self.temporal.score_client(current, clean, client_id)
-            skew = self.skewness.score_client(current, clean, client_id)
+            fresh = self.freshness.score_client(current, clean, client_id)
+            sample_count = int(_get_numeric_series(current, client_id).notna().sum())
             rows.append(
                 DimensionScores(
                     client_id=client_id,
@@ -334,20 +403,26 @@ class WideDemandQualityScorer:
                     C2=comp["C2"],
                     C3=comp["C3"],
                     completeness=comp["completeness"],
+                    V1=val["V1"],
+                    V2=val["V2"],
+                    V3=val["V3"],
+                    V4=val["V4"],
+                    validity=val["validity"],
+                    CS1=cons["CS1"],
+                    CS2=cons["CS2"],
+                    CS3=cons["CS3"],
+                    CS4=cons["CS4"],
+                    CS5=cons["CS5"],
+                    consistency=cons["consistency"],
                     A1=acc["A1"],
                     A2=acc["A2"],
                     A3=acc["A3"],
                     accuracy=acc["accuracy"],
-                    TC1=temp["TC1"],
-                    TC2=temp["TC2"],
-                    TC3=temp["TC3"],
-                    TC4=temp["TC4"],
-                    temporal_consistency=temp["temporal_consistency"],
-                    SK1=skew["SK1"],
-                    SK2=skew["SK2"],
-                    SK3=skew["SK3"],
-                    skewness=skew["skewness"],
-                    sample_count=int(comp["sample_count"]),
+                    F1=fresh["F1"],
+                    F2=fresh["F2"],
+                    F3=fresh["F3"],
+                    freshness=fresh["freshness"],
+                    sample_count=sample_count,
                 )
             )
 
@@ -355,10 +430,31 @@ class WideDemandQualityScorer:
         if out.empty:
             return pd.DataFrame(
                 columns=[
-                    "client_id", "C1", "C2", "C3", "completeness",
-                    "A1", "A2", "A3", "accuracy",
-                    "TC1", "TC2", "TC3", "TC4", "temporal_consistency",
-                    "SK1", "SK2", "SK3", "skewness", "sample_count",
+                    "client_id",
+                    "C1",
+                    "C2",
+                    "C3",
+                    "completeness",
+                    "V1",
+                    "V2",
+                    "V3",
+                    "V4",
+                    "validity",
+                    "CS1",
+                    "CS2",
+                    "CS3",
+                    "CS4",
+                    "CS5",
+                    "consistency",
+                    "A1",
+                    "A2",
+                    "A3",
+                    "accuracy",
+                    "F1",
+                    "F2",
+                    "F3",
+                    "freshness",
+                    "sample_count",
                 ]
             )
         return out.sort_values("client_id", kind="mergesort").reset_index(drop=True)

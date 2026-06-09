@@ -16,9 +16,10 @@ from .io import save_csv, save_json
 
 QUALITY_DIMENSIONS = [
     "completeness",
+    "validity",
+    "consistency",
     "accuracy",
-    "temporal_consistency",
-    "skewness",
+    "freshness",
 ]
 
 
@@ -156,9 +157,10 @@ def compute_pca_quality_scores(
     column_order = [
         "client_id",
         "completeness",
+        "validity",
+        "consistency",
         "accuracy",
-        "temporal_consistency",
-        "skewness",
+        "freshness",
         "pca_raw_score",
         "quality_score",
         "sample_count",

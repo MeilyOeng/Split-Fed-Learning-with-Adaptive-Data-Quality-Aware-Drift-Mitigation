@@ -40,17 +40,104 @@ CLIENT_PATH = "client/client.py"
 STREAM_SERVICE_PATH = "data/stream_service.py"
 SERVER_PATH = "server/server.py"
 ASSIGNMENTS_PATH = Path("dataset") / "cluster-assignment.csv"
-OUTPUT_DIR = Path("output")
+OUTPUT_DIR = Path("outputs") / "output-default"
 RESULTS_DIR = OUTPUT_DIR / "results"
+CLUSTER_DATA_DIR = Path("dataset") / "output"
 STREAM_BASE_PORT = 5101
 SERVER_BASE_PORT = 5002
 CLIENT_WORKER_BASE_PORT = 6101
 
+
+def configure_output_dirs() -> None:
+    global OUTPUT_DIR, RESULTS_DIR
+    explicit_output_dir = str(os.environ.get("OUTPUT_DIR", "")).strip()
+    if explicit_output_dir:
+        OUTPUT_DIR = Path(explicit_output_dir)
+    else:
+        outputs_root = Path(str(os.environ.get("OUTPUTS_ROOT", "outputs")).strip() or "outputs")
+        output_name = str(os.environ.get("OUTPUT_NAME", "")).strip()
+        if not output_name:
+            output_name = f"output-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        OUTPUT_DIR = outputs_root / output_name
+    RESULTS_DIR = OUTPUT_DIR / "results"
+
+
 def refresh_runtime_settings_from_env() -> None:
-    global STREAM_BASE_PORT, SERVER_BASE_PORT, CLIENT_WORKER_BASE_PORT
+    global STREAM_BASE_PORT, SERVER_BASE_PORT, CLIENT_WORKER_BASE_PORT, CLUSTER_DATA_DIR
     STREAM_BASE_PORT = int(os.environ.get("STREAM_BASE_PORT", str(STREAM_BASE_PORT)))
     SERVER_BASE_PORT = int(os.environ.get("SERVER_BASE_PORT", str(SERVER_BASE_PORT)))
     CLIENT_WORKER_BASE_PORT = int(os.environ.get("CLIENT_WORKER_BASE_PORT", str(CLIENT_WORKER_BASE_PORT)))
+    CLUSTER_DATA_DIR = Path(os.environ.get("CLUSTER_DATA_DIR", str(CLUSTER_DATA_DIR)))
+
+
+def configure_model_input_size(env: dict) -> None:
+    manifest_path = CLUSTER_DATA_DIR / "feature_manifest.json"
+    auto_model_input_size = parse_bool(os.environ.get("AUTO_MODEL_INPUT_SIZE", "true"), default=True)
+    use_static_features = parse_bool(os.environ.get("USE_STATIC_FEATURES", "false"), default=False)
+    requested_static_columns = _parse_optional_csv(os.environ.get("STATIC_FEATURE_COLUMNS"))
+    requested_static_groups = _parse_optional_csv(os.environ.get("STATIC_FEATURE_GROUPS"))
+    if not auto_model_input_size:
+        return
+    if not use_static_features:
+        previous = str(env.get("MODEL_INPUT_SIZE", "1"))
+        env["MODEL_INPUT_SIZE"] = "1"
+        if previous != "1":
+            log("MODEL_INPUT_SIZE overridden to 1 because USE_STATIC_FEATURES=false")
+        return
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"USE_STATIC_FEATURES=true requires {manifest_path}. "
+            "Run data/clustering_processing.py first or disable static features."
+        )
+
+    manifest = read_json(manifest_path)
+    available_static_columns = list(manifest.get("static_feature_columns", []) or [])
+    if requested_static_groups and requested_static_columns:
+        raise ValueError("Use either STATIC_FEATURE_COLUMNS or STATIC_FEATURE_GROUPS, not both.")
+
+    if requested_static_groups:
+        selected_static_columns: list[str] = []
+        normalized_groups = [group.strip().lower() for group in requested_static_groups if group.strip()]
+        if "all" in normalized_groups:
+            selected_static_columns = list(available_static_columns)
+        else:
+            for column in available_static_columns:
+                if "numeric" in normalized_groups and column.startswith("meta_num_"):
+                    selected_static_columns.append(column)
+                    continue
+                if "category" in normalized_groups and column.startswith("meta_cat_categoria_"):
+                    selected_static_columns.append(column)
+                    continue
+                if "subcategory" in normalized_groups and column.startswith("meta_cat_subcategoria_"):
+                    selected_static_columns.append(column)
+                    continue
+                if "categorical" in normalized_groups and column.startswith("meta_cat_"):
+                    selected_static_columns.append(column)
+                    continue
+        if not selected_static_columns:
+            raise ValueError(
+                "STATIC_FEATURE_GROUPS did not match any available columns: " + ", ".join(requested_static_groups)
+            )
+    elif requested_static_columns:
+        missing = [col for col in requested_static_columns if col not in available_static_columns]
+        if missing:
+            raise ValueError(
+                "STATIC_FEATURE_COLUMNS contains unknown feature names: " + ", ".join(missing)
+            )
+        selected_static_columns = requested_static_columns
+    else:
+        selected_static_columns = available_static_columns
+    input_size = 1 + len(selected_static_columns)
+    previous = str(env.get("MODEL_INPUT_SIZE", "1"))
+    env["MODEL_INPUT_SIZE"] = str(input_size)
+    if previous != str(input_size):
+        log(f"MODEL_INPUT_SIZE overridden from {previous} to {input_size} using {manifest_path}")
+    if requested_static_columns:
+        log(f"Using selected static features: {selected_static_columns}")
+    elif requested_static_groups:
+        log(f"Using static feature groups {requested_static_groups}: {selected_static_columns}")
+    else:
+        log(f"Using all static features ({len(selected_static_columns)}) from {manifest_path}")
 
 
 def load_cluster_ids(path: Path) -> List[str]:
@@ -143,6 +230,7 @@ def start_stream_service(cluster_id: str, env: dict, cluster_idx: int):
             "STREAM_CLUSTER_ID": str(cluster_id),
             "CLUSTER_ID": str(cluster_id),
             "STREAM_PORT": str(port),
+            "CLUSTER_DIR": str(CLUSTER_DATA_DIR),
             "PROCESS_ROLE": f"stream_cluster_{cluster_idx}",
             "GPU_ENABLED": "false",
         }
@@ -198,6 +286,7 @@ def start_client_worker(cluster_id: str, client_id: str, server_port: int, strea
             "SERVER_PORT": str(server_port),
             "DATA_STREAM_API_URL": f"http://localhost:{stream_port}",
             "CLIENT_WORKER_PORT": str(port),
+            "OUTPUT_DIR": str(cdir),
         }
     )
     log(f"[launch] client cluster={cluster_id} client={client_id} port={port} gpu_id={gpu_meta['gpu_id']} CUDA_VISIBLE_DEVICES={gpu_meta['cuda_visible_devices']}")
@@ -1043,6 +1132,7 @@ def run_test_phase(cluster_ids, cluster_clients, env):
 def main() -> int:
     start_time = time.time()
     dotenv_path = load_env_file()
+    configure_output_dirs()
     refresh_runtime_settings_from_env()
     ensure_dir(OUTPUT_DIR)
     ensure_dir(RESULTS_DIR)
@@ -1086,8 +1176,13 @@ def main() -> int:
             "COMM_LOG_EVAL": os.environ.get("COMM_LOG_EVAL", "false"),
             "COMM_LOG_STREAM": os.environ.get("COMM_LOG_STREAM", "false"),
             "COMM_LOG_EVERY_N_BATCHES": os.environ.get("COMM_LOG_EVERY_N_BATCHES", "1"),
+            "USE_STATIC_FEATURES": os.environ.get("USE_STATIC_FEATURES", "false"),
+            "STATIC_FEATURE_COLUMNS": os.environ.get("STATIC_FEATURE_COLUMNS", ""),
+            "STATIC_FEATURE_GROUPS": os.environ.get("STATIC_FEATURE_GROUPS", ""),
+            "AUTO_MODEL_INPUT_SIZE": os.environ.get("AUTO_MODEL_INPUT_SIZE", "true"),
         }
     )
+    configure_model_input_size(env)
 
     total_epochs = int(env["NUM_EPOCHS"])
     detected_clusters = load_cluster_ids(ASSIGNMENTS_PATH)
@@ -1104,6 +1199,8 @@ def main() -> int:
     log(f"Client order strategy: {env['CLIENT_ORDER_STRATEGY']}")
     log(f"Schedule seed: {env['RANDOM_SEED_SCHEDULE']}")
     log(f"Eval mode: {env['EVAL_MODE']}")
+    log(f"Run output directory: {OUTPUT_DIR}")
+    log(f"Cluster data directory: {CLUSTER_DATA_DIR}")
     log(f"Model layers: {env['MODEL_NUM_LAYERS']}, split at: {env['MODEL_SPLIT_LAYER']}")
     log(f"Window size: {env['WINDOW_SIZE']} horizon: {env['FORECAST_HORIZON']} batch_size: {env['BATCH_SIZE']}")
     log(f"Train/Val/Test ratios: {env['TRAIN_RATIO']}/{env['VAL_RATIO']}/{env['TEST_RATIO']}")

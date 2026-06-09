@@ -3,57 +3,59 @@ frequency: "1h"
 clients:
   selected: []
 
-accuracy:
+validity:
   lower_bound: 0.0
   upper_bound:
   upper_multiplier: 1.5
-  deviation_method: rolling_median
+
+consistency:
+  freeze_min_len: 6
+  freeze_atol: 0.0
+  rate_of_change_threshold:
+  roc_multiplier: 1.5
+
+accuracy:
+  local_anomaly_method: seasonal_naive
   rolling_window: 24
   min_history: 6
   mad_multiplier: 4.0
   min_threshold_abs: 0.1
   seasonal_period: 24
   seasonal_threshold_multiplier: 3.0
-  rate_of_change_threshold:
-  roc_multiplier: 1.5
-  max_stuck_len: 6
-  freeze_atol: 0.0
+  allowed_noise_ratio: 2.0
+  epsilon: 1.0e-6
 
-temporal_consistency:
+freshness:
   staleness_tau: "48h"
-  calendar_n_min: 1
-  autocorr_lags: [1, 24, 168]
-  autocorr_threshold: 0.25
-  stationarity_segments: 4
-  stationarity_tolerance: 1.0
-  epsilon: 1.0e-6
-
-skewness:
-  jsd_bins: 20
-  histogram_strategy: quantile
-  epsilon: 1.0e-6
-  peak_hours: [17, 18, 19, 20, 21]
-  allowed_peak_ratio_shift: 0.5
-  moment_shift_threshold: 3.0
+  window_recency_span: "168h"
+  reporting_delay_enabled: false
+  reporting_delay_tau: "24h"
+  reporting_reference_time:
 
 subcheck_weights:
   completeness:
     C1: 1.0
     C2: 1.0
     C3: 1.0
+  validity:
+    V1: 1.0
+    V2: 1.0
+    V3: 1.0
+    V4: 1.0
+  consistency:
+    CS1: 1.0
+    CS2: 1.0
+    CS3: 1.0
+    CS4: 1.0
+    CS5: 1.0
   accuracy:
     A1: 1.0
     A2: 1.0
     A3: 1.0
-  temporal_consistency:
-    TC1: 1.0
-    TC2: 1.0
-    TC3: 1.0
-    TC4: 1.0
-  skewness:
-    SK1: 1.0
-    SK2: 1.0
-    SK3: 1.0
+  freshness:
+    F1: 1.0
+    F2: 1.0
+    F3: 1.0
 
 pca:
   epsilon: 1.0e-9

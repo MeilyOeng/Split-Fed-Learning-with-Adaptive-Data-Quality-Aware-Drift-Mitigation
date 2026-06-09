@@ -16,18 +16,22 @@ from .statistics import safe_std
 
 SIMPLE_FAULT_TYPES = (
     "missing",
-    "out_of_range",
-    "inconsistent",
-    "timeliness",
+    "invalid_high",
+    "negative_value",
+    "replayed_value",
 )
 
 SIMPLE_FAULT_META = {
     "missing": ("completeness", "C1"),
-    "out_of_range": ("accuracy", "A1"),
-    "inconsistent": ("accuracy", "A1"),
-    "timeliness": ("temporal_consistency", "TC1"),
-    "noise": ("accuracy", "A2"),
-    "spike": ("accuracy", "A2"),
+    "invalid_high": ("validity", "V3"),
+    "negative_value": ("validity", "V3"),
+    "replayed_value": ("consistency", "CS4"),
+    "noise": ("accuracy", "A3"),
+    "spike": ("accuracy", "A1"),
+    # Legacy aliases kept for backward-compatible parsing.
+    "out_of_range": ("validity", "V3"),
+    "inconsistent": ("validity", "V3"),
+    "timeliness": ("consistency", "CS4"),
 }
 
 _ORIG_ROW_ID_COL = "__dq_orig_row_id__"
@@ -124,6 +128,10 @@ def _resolve_fault_config(config: dict, key: str) -> dict:
     return dict((config.get("faults", {}) or {}).get(key, {}) or {})
 
 
+def _resolve_drift_config(config: dict, key: str) -> dict:
+    return dict((config.get("drift", {}) or {}).get(key, {}) or {})
+
+
 class WideDemandFaultInjector:
     """Injects structured faults into a wide-format demand table."""
 
@@ -164,9 +172,13 @@ class WideDemandFaultInjector:
         shared_duplicate_rows: list[int] = []
 
         completeness_cfg = _resolve_fault_config(self.config, "completeness")
+        validity_cfg = _resolve_fault_config(self.config, "validity")
+        consistency_cfg = _resolve_fault_config(self.config, "consistency")
         accuracy_cfg = _resolve_fault_config(self.config, "accuracy")
-        temporal_cfg = _resolve_fault_config(self.config, "temporal_consistency")
-        skewness_cfg = _resolve_fault_config(self.config, "skewness")
+        freshness_cfg = _resolve_fault_config(self.config, "freshness")
+        drift_distribution_cfg = _resolve_drift_config(self.config, "distribution_shift")
+        drift_temporal_cfg = _resolve_drift_config(self.config, "temporal_pattern_shift")
+        drift_regime_cfg = _resolve_drift_config(self.config, "regime_shift")
 
         shared_drop_rate = float(completeness_cfg.get("dropped_timestamp_rows_fraction", 0.0))
         if shared_drop_rate > 0:
@@ -187,7 +199,7 @@ class WideDemandFaultInjector:
                 )
             )
 
-        duplicate_rate = float(temporal_cfg.get("duplicated_timestamp_fraction", 0.0))
+        duplicate_rate = float(consistency_cfg.get("duplicated_timestamp_fraction", 0.0))
         if duplicate_rate > 0:
             dup_count = min(n_rows, max(1, int(round(n_rows * duplicate_rate))))
             shared_duplicate_rows = list(map(int, rng.choice(n_rows, size=dup_count, replace=False)))
@@ -196,8 +208,8 @@ class WideDemandFaultInjector:
                 self._make_event(
                     client_id="__all_clients__",
                     fault_type="duplicated_timestamps",
-                    dimension="temporal_consistency",
-                    subcheck="TC3",
+                    dimension="consistency",
+                    subcheck="CS3",
                     idxs=idxs,
                     timestamps=timestamps,
                     n_rows=n_rows,
@@ -217,14 +229,14 @@ class WideDemandFaultInjector:
             abs_q99 = float(np.nanquantile(np.abs(values[np.isfinite(values)]), 0.99)) if valid_positions.size else 1.0
             upper_anchor = max(abs_q99, scale, 1.0)
 
-            self._inject_accuracy_faults(
+            self._inject_validity_faults(
                 frame,
                 client_id,
                 values,
                 valid_positions,
                 scale,
                 upper_anchor,
-                accuracy_cfg,
+                validity_cfg,
                 client_factor,
                 rng,
                 timestamps,
@@ -233,12 +245,12 @@ class WideDemandFaultInjector:
             values = pd.to_numeric(frame[client_id], errors="coerce").to_numpy(dtype=float, copy=True)
             valid_positions = np.flatnonzero(np.isfinite(values))
 
-            self._inject_temporal_faults(
+            self._inject_consistency_faults(
                 frame,
                 client_id,
                 values,
                 valid_positions,
-                temporal_cfg,
+                consistency_cfg,
                 client_factor,
                 rng,
                 timestamps,
@@ -247,13 +259,13 @@ class WideDemandFaultInjector:
             values = pd.to_numeric(frame[client_id], errors="coerce").to_numpy(dtype=float, copy=True)
             valid_positions = np.flatnonzero(np.isfinite(values))
 
-            self._inject_skewness_faults(
+            self._inject_accuracy_faults(
                 frame,
                 client_id,
                 values,
                 valid_positions,
                 scale,
-                skewness_cfg,
+                accuracy_cfg,
                 client_factor,
                 rng,
                 timestamps,
@@ -268,6 +280,39 @@ class WideDemandFaultInjector:
                 values,
                 valid_positions,
                 completeness_cfg,
+                client_factor,
+                rng,
+                timestamps,
+                events,
+            )
+
+            values = pd.to_numeric(frame[client_id], errors="coerce").to_numpy(dtype=float, copy=True)
+            valid_positions = np.flatnonzero(np.isfinite(values))
+
+            self._inject_freshness_faults(
+                frame,
+                client_id,
+                values,
+                valid_positions,
+                freshness_cfg,
+                client_factor,
+                rng,
+                timestamps,
+                events,
+            )
+
+            values = pd.to_numeric(frame[client_id], errors="coerce").to_numpy(dtype=float, copy=True)
+            valid_positions = np.flatnonzero(np.isfinite(values))
+
+            self._inject_drift_faults(
+                frame,
+                client_id,
+                values,
+                valid_positions,
+                scale,
+                drift_distribution_cfg,
+                drift_temporal_cfg,
+                drift_regime_cfg,
                 client_factor,
                 rng,
                 timestamps,
@@ -348,13 +393,22 @@ class WideDemandFaultInjector:
                 raise ValueError("simple_fault_probabilities must be non-negative and sum to a positive value.")
             fault_probabilities = fault_probabilities / fault_probabilities.sum()
 
-        out_of_range_low, out_of_range_high = self.config.get("simple_out_of_range_range", [1.5, 3.0])
-        inconsistent_low, inconsistent_high = self.config.get("simple_inconsistent_range", [4.0, 8.0])
+        invalid_high_low, invalid_high_high = self.config.get(
+            "simple_invalid_high_range",
+            self.config.get("simple_out_of_range_range", [1.5, 3.0]),
+        )
+        negative_low, negative_high = self.config.get(
+            "simple_negative_value_range",
+            self.config.get("simple_inconsistent_range", [4.0, 8.0]),
+        )
         noise_std_fraction = float(self.config.get("simple_noise_std_fraction", 0.05))
         spike_multiplier = float(self.config.get("simple_spike_multiplier", 4.0))
-        timeliness_steps = np.asarray(self.config.get("simple_timeliness_steps", [-1, 1]), dtype=int)
-        if timeliness_steps.size == 0:
-            timeliness_steps = np.array([-1, 1], dtype=int)
+        replayed_steps = np.asarray(
+            self.config.get("simple_replayed_steps", self.config.get("simple_timeliness_steps", [-1, 1])),
+            dtype=int,
+        )
+        if replayed_steps.size == 0:
+            replayed_steps = np.array([-1, 1], dtype=int)
 
         for client_id in client_cols:
             values = pd.to_numeric(frame[client_id], errors="coerce").to_numpy(dtype=float, copy=True)
@@ -384,14 +438,14 @@ class WideDemandFaultInjector:
 
                 if fault_type == "missing":
                     mutated_values[mask] = np.nan
-                elif fault_type == "out_of_range":
+                elif fault_type in {"invalid_high", "out_of_range"}:
                     magnitudes = np.maximum(np.abs(np.nan_to_num(original_values[mask], nan=0.0)), 1.0)
-                    mutated_values[mask] = magnitudes * rng.uniform(out_of_range_low, out_of_range_high, size=mask.sum())
-                elif fault_type == "inconsistent":
+                    mutated_values[mask] = magnitudes * rng.uniform(invalid_high_low, invalid_high_high, size=mask.sum())
+                elif fault_type in {"negative_value", "inconsistent"}:
                     magnitudes = np.maximum(np.abs(np.nan_to_num(original_values[mask], nan=0.0)), 1.0)
-                    mutated_values[mask] = -magnitudes * rng.uniform(inconsistent_low, inconsistent_high, size=mask.sum())
-                elif fault_type == "timeliness":
-                    steps = rng.choice(timeliness_steps, size=mask.sum(), replace=True)
+                    mutated_values[mask] = -magnitudes * rng.uniform(negative_low, negative_high, size=mask.sum())
+                elif fault_type in {"replayed_value", "timeliness"}:
+                    steps = rng.choice(replayed_steps, size=mask.sum(), replace=True)
                     source_pos = np.clip(idxs + steps, 0, n_rows - 1)
                     stale_values = values[source_pos].copy()
 
@@ -631,109 +685,6 @@ class WideDemandFaultInjector:
                     dict(block_cfg),
                 )
             )
-
-    def _inject_accuracy_faults(
-        self,
-        frame: pd.DataFrame,
-        client_id: str,
-        values: np.ndarray,
-        valid_positions: np.ndarray,
-        scale: float,
-        upper_anchor: float,
-        config: dict,
-        client_factor: float,
-        rng: np.random.Generator,
-        timestamps: pd.Series,
-        events: list[FaultEvent],
-    ) -> None:
-        n_rows = len(frame)
-        negative_rate = float(config.get("negative_rate", 0.0)) * client_factor
-        idxs = _sample_positions(valid_positions, negative_rate, rng)
-        if idxs.size:
-            base = np.maximum(np.abs(pd.to_numeric(frame.loc[idxs, client_id], errors="coerce").to_numpy(dtype=float)), 1.0)
-            frame.loc[idxs, client_id] = -base
-            events.append(self._make_event(client_id, "negative_values", "accuracy", "A1", idxs, timestamps, n_rows, {"rate": negative_rate}))
-
-        high_rate = float(config.get("impossible_high_rate", 0.0)) * client_factor
-        high_multiplier = float(config.get("high_multiplier", 3.0))
-        idxs = _sample_positions(valid_positions, high_rate, rng)
-        if idxs.size:
-            frame.loc[idxs, client_id] = upper_anchor * high_multiplier
-            events.append(self._make_event(client_id, "impossible_high", "accuracy", "A1", idxs, timestamps, n_rows, {"rate": high_rate, "multiplier": high_multiplier}))
-
-        spike_rate = float(config.get("spike_rate", 0.0)) * client_factor
-        spike_multiplier = float(config.get("spike_multiplier", 4.0))
-        idxs = _sample_positions(valid_positions, spike_rate, rng)
-        if idxs.size:
-            current = pd.to_numeric(frame.loc[idxs, client_id], errors="coerce").to_numpy(dtype=float)
-            frame.loc[idxs, client_id] = current + spike_multiplier * scale
-            events.append(self._make_event(client_id, "spikes", "accuracy", "A2", idxs, timestamps, n_rows, {"rate": spike_rate, "multiplier": spike_multiplier}))
-
-        noise_rate = float(config.get("noise_rate", 0.0)) * client_factor
-        noise_std_fraction = float(config.get("noise_std_fraction", 0.0))
-        idxs = _sample_positions(valid_positions, noise_rate, rng)
-        if idxs.size:
-            noise = rng.normal(loc=0.0, scale=max(scale * noise_std_fraction, 1e-6), size=idxs.size)
-            current = pd.to_numeric(frame.loc[idxs, client_id], errors="coerce").to_numpy(dtype=float)
-            frame.loc[idxs, client_id] = current + noise
-            events.append(self._make_event(client_id, "noisy_values", "accuracy", "A2", idxs, timestamps, n_rows, {"rate": noise_rate, "noise_std_fraction": noise_std_fraction}))
-
-        jump_rate = float(config.get("jump_rate", 0.0)) * client_factor
-        jump_multiplier = float(config.get("jump_multiplier", 6.0))
-        idxs = _sample_positions(valid_positions[valid_positions > 0], jump_rate, rng)
-        if idxs.size:
-            previous = pd.to_numeric(frame.loc[idxs - 1, client_id], errors="coerce").to_numpy(dtype=float)
-            signs = rng.choice(np.array([-1.0, 1.0]), size=idxs.size)
-            frame.loc[idxs, client_id] = np.maximum(0.0, previous + signs * jump_multiplier * scale)
-            events.append(self._make_event(client_id, "rate_jumps", "accuracy", "A3", idxs, timestamps, n_rows, {"rate": jump_rate, "multiplier": jump_multiplier}))
-
-        stuck_segments = int(round(float(config.get("stuck_segments_per_client", 0)) * max(client_factor, 0.0)))
-        blocks = _sample_blocks(
-            n_rows=n_rows,
-            count=stuck_segments,
-            min_length=int(config.get("stuck_min_length", 1)),
-            max_length=int(config.get("stuck_max_length", 1)),
-            rng=rng,
-        )
-        for block in blocks:
-            if block.size == 0:
-                continue
-            constant = float(pd.to_numeric(frame.loc[[int(block[0])], client_id], errors="coerce").iloc[0])
-            frame.loc[block, client_id] = constant
-            events.append(self._make_event(client_id, "stuck_constant", "accuracy", "A3", block, timestamps, n_rows, {"min_length": int(config.get("stuck_min_length", 1)), "max_length": int(config.get("stuck_max_length", 1))}))
-
-    def _inject_temporal_faults(
-        self,
-        frame: pd.DataFrame,
-        client_id: str,
-        values: np.ndarray,
-        valid_positions: np.ndarray,
-        config: dict,
-        client_factor: float,
-        rng: np.random.Generator,
-        timestamps: pd.Series,
-        events: list[FaultEvent],
-    ) -> None:
-        n_rows = len(frame)
-        stale_blocks = int(round(float(config.get("stale_blocks_per_client", 0)) * max(client_factor, 0.0)))
-        blocks = _sample_blocks(
-            n_rows=n_rows,
-            count=stale_blocks,
-            min_length=int(config.get("stale_min_length", 1)),
-            max_length=int(config.get("stale_max_length", 1)),
-            rng=rng,
-        )
-        lag_choices = np.asarray(config.get("lag_choices", [1]), dtype=int)
-        lag_probs = np.asarray(config.get("lag_probabilities", np.ones(len(lag_choices))), dtype=float)
-        lag_probs = lag_probs / lag_probs.sum()
-        for block in blocks:
-            if block.size == 0:
-                continue
-            lag = int(rng.choice(lag_choices, p=lag_probs))
-            src = np.clip(block - lag, 0, n_rows - 1)
-            frame.loc[block, client_id] = pd.to_numeric(frame.loc[src, client_id], errors="coerce").to_numpy(dtype=float)
-            events.append(self._make_event(client_id, "stale_block", "temporal_consistency", "TC1", block, timestamps, n_rows, {"lag": lag}))
-
         hole_fraction = float(config.get("calendar_hole_fraction", 0.0)) * min(client_factor, 1.0)
         if hole_fraction > 0:
             block = _sample_single_block(
@@ -772,8 +723,8 @@ class WideDemandFaultInjector:
                             self._make_event(
                                 client_id,
                                 "calendar_hole",
-                                "temporal_consistency",
-                                "TC3",
+                                "completeness",
+                                "C3",
                                 idx_array,
                                 timestamps,
                                 n_rows,
@@ -785,60 +736,156 @@ class WideDemandFaultInjector:
                             )
                         )
 
-        phase_fraction = float(config.get("phase_shift_client_fraction", 0.0))
-        if phase_fraction > 0 and rng.random() < min(1.0, phase_fraction * max(client_factor, 0.0)):
-            shift_choices = np.asarray(config.get("phase_shift_steps_choices", [6, 12]), dtype=int)
-            if shift_choices.size:
-                shift_steps = int(rng.choice(shift_choices))
-                start = int(n_rows * float(config.get("phase_shift_start_fraction", 0.5)))
-                idxs = np.arange(start, n_rows, dtype=int)
-                if idxs.size:
-                    current = pd.to_numeric(frame.loc[idxs, client_id], errors="coerce").to_numpy(dtype=float)
-                    finite_mask = np.isfinite(current)
-                    if finite_mask.any():
-                        shifted = current.copy()
-                        shifted[finite_mask] = np.roll(current[finite_mask], shift_steps)
-                        frame.loc[idxs, client_id] = shifted
-                        events.append(
-                            self._make_event(
-                                client_id,
-                                "phase_shift",
-                                "temporal_consistency",
-                                "TC2",
-                                idxs[finite_mask],
-                                timestamps,
-                                n_rows,
-                                {"shift_steps": shift_steps, "start_fraction": float(config.get("phase_shift_start_fraction", 0.5))},
-                            )
-                        )
+    def _inject_validity_faults(
+        self,
+        frame: pd.DataFrame,
+        client_id: str,
+        values: np.ndarray,
+        valid_positions: np.ndarray,
+        scale: float,
+        upper_anchor: float,
+        config: dict,
+        client_factor: float,
+        rng: np.random.Generator,
+        timestamps: pd.Series,
+        events: list[FaultEvent],
+    ) -> None:
+        n_rows = len(frame)
 
-        regime_fraction = float(config.get("mid_window_regime_shift_fraction", config.get("train_serve_shift_fraction", 0.0)))
-        if regime_fraction > 0 and rng.random() < min(1.0, regime_fraction * max(client_factor, 0.0)):
-            strength = float(config.get("mid_window_regime_shift_strength", config.get("train_serve_shift_strength", 0.25)))
-            start = int(n_rows * float(config.get("mid_window_regime_start_fraction", 0.5)))
-            idxs = np.arange(start, n_rows, dtype=int)
-            if idxs.size:
-                current = pd.to_numeric(frame.loc[idxs, client_id], errors="coerce").to_numpy(dtype=float)
-                finite_mask = np.isfinite(current)
-                if finite_mask.any():
-                    scale = _series_scale(current[finite_mask])
-                    shift = strength * max(scale, 1.0)
-                    current[finite_mask] = current[finite_mask] + shift
-                    frame.loc[idxs, client_id] = current
-                    events.append(
-                        self._make_event(
-                            client_id,
-                            "mid_window_regime_shift",
-                            "temporal_consistency",
-                            "TC4",
-                            idxs[finite_mask],
-                            timestamps,
-                            n_rows,
-                            {"shift": shift, "start_fraction": float(config.get("mid_window_regime_start_fraction", 0.5))},
-                        )
-                    )
+        negative_rate = float(config.get("negative_rate", 0.0)) * client_factor
+        idxs = _sample_positions(valid_positions, negative_rate, rng)
+        if idxs.size:
+            base = np.maximum(
+                np.abs(pd.to_numeric(frame.loc[idxs, client_id], errors="coerce").to_numpy(dtype=float)),
+                1.0,
+            )
+            frame.loc[idxs, client_id] = -base
+            events.append(
+                self._make_event(
+                    client_id,
+                    "negative_values",
+                    "validity",
+                    "V3",
+                    idxs,
+                    timestamps,
+                    n_rows,
+                    {"rate": negative_rate},
+                )
+            )
 
-    def _inject_skewness_faults(
+        high_rate = float(config.get("impossible_high_rate", 0.0)) * client_factor
+        high_multiplier = float(config.get("high_multiplier", 3.0))
+        idxs = _sample_positions(valid_positions, high_rate, rng)
+        if idxs.size:
+            frame.loc[idxs, client_id] = upper_anchor * high_multiplier
+            events.append(
+                self._make_event(
+                    client_id,
+                    "impossible_high",
+                    "validity",
+                    "V3",
+                    idxs,
+                    timestamps,
+                    n_rows,
+                    {"rate": high_rate, "multiplier": high_multiplier},
+                )
+            )
+
+    def _inject_consistency_faults(
+        self,
+        frame: pd.DataFrame,
+        client_id: str,
+        values: np.ndarray,
+        valid_positions: np.ndarray,
+        config: dict,
+        client_factor: float,
+        rng: np.random.Generator,
+        timestamps: pd.Series,
+        events: list[FaultEvent],
+    ) -> None:
+        n_rows = len(frame)
+        scale = _series_scale(values)
+
+        stale_blocks = int(round(float(config.get("stale_blocks_per_client", 0)) * max(client_factor, 0.0)))
+        blocks = _sample_blocks(
+            n_rows=n_rows,
+            count=stale_blocks,
+            min_length=int(config.get("stale_min_length", 1)),
+            max_length=int(config.get("stale_max_length", 1)),
+            rng=rng,
+        )
+        lag_choices = np.asarray(config.get("lag_choices", [1]), dtype=int)
+        lag_probs = np.asarray(config.get("lag_probabilities", np.ones(len(lag_choices))), dtype=float)
+        lag_probs = lag_probs / lag_probs.sum()
+        for block in blocks:
+            if block.size == 0:
+                continue
+            lag = int(rng.choice(lag_choices, p=lag_probs))
+            src = np.clip(block - lag, 0, n_rows - 1)
+            frame.loc[block, client_id] = pd.to_numeric(frame.loc[src, client_id], errors="coerce").to_numpy(dtype=float)
+            events.append(
+                self._make_event(
+                    client_id,
+                    "stale_block",
+                    "consistency",
+                    "CS4",
+                    block,
+                    timestamps,
+                    n_rows,
+                    {"lag": lag},
+                )
+            )
+
+        jump_rate = float(config.get("jump_rate", 0.0)) * client_factor
+        jump_multiplier = float(config.get("jump_multiplier", 6.0))
+        idxs = _sample_positions(valid_positions[valid_positions > 0], jump_rate, rng)
+        if idxs.size:
+            previous = pd.to_numeric(frame.loc[idxs - 1, client_id], errors="coerce").to_numpy(dtype=float)
+            signs = rng.choice(np.array([-1.0, 1.0]), size=idxs.size)
+            frame.loc[idxs, client_id] = np.maximum(0.0, previous + signs * jump_multiplier * scale)
+            events.append(
+                self._make_event(
+                    client_id,
+                    "rate_jumps",
+                    "consistency",
+                    "CS5",
+                    idxs,
+                    timestamps,
+                    n_rows,
+                    {"rate": jump_rate, "multiplier": jump_multiplier},
+                )
+            )
+
+        stuck_segments = int(round(float(config.get("stuck_segments_per_client", 0)) * max(client_factor, 0.0)))
+        blocks = _sample_blocks(
+            n_rows=n_rows,
+            count=stuck_segments,
+            min_length=int(config.get("stuck_min_length", 1)),
+            max_length=int(config.get("stuck_max_length", 1)),
+            rng=rng,
+        )
+        for block in blocks:
+            if block.size == 0:
+                continue
+            constant = float(pd.to_numeric(frame.loc[[int(block[0])], client_id], errors="coerce").iloc[0])
+            frame.loc[block, client_id] = constant
+            events.append(
+                self._make_event(
+                    client_id,
+                    "stuck_constant",
+                    "consistency",
+                    "CS4",
+                    block,
+                    timestamps,
+                    n_rows,
+                    {
+                        "min_length": int(config.get("stuck_min_length", 1)),
+                        "max_length": int(config.get("stuck_max_length", 1)),
+                    },
+                )
+            )
+
+    def _inject_accuracy_faults(
         self,
         frame: pd.DataFrame,
         client_id: str,
@@ -852,18 +899,185 @@ class WideDemandFaultInjector:
         events: list[FaultEvent],
     ) -> None:
         n_rows = len(frame)
+
+        spike_rate = float(config.get("spike_rate", 0.0)) * client_factor
+        spike_multiplier = float(config.get("spike_multiplier", 4.0))
+        idxs = _sample_positions(valid_positions, spike_rate, rng)
+        if idxs.size:
+            current = pd.to_numeric(frame.loc[idxs, client_id], errors="coerce").to_numpy(dtype=float)
+            frame.loc[idxs, client_id] = current + spike_multiplier * scale
+            events.append(
+                self._make_event(
+                    client_id,
+                    "spikes",
+                    "accuracy",
+                    "A1",
+                    idxs,
+                    timestamps,
+                    n_rows,
+                    {"rate": spike_rate, "multiplier": spike_multiplier},
+                )
+            )
+
+        noise_rate = float(config.get("noise_rate", 0.0)) * client_factor
+        noise_std_fraction = float(config.get("noise_std_fraction", 0.0))
+        idxs = _sample_positions(valid_positions, noise_rate, rng)
+        if idxs.size:
+            noise = rng.normal(loc=0.0, scale=max(scale * noise_std_fraction, 1e-6), size=idxs.size)
+            current = pd.to_numeric(frame.loc[idxs, client_id], errors="coerce").to_numpy(dtype=float)
+            frame.loc[idxs, client_id] = current + noise
+            events.append(
+                self._make_event(
+                    client_id,
+                    "noisy_values",
+                    "accuracy",
+                    "A3",
+                    idxs,
+                    timestamps,
+                    n_rows,
+                    {"rate": noise_rate, "noise_std_fraction": noise_std_fraction},
+                )
+            )
+
+    def _inject_freshness_faults(
+        self,
+        frame: pd.DataFrame,
+        client_id: str,
+        values: np.ndarray,
+        valid_positions: np.ndarray,
+        config: dict,
+        client_factor: float,
+        rng: np.random.Generator,
+        timestamps: pd.Series,
+        events: list[FaultEvent],
+    ) -> None:
+        """Freshness faults are intentionally disabled for now."""
+        _ = (frame, client_id, values, valid_positions, config, client_factor, rng, timestamps, events)
+        return
+
+    def _inject_drift_faults(
+        self,
+        frame: pd.DataFrame,
+        client_id: str,
+        values: np.ndarray,
+        valid_positions: np.ndarray,
+        scale: float,
+        distribution_cfg: dict,
+        temporal_pattern_cfg: dict,
+        regime_cfg: dict,
+        client_factor: float,
+        rng: np.random.Generator,
+        timestamps: pd.Series,
+        events: list[FaultEvent],
+    ) -> None:
+        n_rows = len(frame)
         finite = np.isfinite(values)
         if not finite.any():
             return
 
-        mean_shift_fraction = float(config.get("mean_shift_client_fraction", 0.0))
+        phase_fraction = float(temporal_pattern_cfg.get("phase_shift_client_fraction", 0.0))
+        if phase_fraction > 0 and rng.random() < min(1.0, phase_fraction * max(client_factor, 0.0)):
+            shift_choices = np.asarray(temporal_pattern_cfg.get("phase_shift_steps_choices", [6, 12]), dtype=int)
+            if shift_choices.size:
+                shift_steps = int(rng.choice(shift_choices))
+                start = int(n_rows * float(temporal_pattern_cfg.get("phase_shift_start_fraction", 0.5)))
+                idxs = np.arange(start, n_rows, dtype=int)
+                if idxs.size:
+                    current = pd.to_numeric(frame.loc[idxs, client_id], errors="coerce").to_numpy(dtype=float)
+                    finite_mask = np.isfinite(current)
+                    if finite_mask.any():
+                        shifted = current.copy()
+                        shifted[finite_mask] = np.roll(current[finite_mask], shift_steps)
+                        frame.loc[idxs, client_id] = shifted
+                        events.append(
+                            self._make_event(
+                                client_id,
+                                "phase_shift",
+                                "temporal_pattern_shift",
+                                "TP1",
+                                idxs[finite_mask],
+                                timestamps,
+                                n_rows,
+                                {
+                                    "shift_steps": shift_steps,
+                                    "start_fraction": float(temporal_pattern_cfg.get("phase_shift_start_fraction", 0.5)),
+                                },
+                            )
+                        )
+
+        peak_fraction = float(temporal_pattern_cfg.get("peak_shift_client_fraction", 0.0))
+        if peak_fraction > 0 and rng.random() < min(1.0, peak_fraction * max(client_factor, 0.0)):
+            peak_hours = {int(hour) for hour in temporal_pattern_cfg.get("peak_hours", [17, 18, 19, 20, 21])}
+            multiplier = float(temporal_pattern_cfg.get("peak_shift_multiplier", 1.5))
+            block = _sample_single_block(
+                n_rows=n_rows,
+                min_length=int(temporal_pattern_cfg.get("peak_shift_min_length", 72)),
+                max_length=int(temporal_pattern_cfg.get("peak_shift_max_length", 336)),
+                rng=rng,
+            )
+            if block.size:
+                ts = pd.Series(pd.to_datetime(timestamps.iloc[block], errors="coerce"))
+                block_values = pd.to_numeric(frame.loc[block, client_id], errors="coerce").to_numpy(dtype=float)
+                mask = ts.dt.hour.isin(peak_hours).to_numpy() & np.isfinite(block_values)
+                idxs = block[mask]
+                if idxs.size:
+                    frame.loc[idxs, client_id] = (
+                        pd.to_numeric(frame.loc[idxs, client_id], errors="coerce").to_numpy(dtype=float) * multiplier
+                    )
+                    events.append(
+                        self._make_event(
+                            client_id,
+                            "peak_hour_shift",
+                            "temporal_pattern_shift",
+                            "TP2",
+                            idxs,
+                            timestamps,
+                            n_rows,
+                            {
+                                "multiplier": multiplier,
+                                "peak_hours": sorted(peak_hours),
+                                "window_length": int(block.size),
+                            },
+                        )
+                    )
+
+        regime_fraction = float(regime_cfg.get("mid_window_regime_shift_fraction", regime_cfg.get("train_serve_shift_fraction", 0.0)))
+        if regime_fraction > 0 and rng.random() < min(1.0, regime_fraction * max(client_factor, 0.0)):
+            strength = float(regime_cfg.get("mid_window_regime_shift_strength", regime_cfg.get("train_serve_shift_strength", 0.25)))
+            start = int(n_rows * float(regime_cfg.get("mid_window_regime_start_fraction", 0.5)))
+            idxs = np.arange(start, n_rows, dtype=int)
+            if idxs.size:
+                current = pd.to_numeric(frame.loc[idxs, client_id], errors="coerce").to_numpy(dtype=float)
+                finite_mask = np.isfinite(current)
+                if finite_mask.any():
+                    local_scale = _series_scale(current[finite_mask])
+                    shift = strength * max(local_scale, 1.0)
+                    current[finite_mask] = current[finite_mask] + shift
+                    frame.loc[idxs, client_id] = current
+                    events.append(
+                        self._make_event(
+                            client_id,
+                            "mid_window_regime_shift",
+                            "regime_shift",
+                            "RG1",
+                            idxs[finite_mask],
+                            timestamps,
+                            n_rows,
+                            {
+                                "shift": shift,
+                                "start_fraction": float(regime_cfg.get("mid_window_regime_start_fraction", 0.5)),
+                            },
+                        )
+                    )
+
+        mean_shift_fraction = float(distribution_cfg.get("mean_shift_client_fraction", 0.0))
         if mean_shift_fraction > 0 and rng.random() < min(1.0, mean_shift_fraction * max(client_factor, 0.0)):
-            multiplier = float(config.get("mean_shift_std_multiplier", 1.0))
+            multiplier = float(distribution_cfg.get("mean_shift_std_multiplier", 1.0))
             shift = multiplier * scale
             block = _sample_single_block(
                 n_rows=n_rows,
-                min_length=int(config.get("mean_shift_min_length", 72)),
-                max_length=int(config.get("mean_shift_max_length", 336)),
+                min_length=int(distribution_cfg.get("mean_shift_min_length", 72)),
+                max_length=int(distribution_cfg.get("mean_shift_max_length", 336)),
                 rng=rng,
             )
             if block.size:
@@ -879,8 +1093,8 @@ class WideDemandFaultInjector:
                         self._make_event(
                             client_id,
                             "mean_shift",
-                            "skewness",
-                            "SK1",
+                            "distribution_shift",
+                            "DS1",
                             idxs,
                             timestamps,
                             n_rows,
@@ -889,14 +1103,14 @@ class WideDemandFaultInjector:
                     )
                     values = shifted
 
-        variance_fraction = float(config.get("variance_shift_client_fraction", 0.0))
+        variance_fraction = float(distribution_cfg.get("variance_shift_client_fraction", 0.0))
         if variance_fraction > 0 and rng.random() < min(1.0, variance_fraction * max(client_factor, 0.0)):
-            low, high = config.get("variance_scale_range", [1.5, 2.0])
+            low, high = distribution_cfg.get("variance_scale_range", [1.5, 2.0])
             factor = float(rng.uniform(low, high))
             block = _sample_single_block(
                 n_rows=n_rows,
-                min_length=int(config.get("variance_shift_min_length", 72)),
-                max_length=int(config.get("variance_shift_max_length", 336)),
+                min_length=int(distribution_cfg.get("variance_shift_min_length", 72)),
+                max_length=int(distribution_cfg.get("variance_shift_max_length", 336)),
                 rng=rng,
             )
             if block.size:
@@ -913,8 +1127,8 @@ class WideDemandFaultInjector:
                         self._make_event(
                             client_id,
                             "variance_shift",
-                            "skewness",
-                            "SK3",
+                            "distribution_shift",
+                            "DS2",
                             idxs,
                             timestamps,
                             n_rows,
@@ -923,48 +1137,14 @@ class WideDemandFaultInjector:
                     )
                     values = scaled
 
-        peak_fraction = float(config.get("peak_shift_client_fraction", 0.0))
-        if peak_fraction > 0 and rng.random() < min(1.0, peak_fraction * max(client_factor, 0.0)):
-            peak_hours = {int(hour) for hour in config.get("peak_hours", [17, 18, 19, 20, 21])}
-            multiplier = float(config.get("peak_shift_multiplier", 1.5))
-            block = _sample_single_block(
-                n_rows=n_rows,
-                min_length=int(config.get("peak_shift_min_length", 72)),
-                max_length=int(config.get("peak_shift_max_length", 336)),
-                rng=rng,
-            )
-            if block.size:
-                ts = pd.Series(pd.to_datetime(timestamps.iloc[block], errors="coerce"))
-                block_values = pd.to_numeric(frame.loc[block, client_id], errors="coerce").to_numpy(dtype=float)
-                mask = ts.dt.hour.isin(peak_hours).to_numpy() & np.isfinite(block_values)
-                idxs = block[mask]
-                if idxs.size:
-                    frame.loc[idxs, client_id] = pd.to_numeric(frame.loc[idxs, client_id], errors="coerce").to_numpy(dtype=float) * multiplier
-                    events.append(
-                        self._make_event(
-                            client_id,
-                            "peak_hour_shift",
-                            "skewness",
-                            "SK2",
-                            idxs,
-                            timestamps,
-                            n_rows,
-                            {
-                                "multiplier": multiplier,
-                                "peak_hours": sorted(peak_hours),
-                                "window_length": int(block.size),
-                            },
-                        )
-                    )
-
-        long_term_fraction = float(config.get("long_term_shift_client_fraction", 0.0))
+        long_term_fraction = float(distribution_cfg.get("long_term_shift_client_fraction", 0.0))
         if long_term_fraction > 0 and rng.random() < min(1.0, long_term_fraction * max(client_factor, 0.0)):
-            multiplier = float(config.get("long_term_shift_multiplier", 0.5))
+            multiplier = float(distribution_cfg.get("long_term_shift_multiplier", 0.5))
             shift = multiplier * scale
             block = _sample_single_block(
                 n_rows=n_rows,
-                min_length=int(config.get("long_term_shift_min_length", 336)),
-                max_length=int(config.get("long_term_shift_max_length", 720)),
+                min_length=int(distribution_cfg.get("long_term_shift_min_length", 336)),
+                max_length=int(distribution_cfg.get("long_term_shift_max_length", 720)),
                 rng=rng,
             )
             if block.size:
@@ -976,8 +1156,8 @@ class WideDemandFaultInjector:
                     self._make_event(
                         client_id,
                         "long_term_shift",
-                        "skewness",
-                        "SK3",
+                        "distribution_shift",
+                        "DS3",
                         block[finite_mask],
                         timestamps,
                         n_rows,
