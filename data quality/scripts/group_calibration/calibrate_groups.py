@@ -111,10 +111,17 @@ def load_demand(path: Path, timestamp_col: str) -> tuple[pd.DataFrame, list[str]
         else:
             frame[col] = frame[col].astype(float, copy=False)
 
-        values = frame[col]
-        valid = values.dropna()
-        if not valid.empty and float((valid < 0).mean()) > 0.5:
-            frame[col] = -values
+    # Flip the whole demand table together when the source looks like the raw
+    # smart-meter export: values are non-positive globally, with at least one
+    # negative reading. This avoids leaving zero-heavy clients unflipped.
+    demand_values = frame.loc[:, client_cols].to_numpy(dtype=float, copy=False)
+    finite_mask = np.isfinite(demand_values)
+    if finite_mask.any():
+        finite_values = demand_values[finite_mask]
+        has_negative = bool((finite_values < 0).any())
+        has_positive = bool((finite_values > 0).any())
+        if has_negative and not has_positive:
+            frame.loc[:, client_cols] = frame.loc[:, client_cols] * -1.0
 
     return frame, client_cols
 

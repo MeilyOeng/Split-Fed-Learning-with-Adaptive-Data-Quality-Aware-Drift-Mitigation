@@ -60,6 +60,14 @@ faults:
     spike_multiplier: 4.0
     noise_rate: 0.02
     noise_std_fraction: 0.05
+    cluster_shared_noise:
+      enabled: false
+      clusters: []
+      events_per_cluster: 1
+      min_length: 6
+      max_length: 24
+      noise_std_fraction: 0.05
+      same_pattern_within_cluster: true
 
   freshness: {}
 

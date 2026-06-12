@@ -155,7 +155,7 @@ def rolling_median_mad_anomaly_mask(
         return median_absolute_deviation(arr.to_numpy())
 
     mad = history.rolling(window=window, min_periods=min_history).apply(_mad, raw=False)
-    threshold = (mad_multiplier * mad).clip(lower=min_threshold_abs)
+    threshold = ((mad_multiplier * mad) / 0.6745).clip(lower=min_threshold_abs)
     applicable = values.notna() & expected.notna()
     anomaly = pd.Series(False, index=series.index)
     anomaly.loc[applicable] = (

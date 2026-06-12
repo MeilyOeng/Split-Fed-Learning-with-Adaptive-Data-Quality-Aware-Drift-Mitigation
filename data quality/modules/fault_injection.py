@@ -51,6 +51,8 @@ class FaultEvent:
     affected_rows: int
     affected_fraction: float
     parameters_used: str
+    cluster_id: str | None = None
+    scope: str = "client"
     shared_timestamp_event: bool = False
 
 
@@ -132,6 +134,58 @@ def _resolve_drift_config(config: dict, key: str) -> dict:
     return dict((config.get("drift", {}) or {}).get(key, {}) or {})
 
 
+def _normalize_identifier(value: Any) -> str:
+    text = str(value).strip()
+    if text.endswith(".0"):
+        text = text[:-2]
+    return text
+
+
+def _normalize_identifier_list(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, (str, int, float)):
+        text = _normalize_identifier(raw)
+        return [text] if text else []
+    if isinstance(raw, Sequence):
+        out: list[str] = []
+        for item in raw:
+            text = _normalize_identifier(item)
+            if text:
+                out.append(text)
+        return out
+    text = _normalize_identifier(raw)
+    return [text] if text else []
+
+
+def _load_cluster_assignment_map(
+    path: Path | str,
+    *,
+    client_id_column: str = "ID",
+    cluster_id_column: str = "Cluster",
+) -> dict[str, str]:
+    assignment_path = Path(path)
+    if not assignment_path.exists():
+        raise FileNotFoundError(f"Cluster assignment CSV not found: {assignment_path}")
+
+    assignments = pd.read_csv(assignment_path).copy()
+    required_cols = {client_id_column, cluster_id_column}
+    if not required_cols.issubset(assignments.columns):
+        missing = sorted(required_cols - set(assignments.columns))
+        raise ValueError(
+            f"Cluster assignment CSV at {assignment_path} is missing required columns: {missing}"
+        )
+
+    assignments[client_id_column] = assignments[client_id_column].map(_normalize_identifier)
+    assignments[cluster_id_column] = assignments[cluster_id_column].map(_normalize_identifier)
+    assignments = assignments.drop_duplicates(subset=[client_id_column], keep="first").reset_index(drop=True)
+    return {
+        str(client_id): str(cluster_id)
+        for client_id, cluster_id in zip(assignments[client_id_column], assignments[cluster_id_column])
+        if str(client_id) and str(cluster_id)
+    }
+
+
 class WideDemandFaultInjector:
     """Injects structured faults into a wide-format demand table."""
 
@@ -142,6 +196,7 @@ class WideDemandFaultInjector:
         self,
         dataset: WideDemandDataset,
         seed: int = 42,
+        cluster_assignment_path: Optional[Path | str] = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Inject configured faults into a wide demand dataset."""
         rng = np.random.default_rng(seed)
@@ -179,6 +234,30 @@ class WideDemandFaultInjector:
         drift_distribution_cfg = _resolve_drift_config(self.config, "distribution_shift")
         drift_temporal_cfg = _resolve_drift_config(self.config, "temporal_pattern_shift")
         drift_regime_cfg = _resolve_drift_config(self.config, "regime_shift")
+        cluster_assignment_cfg = dict(self.config.get("cluster_assignment", {}) or {})
+        cluster_shared_noise_cfg = dict((accuracy_cfg.get("cluster_shared_noise", {}) or {}))
+        cluster_noise_clusters = _normalize_identifier_list(
+            cluster_shared_noise_cfg.get("clusters", cluster_shared_noise_cfg.get("cluster"))
+        )
+        cluster_noise_enabled = bool(cluster_shared_noise_cfg.get("enabled", False) or cluster_noise_clusters)
+        if cluster_shared_noise_cfg.get("enabled", False) and not cluster_noise_clusters:
+            raise ValueError(
+                "accuracy.cluster_shared_noise.enabled is true but no clusters were configured."
+            )
+        cluster_assignment_map: dict[str, str] = {}
+        if cluster_noise_enabled:
+            resolved_assignment_path = cluster_assignment_path or cluster_assignment_cfg.get("path")
+            if resolved_assignment_path is None:
+                raise ValueError(
+                    "Cluster-shared noise requires a cluster assignment CSV. "
+                    "Pass --cluster-assignment or set cluster_assignment.path in the fault config."
+                )
+            cluster_assignment_map = _load_cluster_assignment_map(
+                resolved_assignment_path,
+                client_id_column=str(cluster_assignment_cfg.get("client_id_column", "ID")),
+                cluster_id_column=str(cluster_assignment_cfg.get("cluster_id_column", "Cluster")),
+            )
+            cluster_shared_noise_cfg["clusters"] = cluster_noise_clusters
 
         shared_drop_rate = float(completeness_cfg.get("dropped_timestamp_rows_fraction", 0.0))
         if shared_drop_rate > 0:
@@ -317,6 +396,17 @@ class WideDemandFaultInjector:
                 rng,
                 timestamps,
                 events,
+            )
+
+        if cluster_noise_enabled:
+            self._inject_cluster_shared_noise(
+                frame=frame,
+                all_client_cols=dataset.client_cols,
+                cluster_assignment_map=cluster_assignment_map,
+                config=cluster_shared_noise_cfg,
+                rng=rng,
+                timestamps=timestamps,
+                events=events,
             )
 
         if shared_duplicate_rows:
@@ -939,6 +1029,104 @@ class WideDemandFaultInjector:
                 )
             )
 
+    def _inject_cluster_shared_noise(
+        self,
+        frame: pd.DataFrame,
+        all_client_cols: Sequence[str],
+        cluster_assignment_map: dict[str, str],
+        config: dict,
+        rng: np.random.Generator,
+        timestamps: pd.Series,
+        events: list[FaultEvent],
+    ) -> None:
+        n_rows = len(frame)
+        selected_clusters = _normalize_identifier_list(config.get("clusters", config.get("cluster")))
+        if not selected_clusters:
+            return
+
+        available_clients = [str(client_id) for client_id in all_client_cols if str(client_id) in frame.columns]
+        cluster_members: dict[str, list[str]] = {
+            cluster_id: [
+                client_id
+                for client_id in available_clients
+                if cluster_assignment_map.get(str(client_id)) == cluster_id
+            ]
+            for cluster_id in selected_clusters
+        }
+        cluster_members = {
+            cluster_id: members
+            for cluster_id, members in cluster_members.items()
+            if members
+        }
+        if not cluster_members:
+            raise ValueError(
+                "No available dataset clients matched the configured cluster_shared_noise clusters."
+            )
+
+        events_per_cluster = int(config.get("events_per_cluster", 1))
+        if events_per_cluster <= 0:
+            return
+        noise_std_fraction = float(config.get("noise_std_fraction", 0.0))
+        if noise_std_fraction <= 0:
+            return
+        same_pattern_within_cluster = bool(config.get("same_pattern_within_cluster", True))
+        min_length = int(config.get("min_length", 1))
+        max_length = int(config.get("max_length", max(min_length, 1)))
+
+        for cluster_id, members in cluster_members.items():
+            for event_index in range(events_per_cluster):
+                block = _sample_single_block(
+                    n_rows=n_rows,
+                    min_length=min_length,
+                    max_length=max_length,
+                    rng=rng,
+                )
+                if block.size == 0:
+                    continue
+
+                shared_pattern = (
+                    rng.normal(loc=0.0, scale=1.0, size=block.size)
+                    if same_pattern_within_cluster
+                    else None
+                )
+                for client_id in members:
+                    current = pd.to_numeric(frame.loc[block, client_id], errors="coerce").to_numpy(dtype=float)
+                    finite_mask = np.isfinite(current)
+                    if not finite_mask.any():
+                        continue
+
+                    pattern = (
+                        shared_pattern
+                        if shared_pattern is not None
+                        else rng.normal(loc=0.0, scale=1.0, size=block.size)
+                    )
+                    client_values = pd.to_numeric(frame[client_id], errors="coerce").to_numpy(dtype=float)
+                    client_scale = _series_scale(client_values)
+                    noise = pattern[finite_mask] * max(client_scale * noise_std_fraction, 1e-6)
+                    frame.loc[block[finite_mask], client_id] = current[finite_mask] + noise
+                    events.append(
+                        self._make_event(
+                            client_id=client_id,
+                            fault_type="cluster_shared_noise",
+                            dimension="accuracy",
+                            subcheck="A3",
+                            idxs=block[finite_mask],
+                            timestamps=timestamps,
+                            n_rows=n_rows,
+                            parameters={
+                                "mode": "cluster_shared_noise",
+                                "cluster_id": cluster_id,
+                                "event_index": int(event_index),
+                                "window_length": int(block.size),
+                                "noise_std_fraction": noise_std_fraction,
+                                "same_pattern_within_cluster": same_pattern_within_cluster,
+                                "cluster_client_count": int(len(members)),
+                            },
+                            cluster_id=cluster_id,
+                            scope="cluster",
+                        )
+                    )
+
     def _inject_freshness_faults(
         self,
         frame: pd.DataFrame,
@@ -1176,6 +1364,8 @@ class WideDemandFaultInjector:
         n_rows: int,
         parameters: dict,
         shared: bool = False,
+        cluster_id: Optional[str] = None,
+        scope: str = "client",
     ) -> FaultEvent:
         if idxs.size == 0:
             start_time = None
@@ -1194,6 +1384,8 @@ class WideDemandFaultInjector:
             affected_rows=int(idxs.size),
             affected_fraction=float(idxs.size / max(1, n_rows)),
             parameters_used=_json_params(parameters),
+            cluster_id=str(cluster_id) if cluster_id is not None else None,
+            scope=str(scope),
             shared_timestamp_event=shared,
         )
 
@@ -1205,11 +1397,16 @@ def inject_faults_to_csv(
     config: Optional[dict] = None,
     timestamp_col: Optional[str] = None,
     seed: int = 42,
+    cluster_assignment_path: Optional[Path | str] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load a clean demand CSV, inject faults, and save outputs."""
     dataset = load_wide_demand_csv(input_path, timestamp_col=timestamp_col)
     injector = WideDemandFaultInjector(config=config)
-    faulty_df, report_df = injector.inject(dataset, seed=seed)
+    faulty_df, report_df = injector.inject(
+        dataset,
+        seed=seed,
+        cluster_assignment_path=cluster_assignment_path,
+    )
     save_csv(faulty_df, output_path)
     save_csv(report_df, report_path)
     return faulty_df, report_df

@@ -22,6 +22,7 @@ def run_quality_pipeline(
     timestamp_col: Optional[str] = None,
     seed: int = 42,
     pca_model_output_path: Optional[Path | str] = None,
+    cluster_assignment_path: Optional[Path | str] = None,
 ) -> dict[str, str]:
     """Run fault injection, scoring, PCA scoring, and weight export."""
     fault_config = load_yaml_config(fault_config_path)
@@ -34,6 +35,7 @@ def run_quality_pipeline(
         config=fault_config,
         timestamp_col=timestamp_col,
         seed=seed,
+        cluster_assignment_path=cluster_assignment_path,
     )
 
     score_wide_demand_quality(

@@ -73,6 +73,16 @@ def _get_timestamp_series(dataset: WideDemandDataset) -> pd.Series:
     return pd.to_datetime(dataset.frame[dataset.timestamp_col], errors="coerce")
 
 
+def _resolve_reference_time(clean_ts: pd.Series, config: dict) -> pd.Timestamp | pd.NaT:
+    freshness_cfg = dict((config.get("freshness", {}) or {}))
+    configured_ref = freshness_cfg.get("reference_time")
+    if configured_ref is not None:
+        ref = pd.to_datetime(configured_ref, errors="coerce")
+        if pd.notna(ref):
+            return ref
+    return clean_ts.max()
+
+
 def _series_upper_bound(clean_series: pd.Series, cfg: dict) -> float:
     lower_bound = float(cfg.get("lower_bound", 0.0))
     fixed_upper = cfg.get("upper_bound")
@@ -100,13 +110,17 @@ class CompletenessScorer:
         diag = current.diagnostics
         column_present = bool(diag.client_column_present.get(client_id, False))
         parseable_count = int(diag.client_numeric_parseable_count.get(client_id, 0))
+        current_series = _get_numeric_series(current, client_id)
+        current_ts = _get_timestamp_series(current)
+        expected_ts = expected_timestamp_index(clean.frame[clean.timestamp_col], clean.frequency)
+        expected_count = int(len(expected_ts))
+        valid_non_null_count = int((current_series.notna() & current_ts.notna()).sum())
+        observed_ts = pd.DatetimeIndex(current_ts.dropna().unique())
+        observed_covered = int(observed_ts.intersection(expected_ts).shape[0])
 
-        c1 = float(diag.client_raw_non_null_ratio.get(client_id, 0.0)) if column_present else 0.0
+        c1 = float(valid_non_null_count / max(1, expected_count)) if column_present else 0.0
         c2 = 1.0 if column_present and parseable_count > 0 else 0.0
-
-        expected_count = len(expected_timestamp_index(clean.frame[clean.timestamp_col], clean.frequency))
-        coverage = float(diag.unique_timestamp_count / max(1, expected_count))
-        c3 = float(min(1.0, coverage)) if column_present and diag.timestamp_col_present else 0.0
+        c3 = float(observed_covered / max(1, expected_count)) if column_present and diag.timestamp_col_present else 0.0
 
         weights = dict((self.config.get("subcheck_weights", {}) or {}).get("completeness", {}) or {})
         completeness = _weighted_average({"C1": c1, "C2": c2, "C3": c3}, weights)
@@ -135,9 +149,11 @@ class ValidityScorer:
         current_series = _get_numeric_series(current, client_id)
         clean_series = _get_numeric_series(clean, client_id)
         column_present = bool(diag.client_column_present.get(client_id, False))
+        observed_record_count = int(len(current.frame))
 
         if column_present:
-            v1 = float(diag.client_numeric_parseable_ratio.get(client_id, 1.0))
+            finite_values = int(np.isfinite(current_series.to_numpy(dtype=float, copy=False)).sum())
+            v1 = float(finite_values / max(1, observed_record_count))
         else:
             v1 = 0.0
 
@@ -152,7 +168,8 @@ class ValidityScorer:
         else:
             v3 = 0.0
 
-        v4 = 1.0 if (diag.timestamp_col_present and diag.schema_required_columns_present and column_present) else 0.0
+        required_present = int(bool(diag.timestamp_col_present)) + int(bool(column_present))
+        v4 = float(required_present / 2.0)
 
         weights = dict((self.config.get("subcheck_weights", {}) or {}).get("validity", {}) or {})
         validity = _weighted_average({"V1": v1, "V2": v2, "V3": v3, "V4": v4}, weights)
@@ -183,9 +200,23 @@ class ConsistencyScorer:
         clean_series = _get_numeric_series(clean, client_id)
         column_present = bool(diag.client_column_present.get(client_id, False))
 
-        cs1 = float(diag.interval_regularity_score) if column_present and diag.timestamp_col_present else 0.0
-        cs2 = float(diag.monotonic_non_decreasing_score) if column_present and diag.timestamp_col_present else 0.0
-        cs3 = float(diag.duplicate_timestamp_score) if column_present and diag.timestamp_col_present else 0.0
+        if column_present and diag.timestamp_col_present:
+            timestamps = _get_timestamp_series(current)
+            valid_ts = timestamps.dropna().reset_index(drop=True)
+            if valid_ts.shape[0] <= 1:
+                cs1 = 1.0 if valid_ts.shape[0] == 1 else 0.0
+                cs2 = cs1
+            else:
+                deltas = valid_ts.diff().dropna()
+                tolerance = max(pd.Timedelta(seconds=1), current.frequency * 0.1)
+                cs1 = float((deltas.sub(current.frequency).abs() <= tolerance).mean())
+                cs2 = float((deltas > pd.Timedelta(0)).mean())
+            observed_count = int(valid_ts.shape[0])
+            cs3 = float(valid_ts.nunique() / max(1, observed_count))
+        else:
+            cs1 = 0.0
+            cs2 = 0.0
+            cs3 = 0.0
 
         valid = current_series.notna()
         if valid.any():
@@ -194,7 +225,14 @@ class ConsistencyScorer:
                 min_len=int(self.consistency_cfg.get("freeze_min_len", 6)),
                 atol=float(self.consistency_cfg.get("freeze_atol", 0.0)),
             )
-            cs4 = float(max(0.0, 1.0 - freeze_mask.loc[valid].mean()))
+            clean_valid = clean_series.dropna()
+            clean_zero_ratio = float((clean_valid.abs() <= 1e-9).mean()) if not clean_valid.empty else 0.0
+            clean_std = float(clean_valid.std(ddof=0)) if not clean_valid.empty else 0.0
+            frozen_ratio = float(freeze_mask.loc[valid].mean())
+            if frozen_ratio >= 0.999 and (clean_zero_ratio >= 0.95 or clean_std <= 1e-9):
+                cs4 = 1.0
+            else:
+                cs4 = float(max(0.0, 1.0 - frozen_ratio))
         else:
             cs4 = 0.0
 
@@ -253,25 +291,23 @@ class AccuracyScorer:
         return {"A1": a1, "A2": a2, "A3": a3, "accuracy": accuracy}
 
     def _score_local_anomaly(self, current_series: pd.Series) -> float:
-        method = str(self.accuracy_cfg.get("local_anomaly_method", "seasonal_naive")).lower()
-        if method == "rolling_median":
-            anomaly, applicable, _ = rolling_median_mad_anomaly_mask(
-                current_series,
-                window=int(self.accuracy_cfg.get("rolling_window", 24)),
-                mad_multiplier=float(self.accuracy_cfg.get("mad_multiplier", 4.0)),
-                min_history=int(self.accuracy_cfg.get("min_history", 6)),
-                min_threshold_abs=float(self.accuracy_cfg.get("min_threshold_abs", 0.0)),
-            )
-        else:
-            anomaly, applicable, _ = seasonal_naive_anomaly_mask(
-                current_series,
-                period=int(self.accuracy_cfg.get("seasonal_period", 24)),
-                threshold_multiplier=float(self.accuracy_cfg.get("seasonal_threshold_multiplier", 3.0)),
-                min_threshold_abs=float(self.accuracy_cfg.get("min_threshold_abs", 0.0)),
-            )
-
+        values = pd.to_numeric(current_series, errors="coerce")
+        applicable = values.notna() & values.shift(1).notna() & values.shift(-1).notna()
         if int(applicable.sum()) == 0:
             return 1.0 if current_series.notna().any() else 0.0
+        x_hat = (values.shift(1) + values.shift(-1)) / 2.0
+        sigma_ref = max(
+            safe_std(values.dropna().to_numpy(dtype=float)),
+            float(self.accuracy_cfg.get("min_threshold_abs", 0.0)),
+            1e-6,
+        )
+        kappa = float(
+            self.accuracy_cfg.get(
+                "local_spike_kappa",
+                self.accuracy_cfg.get("seasonal_threshold_multiplier", 3.0),
+            )
+        )
+        anomaly = (values - x_hat).abs() > (kappa * sigma_ref)
         return float(max(0.0, 1.0 - anomaly.loc[applicable].mean()))
 
     def _score_robust_deviation(self, current_series: pd.Series) -> float:
@@ -289,25 +325,19 @@ class AccuracyScorer:
     def _score_noise_instability(self, current_series: pd.Series, clean_series: pd.Series) -> float:
         values = pd.to_numeric(current_series, errors="coerce")
         clean_values = pd.to_numeric(clean_series, errors="coerce")
-        cur_diffs = values.diff().dropna().to_numpy(dtype=float)
-        clean_diffs = clean_values.diff().dropna().to_numpy(dtype=float)
+        cur_diffs = values.diff().abs().dropna().to_numpy(dtype=float)
+        clean_diffs = clean_values.diff().abs().dropna().to_numpy(dtype=float)
         cur_diffs = cur_diffs[np.isfinite(cur_diffs)]
         clean_diffs = clean_diffs[np.isfinite(clean_diffs)]
         if cur_diffs.size == 0:
             return 0.0 if values.notna().sum() == 0 else 1.0
 
-        cur_noise = median_absolute_deviation(cur_diffs)
-        if cur_noise <= 0:
-            cur_noise = safe_std(cur_diffs)
-        ref_noise = median_absolute_deviation(clean_diffs)
-        if ref_noise <= 0:
-            ref_noise = safe_std(clean_diffs)
         epsilon = float(self.accuracy_cfg.get("epsilon", 1e-6))
-        ref_noise = max(ref_noise, epsilon)
-        ratio = cur_noise / ref_noise
-        allowed_ratio = float(self.accuracy_cfg.get("allowed_noise_ratio", 2.0))
-        excess = max(0.0, ratio - 1.0)
-        return float(max(0.0, 1.0 - min(1.0, excess / max(allowed_ratio, epsilon))))
+        ref_mafd = float(np.mean(clean_diffs)) if clean_diffs.size else 0.0
+        cur_mafd = float(np.mean(cur_diffs))
+        tau_noise = float(self.accuracy_cfg.get("allowed_noise_ratio", 2.0))
+        denom = max(ref_mafd * tau_noise, epsilon)
+        return float(max(0.0, 1.0 - (cur_mafd / denom)))
 
 
 class FreshnessScorer:
@@ -328,7 +358,7 @@ class FreshnessScorer:
         clean_ts = _get_timestamp_series(clean)
         valid = current_series.notna() & current_ts.notna()
 
-        ref_time = clean_ts.max()
+        ref_time = _resolve_reference_time(clean_ts, self.config)
         if valid.any() and pd.notna(ref_time):
             latest_valid_ts = current_ts.loc[valid].max()
             age = ref_time - latest_valid_ts
@@ -352,18 +382,16 @@ class FreshnessScorer:
         if not reporting_delay_enabled:
             f3 = 1.0
         else:
-            reporting_ref = self.freshness_cfg.get("reporting_reference_time")
             delay_tau = pd.to_timedelta(self.freshness_cfg.get("reporting_delay_tau", "24h"))
-            if reporting_ref is None or delay_tau <= pd.Timedelta(0) or not valid.any():
+            deadline_raw = self.freshness_cfg.get("reporting_deadline_time")
+            arrival_raw = self.freshness_cfg.get("reporting_arrival_time")
+            deadline_time = pd.to_datetime(deadline_raw, errors="coerce") if deadline_raw is not None else pd.NaT
+            arrival_time = pd.to_datetime(arrival_raw, errors="coerce") if arrival_raw is not None else pd.NaT
+            if delay_tau <= pd.Timedelta(0) or pd.isna(deadline_time) or pd.isna(arrival_time):
                 f3 = 1.0
             else:
-                reference_time = pd.to_datetime(reporting_ref, errors="coerce")
-                if pd.isna(reference_time):
-                    f3 = 1.0
-                else:
-                    latest_valid_ts = current_ts.loc[valid].max()
-                    delay = reference_time - latest_valid_ts
-                    f3 = float(max(0.0, 1.0 - (delay / delay_tau)))
+                delay = max(pd.Timedelta(0), arrival_time - deadline_time)
+                f3 = float(max(0.0, 1.0 - (delay / delay_tau)))
 
         weights = dict((self.config.get("subcheck_weights", {}) or {}).get("freshness", {}) or {})
         freshness = _weighted_average({"F1": f1, "F2": f2, "F3": f3}, weights)

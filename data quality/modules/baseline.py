@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from .io import load_wide_demand_csv, save_json
@@ -50,14 +52,26 @@ def calibrate_client_baselines(
         if valid.empty:
             continue
 
+        diffs = valid.diff().abs().dropna()
+        q95 = float(valid.quantile(0.95))
+        q99 = float(valid.quantile(0.99))
+        median = float(valid.median())
+        zero_ratio = float((valid.abs() <= 1e-9).mean())
+
         edges = make_histogram_bin_edges(valid.to_numpy(dtype=float), bins=bins, strategy=strategy)
         probs = histogram_probs(valid.to_numpy(dtype=float), edges, epsilon=epsilon)
         baselines[str(client_id)] = {
             "sample_count": int(valid.shape[0]),
             "mean": safe_mean(valid),
             "std": safe_std(valid),
+            "median": median,
+            "q95": q95,
+            "q99": q99,
             "lower_bound": lower_bound,
             "upper_bound": float(valid.quantile(0.999) * upper_multiplier),
+            "mafd": float(diffs.mean()) if not diffs.empty else 0.0,
+            "diff_mad": float(np.median(np.abs(diffs - np.median(diffs)))) if not diffs.empty else 0.0,
+            "zero_ratio": zero_ratio,
             "peak_ratio": peak_offpeak_ratio(series, dataset.frame[dataset.timestamp_col], peak_hours, epsilon=epsilon),
             "autocorr": {str(k): float(v) for k, v in autocorrelation_at_lags(series, autocorr_lags).items()},
             "stationarity_sigma_ref": segment_mean_std(series, n_segments=stationarity_segments),
@@ -91,4 +105,14 @@ def calibrate_demand_baseline_from_csv(
     )
     payload = calibrate_client_baselines(dataset, config=config)
     save_json(payload, output_path)
+    return payload
+
+
+def load_baseline_artifact(path: Path | str) -> dict:
+    """Load a previously saved baseline JSON artifact."""
+    baseline_path = Path(path)
+    with baseline_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Baseline artifact at {baseline_path} must be a JSON object.")
     return payload
