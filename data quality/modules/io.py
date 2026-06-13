@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import ast
 import json
-import subprocess
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -149,22 +149,204 @@ def load_yaml_config(path: Path | str) -> dict:
         with config_path.open("r", encoding="utf-8") as handle:
             data = yaml.safe_load(handle) or {}
     except ModuleNotFoundError:
-        # Fall back to the system Python when the active project venv does not
-        # include PyYAML but a machine-wide install is available.
-        script = (
-            "import json, sys, yaml; "
-            "print(json.dumps(yaml.safe_load(open(sys.argv[1], 'r', encoding='utf-8')) or {}))"
-        )
-        proc = subprocess.run(
-            ["python3", "-c", script, str(config_path)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        data = json.loads(proc.stdout or "{}")
+        data = _load_simple_yaml_config(config_path)
     if not isinstance(data, dict):
         raise ValueError(f"Config at {config_path} must contain a YAML mapping.")
     return data
+
+
+def _load_simple_yaml_config(path: Path) -> dict:
+    """Parse the limited YAML subset used by this repository.
+
+    Supported features:
+    - nested mappings by indentation
+    - inline lists: `[a, b, "c"]`
+    - inline dicts: `{"a": 1, "b": 2}`
+    - quoted strings, numbers, booleans, and nulls
+    - blank lines and `#` comments
+
+    Unsupported features intentionally raise a clear error instead of silently
+    mis-parsing the config.
+    """
+    entries: list[tuple[int, int, str]] = []
+    for lineno, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        stripped_line = _strip_yaml_comment(raw_line).rstrip()
+        if not stripped_line.strip():
+            continue
+        indent = len(stripped_line) - len(stripped_line.lstrip(" "))
+        content = stripped_line[indent:]
+        if content.startswith("- "):
+            raise ValueError(
+                f"Unsupported block-list YAML syntax at {path}:{lineno}. "
+                "Use inline lists like [a, b, c] or install PyYAML."
+            )
+        entries.append((lineno, indent, content))
+
+    root: dict = {}
+    stack: list[tuple[int, dict]] = [(-1, root)]
+    for index, (lineno, indent, content) in enumerate(entries):
+        if "\t" in content:
+            raise ValueError(f"Tabs are not supported in YAML config at {path}:{lineno}.")
+        separator = _find_top_level_separator(content, ":")
+        if separator < 0:
+            raise ValueError(f"Invalid YAML mapping entry at {path}:{lineno}: {content!r}")
+
+        key = content[:separator].strip()
+        raw_value = content[separator + 1 :].strip()
+        if not key:
+            raise ValueError(f"Empty YAML key at {path}:{lineno}.")
+
+        while indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+
+        next_indent = entries[index + 1][1] if index + 1 < len(entries) else None
+        if raw_value:
+            parent[key] = _parse_simple_yaml_value(raw_value, path=path, lineno=lineno)
+            continue
+
+        if next_indent is not None and next_indent > indent:
+            child: dict = {}
+            parent[key] = child
+            stack.append((indent, child))
+        else:
+            parent[key] = None
+
+    return root
+
+
+def _strip_yaml_comment(line: str) -> str:
+    in_single = False
+    in_double = False
+    escaped = False
+    for idx, char in enumerate(line):
+        if char == "\\" and in_double and not escaped:
+            escaped = True
+            continue
+        if char == "'" and not in_double and not escaped:
+            in_single = not in_single
+        elif char == '"' and not in_single and not escaped:
+            in_double = not in_double
+        elif char == "#" and not in_single and not in_double:
+            return line[:idx]
+        escaped = False
+    return line
+
+
+def _find_top_level_separator(text: str, separator: str) -> int:
+    in_single = False
+    in_double = False
+    escaped = False
+    bracket_depth = 0
+    brace_depth = 0
+    for idx, char in enumerate(text):
+        if char == "\\" and in_double and not escaped:
+            escaped = True
+            continue
+        if char == "'" and not in_double and not escaped:
+            in_single = not in_single
+        elif char == '"' and not in_single and not escaped:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if char == "[":
+                bracket_depth += 1
+            elif char == "]":
+                bracket_depth = max(0, bracket_depth - 1)
+            elif char == "{":
+                brace_depth += 1
+            elif char == "}":
+                brace_depth = max(0, brace_depth - 1)
+            elif char == separator and bracket_depth == 0 and brace_depth == 0:
+                return idx
+        escaped = False
+    return -1
+
+
+def _split_top_level_items(text: str) -> list[str]:
+    items: list[str] = []
+    start = 0
+    in_single = False
+    in_double = False
+    escaped = False
+    bracket_depth = 0
+    brace_depth = 0
+    for idx, char in enumerate(text):
+        if char == "\\" and in_double and not escaped:
+            escaped = True
+            continue
+        if char == "'" and not in_double and not escaped:
+            in_single = not in_single
+        elif char == '"' and not in_single and not escaped:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if char == "[":
+                bracket_depth += 1
+            elif char == "]":
+                bracket_depth = max(0, bracket_depth - 1)
+            elif char == "{":
+                brace_depth += 1
+            elif char == "}":
+                brace_depth = max(0, brace_depth - 1)
+            elif char == "," and bracket_depth == 0 and brace_depth == 0:
+                items.append(text[start:idx].strip())
+                start = idx + 1
+        escaped = False
+
+    tail = text[start:].strip()
+    if tail:
+        items.append(tail)
+    return items
+
+
+def _parse_simple_yaml_value(raw_value: str, *, path: Path, lineno: int):
+    text = raw_value.strip()
+    if not text or text in {"null", "Null", "NULL", "~"}:
+        return None
+
+    lower = text.lower()
+    if lower == "true":
+        return True
+    if lower == "false":
+        return False
+
+    if text.startswith("[") and text.endswith("]"):
+        inner = text[1:-1].strip()
+        if not inner:
+            return []
+        return [
+            _parse_simple_yaml_value(item, path=path, lineno=lineno)
+            for item in _split_top_level_items(inner)
+        ]
+
+    if text.startswith("{") and text.endswith("}"):
+        inner = text[1:-1].strip()
+        if not inner:
+            return {}
+        parsed: dict = {}
+        for item in _split_top_level_items(inner):
+            separator = _find_top_level_separator(item, ":")
+            if separator < 0:
+                raise ValueError(f"Invalid inline YAML mapping at {path}:{lineno}: {item!r}")
+            key = _parse_simple_yaml_value(item[:separator].strip(), path=path, lineno=lineno)
+            if not isinstance(key, (str, int, float, bool)):
+                raise ValueError(f"Unsupported inline YAML key type at {path}:{lineno}: {item!r}")
+            parsed[str(key)] = _parse_simple_yaml_value(item[separator + 1 :].strip(), path=path, lineno=lineno)
+        return parsed
+
+    if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
+        return ast.literal_eval(text)
+
+    try:
+        return int(text)
+    except ValueError:
+        pass
+
+    try:
+        return float(text)
+    except ValueError:
+        pass
+
+    return text
 
 
 def load_wide_demand_dataframe(
