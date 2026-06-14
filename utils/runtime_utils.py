@@ -74,13 +74,25 @@ def wait_for_service(url: str, max_attempts: int = 60, delay_sec: float = 1.0) -
 
 def post_json(url: str, payload: Optional[Dict[str, Any]] = None, timeout: float = 120.0):
     response = requests.post(url, json=payload or {}, timeout=timeout)
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        body = (response.text or "").strip()
+        if body:
+            raise RuntimeError(f"POST {url} failed with HTTP {response.status_code}: {body}") from exc
+        raise
     return response.json()
 
 
 def get_json(url: str, timeout: float = 30.0):
     response = requests.get(url, timeout=timeout)
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        body = (response.text or "").strip()
+        if body:
+            raise RuntimeError(f"GET {url} failed with HTTP {response.status_code}: {body}") from exc
+        raise
     return response.json()
 
 

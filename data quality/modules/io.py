@@ -41,7 +41,7 @@ def normalize_consumption_sign(
         if finite.empty:
             normalized[col] = values
             continue
-        negative_fraction = float((finite < 0).mean())
+        negative_fraction = float((finite <= 0).mean())
         if negative_fraction > 0.5:
             normalized[col] = -values
         else:
@@ -156,18 +156,7 @@ def load_yaml_config(path: Path | str) -> dict:
 
 
 def _load_simple_yaml_config(path: Path) -> dict:
-    """Parse the limited YAML subset used by this repository.
-
-    Supported features:
-    - nested mappings by indentation
-    - inline lists: `[a, b, "c"]`
-    - inline dicts: `{"a": 1, "b": 2}`
-    - quoted strings, numbers, booleans, and nulls
-    - blank lines and `#` comments
-
-    Unsupported features intentionally raise a clear error instead of silently
-    mis-parsing the config.
-    """
+    """Parse the limited YAML subset used by this repository"""
     entries: list[tuple[int, int, str]] = []
     for lineno, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         stripped_line = _strip_yaml_comment(raw_line).rstrip()
@@ -356,12 +345,7 @@ def load_wide_demand_dataframe(
     configured_freq: Optional[str] = None,
     min_numeric_fraction: float = 0.5,
 ) -> WideDemandDataset:
-    """Standardize a wide demand DataFrame.
-
-    After timestamp parsing and client detection, demand columns are normalized
-    to positive consumption values. Raw smart-meter inputs that are
-    predominantly negative are converted via ``y = -y``.
-    """
+    """Standardize a wide demand DataFrame"""
     if df.empty:
         raise ValueError("Input demand DataFrame is empty.")
 
