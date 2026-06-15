@@ -1386,7 +1386,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset-dir", type=Path, default=Path("dataset"), help="Dataset directory")
     p.add_argument("--cluster-output-dir", type=Path, default=Path("dataset") / "output", help="Directory containing cluster_*.pkl files used to rebuild prediction timelines.")
     p.add_argument("--raw-csv-path", type=Path, default=Path("dataset") / "dataset.csv", help="Wide-format raw CSV used when cluster pickle files are missing or unreadable.")
-    p.add_argument("--output-dir", type=Path, default=Path("outputs/output-new-best-faulty-eval"), help="Training output directory")
+    p.add_argument("--output-dir", type=Path, default=Path("outputs/output-20260613-185635"), help="Training output directory")
     p.add_argument("--test-report", type=Path, default=None, help="Per-client split-learning test report CSV. Defaults to output/results/test_report.csv with fallbacks.")
     p.add_argument("--baseline-report", type=Path, default=None, help="Baseline LSTM metrics CSV. Defaults to dataset/lstm_results_updated.csv with fallbacks.")
     p.add_argument("--assignments-path", type=Path, default=Path("dataset") / "cluster-assignment.csv", help="Cluster assignment CSV used to map baseline rows to clusters.")
