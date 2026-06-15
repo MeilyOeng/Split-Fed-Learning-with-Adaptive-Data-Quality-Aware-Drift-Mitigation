@@ -425,12 +425,22 @@ def inverse_transform(arr: np.ndarray, normalize: bool, method: str, mean: float
     return arr
 
 
-def apply_sign_flip(arr: np.ndarray, sign_flip: bool) -> np.ndarray:
-    return (-arr) if sign_flip else arr
+def apply_runtime_sign_transform(arr: np.ndarray, sign_flip_enabled: bool) -> Tuple[np.ndarray, bool]:
+    """Mirror stream_service._transform_series() for offline reconstruction.
 
-
-def undo_sign_flip(arr: np.ndarray, sign_flip: bool) -> np.ndarray:
-    return (-arr) if sign_flip else arr
+    The runtime only flips a series when sign flipping is enabled *and* the
+    loaded finite values are all negative. This matters because cluster pickle
+    files may already contain positive sign-normalized values, while raw-CSV
+    fallback data may still be negative.
+    """
+    values = np.asarray(arr, dtype=np.float32).copy()
+    if not sign_flip_enabled:
+        return values, False
+    finite = values[np.isfinite(values)]
+    should_flip = bool(finite.size > 0 and np.all(finite < 0))
+    if should_flip:
+        values = -values
+    return values, should_flip
 
 
 def compute_metrics(preds: np.ndarray, targets: np.ndarray) -> Dict[str, Optional[float]]:
@@ -1244,7 +1254,10 @@ def evaluate_one_client(
 
     original_values = cdf["value"].to_numpy(dtype=np.float32)
     timestamps = cdf["Fecha_Hora"].to_numpy()
-    working_values = apply_sign_flip(original_values, artifact_cfg.sign_flip)
+    working_values, runtime_sign_flipped = apply_runtime_sign_transform(
+        original_values,
+        artifact_cfg.sign_flip,
+    )
 
     X_all, y_all_working, ts_all = build_all_windows(working_values, timestamps, window_size, forecast_horizon)
     if len(X_all) == 0:
@@ -1311,23 +1324,26 @@ def evaluate_one_client(
     ).reshape(-1, 1)
     y_true_working = y_test_working.reshape(-1, 1)
 
-    preds_original = undo_sign_flip(preds_working, artifact_cfg.sign_flip)
-    y_true_original = undo_sign_flip(y_true_working, artifact_cfg.sign_flip)
-    metrics = compute_metrics(preds_original, y_true_original)
+    # Match online evaluation: metrics are computed after inverse
+    # normalization, on the same sign-transformed working values seen by the
+    # live stream service.
+    preds_eval = preds_working
+    y_true_eval = y_true_working
+    metrics = compute_metrics(preds_eval, y_true_eval)
 
     plot_path = plots_dir / "predictions" / f"cluster_{cluster_id}" / f"{client_id}.png"
     prediction_csv = predictions_dir / f"cluster_{cluster_id}" / f"client_{client_id}_predictions.csv"
     plot_client_forecast(
         plot_path,
         ts_test,
-        y_true_original,
-        preds_original,
+        y_true_eval,
+        preds_eval,
         cluster_id=cluster_id,
         client_id=client_id,
         metrics=metrics,
         last_n=last_n_plot,
     )
-    save_prediction_points_csv(prediction_csv, ts_test, y_true_original, preds_original)
+    save_prediction_points_csv(prediction_csv, ts_test, y_true_eval, preds_eval)
 
     saved_test = maybe_load_saved_test_metrics(output_dir, cluster_id, client_id)
     saved_raw = None if saved_test is None else saved_test.get("raw_metrics", {})
@@ -1341,7 +1357,7 @@ def evaluate_one_client(
         "client_id": str(client_id),
         "checkpoint_mode": checkpoint_mode,
         "artifact_eval_mode": artifact_cfg.eval_mode,
-        "num_test_samples": int(len(y_true_original)),
+        "num_test_samples": int(len(y_true_eval)),
         "checkpoint_client": str(client_ckpt_path),
         "checkpoint_server": str(server_ckpt_path),
         "client_checkpoint_epoch": int(client_ckpt.get("epoch", -1)) if isinstance(client_ckpt, dict) else None,
@@ -1349,6 +1365,7 @@ def evaluate_one_client(
         "normalize": bool(artifact_cfg.normalize),
         "normalize_method": artifact_cfg.normalize_method,
         "sign_flip": bool(artifact_cfg.sign_flip),
+        "runtime_sign_flipped": bool(runtime_sign_flipped),
         "norm_mean": float(artifact_cfg.mean),
         "norm_scale": float(artifact_cfg.scale),
         "plot_path": str(plot_path),
@@ -1366,8 +1383,8 @@ def evaluate_one_client(
             "cluster_id": str(cluster_id),
             "client_id": str(client_id),
             "timestamps": pd.to_datetime(ts_test).astype(str).tolist(),
-            "y_true": y_true_original.reshape(-1).tolist(),
-            "y_pred": preds_original.reshape(-1).tolist(),
+            "y_true": y_true_eval.reshape(-1).tolist(),
+            "y_pred": preds_eval.reshape(-1).tolist(),
             "metrics": metrics,
         },
     }
