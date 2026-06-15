@@ -64,6 +64,8 @@ notes/
 *.pdf
 .dist/
 *.csv
+output-*
+output/*
 # compare_*.py
 # reports/
 # report-*/

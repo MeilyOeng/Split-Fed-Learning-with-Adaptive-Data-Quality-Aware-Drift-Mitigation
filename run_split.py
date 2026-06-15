@@ -42,6 +42,7 @@ CLIENT_PATH = "client/client.py"
 STREAM_SERVICE_PATH = "data/stream_service.py"
 SERVER_PATH = "server/server.py"
 ASSIGNMENTS_PATH = Path("dataset") / "cluster-assignment.csv"
+# OUTPUT_DIR  = Path("outputs/output-20260613-185635")
 OUTPUT_DIR = Path("outputs") / "output-default"
 RESULTS_DIR = OUTPUT_DIR / "results"
 CLUSTER_DATA_DIR = Path("dataset") / "output"
