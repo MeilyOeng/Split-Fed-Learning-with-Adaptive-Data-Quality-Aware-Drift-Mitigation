@@ -285,7 +285,20 @@ class ClusterDataRepository:
         pkl_path = self.cluster_output_dir / f"cluster_{cluster_id}.pkl"
         if pkl_path.exists():
             try:
-                df = pd.read_pickle(pkl_path).copy()
+                payload = pd.read_pickle(pkl_path)
+                if isinstance(payload, pd.DataFrame):
+                    df = payload.copy()
+                elif isinstance(payload, dict):
+                    timeseries = payload.get("timeseries")
+                    if not isinstance(timeseries, pd.DataFrame):
+                        raise ValueError(
+                            f"Cluster pickle payload at {pkl_path} does not contain a pandas DataFrame under 'timeseries'."
+                        )
+                    df = timeseries.copy()
+                else:
+                    raise TypeError(
+                        f"Unsupported cluster pickle payload type at {pkl_path}: {type(payload).__name__}"
+                    )
             except Exception as exc:
                 log(f"[WARN] Failed to read {pkl_path}; falling back to raw CSV merge: {exc}")
                 df = self._load_cluster_df_from_csv(cluster_id)
