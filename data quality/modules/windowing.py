@@ -14,6 +14,9 @@ from .io import WideDemandDataset, load_wide_demand_csv, load_wide_demand_datafr
 from .schema import expected_timestamp_index
 
 
+DQ_METADATA_PREFIX = "__dq_"
+
+
 @dataclass(frozen=True)
 class DemandWindowSource:
     """Shared source state for per-client window generation."""
@@ -37,6 +40,8 @@ class ClientWindowSlice:
     client_id: str
     window_id: str
     window_index: int
+    window_start_index: int
+    window_end_index: int
     window_start: pd.Timestamp
     window_end: pd.Timestamp
     timestamp_col: str
@@ -118,16 +123,19 @@ def _slice_raw_client_frame(
     cols = [timestamp_col]
     if client_id in raw_frame.columns:
         cols.append(client_id)
+    cols.extend([col for col in raw_frame.columns if str(col).startswith(DQ_METADATA_PREFIX)])
     subset = raw_frame.loc[(parsed_ts >= window_start) & (parsed_ts <= window_end), cols].copy()
     if client_id not in subset.columns:
         subset[client_id] = np.nan
     if subset.empty:
-        subset = pd.DataFrame(
-            {
-                timestamp_col: pd.Series(fallback_grid, dtype="datetime64[ns]"),
-                client_id: np.nan,
-            }
-        )
+        data = {
+            timestamp_col: pd.Series(fallback_grid, dtype="datetime64[ns]"),
+            client_id: np.nan,
+        }
+        for col in raw_frame.columns:
+            if str(col).startswith(DQ_METADATA_PREFIX):
+                data[str(col)] = np.nan
+        subset = pd.DataFrame(data)
     return subset
 
 
@@ -226,6 +234,8 @@ def iter_client_windows(
                 client_id=str(client_id),
                 window_id=window_id,
                 window_index=int(end_idx),
+                window_start_index=int(start_idx),
+                window_end_index=int(end_idx),
                 window_start=window_start,
                 window_end=window_end,
                 timestamp_col=source.timestamp_col,

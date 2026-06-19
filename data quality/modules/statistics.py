@@ -109,17 +109,30 @@ def autocorrelation_at_lags(
 ) -> dict[int, float]:
     """Compute autocorrelation at specific lags for one numeric series."""
     values = pd.to_numeric(series, errors="coerce")
+    array = values.to_numpy(dtype=float, copy=False)
     out: dict[int, float] = {}
     for lag in lags:
         lag_int = int(lag)
         if lag_int <= 0:
             continue
-        try:
-            corr = values.autocorr(lag=lag_int)
-        except Exception:
-            corr = np.nan
+        if lag_int >= array.shape[0]:
+            continue
+        x = array[:-lag_int]
+        y = array[lag_int:]
+        mask = np.isfinite(x) & np.isfinite(y)
+        if int(mask.sum()) < 2:
+            continue
+        x = x[mask]
+        y = y[mask]
+        x_std = float(np.std(x, ddof=0))
+        y_std = float(np.std(y, ddof=0))
+        if x_std <= 1e-12 or y_std <= 1e-12:
+            continue
+        x_centered = x - float(np.mean(x))
+        y_centered = y - float(np.mean(y))
+        corr = float(np.mean(x_centered * y_centered) / (x_std * y_std))
         if np.isfinite(corr):
-            out[lag_int] = float(corr)
+            out[lag_int] = corr
     return out
 
 

@@ -43,6 +43,9 @@ ASSIGNMENTS_PATH = Path("dataset") / "cluster-assignment.csv"
 OUTPUT_DIR = Path("outputs") / "output-default"
 RESULTS_DIR = OUTPUT_DIR / "results"
 CLUSTER_DATA_DIR = Path("dataset") / "output"
+TRAIN_CLUSTER_DATA_DIR = CLUSTER_DATA_DIR
+VAL_CLUSTER_DATA_DIR = CLUSTER_DATA_DIR
+TEST_CLUSTER_DATA_DIR = CLUSTER_DATA_DIR
 STREAM_BASE_PORT = 5101
 SERVER_BASE_PORT = 5002
 CLIENT_WORKER_BASE_PORT = 6101
@@ -63,15 +66,19 @@ def configure_output_dirs() -> None:
 
 
 def refresh_runtime_settings_from_env() -> None:
-    global STREAM_BASE_PORT, SERVER_BASE_PORT, CLIENT_WORKER_BASE_PORT, CLUSTER_DATA_DIR
+    global STREAM_BASE_PORT, SERVER_BASE_PORT, CLIENT_WORKER_BASE_PORT
+    global CLUSTER_DATA_DIR, TRAIN_CLUSTER_DATA_DIR, VAL_CLUSTER_DATA_DIR, TEST_CLUSTER_DATA_DIR
     STREAM_BASE_PORT = int(os.environ.get("STREAM_BASE_PORT", str(STREAM_BASE_PORT)))
     SERVER_BASE_PORT = int(os.environ.get("SERVER_BASE_PORT", str(SERVER_BASE_PORT)))
     CLIENT_WORKER_BASE_PORT = int(os.environ.get("CLIENT_WORKER_BASE_PORT", str(CLIENT_WORKER_BASE_PORT)))
     CLUSTER_DATA_DIR = Path(os.environ.get("CLUSTER_DATA_DIR", str(CLUSTER_DATA_DIR)))
+    TRAIN_CLUSTER_DATA_DIR = Path(os.environ.get("TRAIN_CLUSTER_DATA_DIR", str(CLUSTER_DATA_DIR)))
+    VAL_CLUSTER_DATA_DIR = Path(os.environ.get("VAL_CLUSTER_DATA_DIR", str(CLUSTER_DATA_DIR)))
+    TEST_CLUSTER_DATA_DIR = Path(os.environ.get("TEST_CLUSTER_DATA_DIR", str(CLUSTER_DATA_DIR)))
 
 
 def configure_model_input_size(env: dict) -> None:
-    manifest_path = CLUSTER_DATA_DIR / "feature_manifest.json"
+    manifest_path = TRAIN_CLUSTER_DATA_DIR / "feature_manifest.json"
     auto_model_input_size = parse_bool(os.environ.get("AUTO_MODEL_INPUT_SIZE", "true"), default=True)
     use_static_features = parse_bool(os.environ.get("USE_STATIC_FEATURES", "false"), default=False)
     requested_static_columns = _parse_optional_csv(os.environ.get("STATIC_FEATURE_COLUMNS"))
@@ -231,6 +238,9 @@ def start_stream_service(cluster_id: str, env: dict, cluster_idx: int):
             "CLUSTER_ID": str(cluster_id),
             "STREAM_PORT": str(port),
             "CLUSTER_DIR": str(CLUSTER_DATA_DIR),
+            "TRAIN_CLUSTER_DATA_DIR": str(TRAIN_CLUSTER_DATA_DIR),
+            "VAL_CLUSTER_DATA_DIR": str(VAL_CLUSTER_DATA_DIR),
+            "TEST_CLUSTER_DATA_DIR": str(TEST_CLUSTER_DATA_DIR),
             "PROCESS_ROLE": f"stream_cluster_{cluster_idx}",
             "GPU_ENABLED": "false",
         }
@@ -776,7 +786,14 @@ def run_round(server_port: int, cluster_id: str, client_ports: Dict[str, int], r
     numeric_round_id = int(round_idx * 1000 + round_chunk_idx)
     round_label = f"epoch{scheduler_epoch}_round{round_idx}_chunk{round_chunk_idx}"
     log(f"[ROUND][start] cluster={cluster_id} scheduler_epoch={scheduler_epoch} round={round_idx} chunk={round_chunk_idx} round_id={round_label} active_clients={round_clients}")
-    post_json(f"http://localhost:{server_port}/round/start", {"round_id": numeric_round_id, "expected_clients": round_clients})
+    post_json(
+        f"http://localhost:{server_port}/round/start",
+        {
+            "round_id": numeric_round_id,
+            "expected_clients": round_clients,
+            "effective_accum_steps_target": len(round_clients),
+        },
+    )
 
     results: Dict[str, dict] = {}
     for order_idx, client_id in enumerate(round_clients, start=1):
@@ -1180,6 +1197,18 @@ def main() -> int:
             "STATIC_FEATURE_COLUMNS": os.environ.get("STATIC_FEATURE_COLUMNS", ""),
             "STATIC_FEATURE_GROUPS": os.environ.get("STATIC_FEATURE_GROUPS", ""),
             "AUTO_MODEL_INPUT_SIZE": os.environ.get("AUTO_MODEL_INPUT_SIZE", "true"),
+            "CLUSTER_DATA_DIR": os.environ.get("CLUSTER_DATA_DIR", str(CLUSTER_DATA_DIR)),
+            "TRAIN_CLUSTER_DATA_DIR": os.environ.get("TRAIN_CLUSTER_DATA_DIR", str(TRAIN_CLUSTER_DATA_DIR)),
+            "VAL_CLUSTER_DATA_DIR": os.environ.get("VAL_CLUSTER_DATA_DIR", str(VAL_CLUSTER_DATA_DIR)),
+            "TEST_CLUSTER_DATA_DIR": os.environ.get("TEST_CLUSTER_DATA_DIR", str(TEST_CLUSTER_DATA_DIR)),
+            "USE_QUALITY_WEIGHTS": os.environ.get("USE_QUALITY_WEIGHTS", "false"),
+            "QUALITY_SCORE_PATH": os.environ.get("QUALITY_SCORE_PATH", ""),
+            "QUALITY_SCORE_GRANULARITY": os.environ.get("QUALITY_SCORE_GRANULARITY", "window"),
+            "STRICT_QUALITY_SCORE_MATCHING": os.environ.get("STRICT_QUALITY_SCORE_MATCHING", "true"),
+            "QUALITY_SCORE_FALLBACK": os.environ.get("QUALITY_SCORE_FALLBACK", "1.0"),
+            "QUALITY_SCORE_MIN": os.environ.get("QUALITY_SCORE_MIN", "0.05"),
+            "QUALITY_SCORE_MAX": os.environ.get("QUALITY_SCORE_MAX", "1.0"),
+            "QUALITY_SCORE_EPS": os.environ.get("QUALITY_SCORE_EPS", "1e-8"),
         }
     )
     configure_model_input_size(env)
@@ -1201,14 +1230,22 @@ def main() -> int:
     log(f"Eval mode: {env['EVAL_MODE']}")
     log(f"Run output directory: {OUTPUT_DIR}")
     log(f"Cluster data directory: {CLUSTER_DATA_DIR}")
+    log(f"Train cluster data directory: {TRAIN_CLUSTER_DATA_DIR}")
+    log(f"Val cluster data directory: {VAL_CLUSTER_DATA_DIR}")
+    log(f"Test cluster data directory: {TEST_CLUSTER_DATA_DIR}")
     log(f"Model layers: {env['MODEL_NUM_LAYERS']}, split at: {env['MODEL_SPLIT_LAYER']}")
     log(f"Window size: {env['WINDOW_SIZE']} horizon: {env['FORECAST_HORIZON']} batch_size: {env['BATCH_SIZE']}")
     log(f"Train/Val/Test ratios: {env['TRAIN_RATIO']}/{env['VAL_RATIO']}/{env['TEST_RATIO']}")
     log(f"Normalization: enabled={env['NORMALIZE']} method={env['NORMALIZE_METHOD']}")
     log(f"Client LR: {env['CLIENT_LR']}")
     log(f"Server LR: {env['SERVER_LR']}")
-    log(f"Server round chunk size (ACCUM_STEPS_SERVER): {env['ACCUM_STEPS_SERVER']}")
+    log(f"Configured ACCUM_STEPS_SERVER: {env['ACCUM_STEPS_SERVER']} (runtime enforces len(round_clients) per logical round)")
     log(f"Checkpoint every rounds: {env['CHECKPOINT_EVERY_ROUNDS']}")
+    log(
+        f"Quality weights: enabled={env['USE_QUALITY_WEIGHTS']} "
+        f"path={env['QUALITY_SCORE_PATH'] or '<disabled>'} "
+        f"granularity={env['QUALITY_SCORE_GRANULARITY']} strict={env['STRICT_QUALITY_SCORE_MATCHING']}"
+    )
     log(
         f"Communication logging: train={env['COMM_LOG_TRAIN']} eval={env['COMM_LOG_EVAL']} "
         f"stream={env['COMM_LOG_STREAM']} every_n_batches={env['COMM_LOG_EVERY_N_BATCHES']}"

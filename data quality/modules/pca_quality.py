@@ -23,6 +23,15 @@ QUALITY_DIMENSIONS = [
 ]
 
 
+def _safe_correlation(x: np.ndarray, y: np.ndarray, epsilon: float = 1e-12) -> float:
+    """Return a stable correlation or NaN when either vector is effectively constant."""
+    x_std = float(np.nanstd(x))
+    y_std = float(np.nanstd(y))
+    if x_std <= epsilon or y_std <= epsilon:
+        return float("nan")
+    return float(np.corrcoef(x, y)[0, 1])
+
+
 @dataclass
 class DemandPCAQualityModel:
     """One-component PCA model for client quality aggregation."""
@@ -62,7 +71,7 @@ class DemandPCAQualityModel:
             component = pca.components_[0].astype(float)
             explained_variance_ratio = float(pca.explained_variance_ratio_[0])
             fallback_to_row_mean = False
-            corr = np.corrcoef(raw_scores, row_mean)[0, 1]
+            corr = _safe_correlation(raw_scores, row_mean)
             if not np.isnan(corr) and corr < 0:
                 raw_scores = -raw_scores
                 component = -component

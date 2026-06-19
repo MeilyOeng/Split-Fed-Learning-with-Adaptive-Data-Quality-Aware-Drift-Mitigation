@@ -5,7 +5,7 @@ Supports modes: train, val, test.
 
 import pickle
 import time
-from typing import Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 import requests
 import torch
@@ -40,7 +40,7 @@ class StreamingIterableDataset(IterableDataset):
             self._session = requests.Session()
         return self._session
 
-    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]]:
         session = self._get_session()
         while True:
             attempt = 0
@@ -88,4 +88,21 @@ class StreamingIterableDataset(IterableDataset):
             if not torch.is_tensor(y_batch):
                 y_batch = torch.tensor(y_batch, dtype=torch.float32)
 
-            yield X_batch, y_batch
+            quality_scores = payload.get("quality_scores")
+            if quality_scores is not None and not torch.is_tensor(quality_scores):
+                quality_scores = torch.tensor(quality_scores, dtype=torch.float32)
+
+            meta: Dict[str, Any] = {
+                "cluster_id": payload.get("cluster_id"),
+                "client_id": payload.get("client_id"),
+                "mode": payload.get("mode", self.mode),
+                "window_start_indices": payload.get("window_start_indices", []),
+                "window_end_indices": payload.get("window_end_indices", []),
+                "window_start_timestamps": payload.get("window_start_timestamps", []),
+                "window_end_timestamps": payload.get("window_end_timestamps", []),
+                "target_timestamps": payload.get("target_timestamps", []),
+                "quality_scores": quality_scores,
+                "quality_score_metadata": payload.get("quality_score_metadata", {}),
+            }
+
+            yield X_batch, y_batch, meta

@@ -27,6 +27,37 @@ TARGET_COLUMNS = [
 ]
 
 
+def _runtime_split_bounds(
+    num_values: int,
+    *,
+    window_size_steps: int,
+    forecast_horizon: int,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+) -> dict[str, tuple[int, int]]:
+    total_windows = max(0, num_values - window_size_steps - forecast_horizon + 1)
+    train_windows = int(total_windows * train_ratio)
+    val_windows = int(total_windows * val_ratio)
+    test_windows = total_windows - train_windows - val_windows
+    train_end = train_windows
+    val_end = train_end + val_windows
+    test_end = val_end + test_windows
+    return {
+        "train": (0, train_end),
+        "val": (train_end, val_end),
+        "test": (val_end, test_end),
+    }
+
+
+def _runtime_mode_for_window_start(window_start_index: int, split_bounds: dict[str, tuple[int, int]]) -> str:
+    for mode in ("train", "val", "test"):
+        start, end = split_bounds[mode]
+        if start <= window_start_index < end:
+            return mode
+    return "out_of_split"
+
+
 def _save_dataframe(df: pd.DataFrame, path: Path | str) -> None:
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,6 +136,10 @@ def build_demand_label_dataset(
     baseline_artifact_path: Optional[Path | str] = None,
     window_size_steps: int = 168,
     stride_steps: int = 24,
+    forecast_horizon: int = 1,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.1,
+    test_ratio: float = 0.2,
     timestamp_col: Optional[str] = None,
     configured_freq: Optional[str] = None,
     selected_clients: Optional[Sequence[str]] = None,
@@ -127,6 +162,15 @@ def build_demand_label_dataset(
         selected_clients=selected_clients,
     )
     scorer = WideDemandQualityScorer(config=score_config)
+    total_runtime_windows = max(0, len(source.expected_grid) - window_size_steps - forecast_horizon + 1)
+    split_bounds = _runtime_split_bounds(
+        len(source.expected_grid),
+        window_size_steps=window_size_steps,
+        forecast_horizon=forecast_horizon,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        test_ratio=test_ratio,
+    )
 
     rows: list[dict[str, float | str]] = []
     for idx, window in enumerate(
@@ -136,6 +180,8 @@ def build_demand_label_dataset(
             stride_steps=stride_steps,
         )
     ):
+        if window.window_start_index >= total_runtime_windows:
+            continue
         if max_windows is not None and idx >= int(max_windows):
             break
         current = window.current_window
@@ -154,7 +200,11 @@ def build_demand_label_dataset(
 
         row: dict[str, float | str] = {
             "client_id": client_id,
+            "mode": _runtime_mode_for_window_start(window.window_start_index, split_bounds),
             "window_id": window.window_id,
+            "window_index": int(window.window_index),
+            "window_start_index": int(window.window_start_index),
+            "window_end_index": int(window.window_end_index),
             "window_start": window.window_start.isoformat(),
             "window_end": window.window_end.isoformat(),
             **features,
@@ -195,13 +245,50 @@ def build_demand_label_dataset(
 
     raw_scores = model.transform(dimension_df)
     dataset["y_final"] = _normalize_quality_score(raw_scores, dimension_df, model)
+    dataset["quality_score"] = dataset["y_final"].astype(float)
+    dataset["dimension_completeness"] = dataset["y_completeness"].astype(float)
+    dataset["dimension_validity"] = dataset["y_validity"].astype(float)
+    dataset["dimension_consistency"] = dataset["y_consistency"].astype(float)
+    dataset["dimension_accuracy"] = dataset["y_accuracy"].astype(float)
+    dataset["dimension_freshness"] = dataset["y_freshness"].astype(float)
 
     ordered_columns = [
         "client_id",
+        "mode",
         "window_id",
+        "window_index",
+        "window_start_index",
+        "window_end_index",
         "window_start",
         "window_end",
-        *[col for col in dataset.columns if col not in {"client_id", "window_id", "window_start", "window_end", *TARGET_COLUMNS}],
+        "quality_score",
+        "dimension_completeness",
+        "dimension_validity",
+        "dimension_consistency",
+        "dimension_accuracy",
+        "dimension_freshness",
+        *[
+            col
+            for col in dataset.columns
+            if col
+            not in {
+                "client_id",
+                "mode",
+                "window_id",
+                "window_index",
+                "window_start_index",
+                "window_end_index",
+                "window_start",
+                "window_end",
+                "quality_score",
+                "dimension_completeness",
+                "dimension_validity",
+                "dimension_consistency",
+                "dimension_accuracy",
+                "dimension_freshness",
+                *TARGET_COLUMNS,
+            }
+        ],
         *TARGET_COLUMNS,
     ]
     dataset = dataset.loc[:, ordered_columns]

@@ -139,7 +139,7 @@ class ClusteredClientRunner:
         self.train_dataset = self._build_stream_dataset("train")
         self.val_dataset = self._build_stream_dataset("val")
         self.test_dataset = self._build_stream_dataset("test")
-        self.train_iter: Optional[Iterator[Tuple[torch.Tensor, torch.Tensor]]] = None
+        self.train_iter: Optional[Iterator[Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]]] = None
         self.train_stream_active = bool(self.progress.get("train_stream_active", False))
         self.prefetched_train_batch = None
         self.train_epoch_exhausted = False
@@ -334,16 +334,32 @@ class ClusteredClientRunner:
             y = y.squeeze(-1)
         return X, y
 
+    def _unpack_stream_batch(self, batch: Any) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
+        if isinstance(batch, tuple):
+            if len(batch) == 3:
+                X, y, meta = batch
+                return X, y, (meta or {})
+            if len(batch) == 2:
+                X, y = batch
+                return X, y, {}
+        raise TypeError(f"Unsupported stream batch type: {type(batch).__name__}")
+
     def _pack_payload(
         self,
         client_id: str,
         activations: torch.Tensor,
         targets: Optional[torch.Tensor],
+        quality_scores: Optional[torch.Tensor] = None,
+        quality_score_metadata: Optional[Dict[str, Any]] = None,
         meta: Optional[Dict[str, Any]] = None,
     ) -> bytes:
         payload = {"client_id": str(client_id), "activations": activations.detach().cpu()}
         if targets is not None:
             payload["targets"] = targets.detach().cpu()
+        if quality_scores is not None:
+            payload["quality_scores"] = quality_scores.detach().cpu()
+        if quality_score_metadata is not None:
+            payload["quality_score_metadata"] = quality_score_metadata
         if meta:
             payload.update(meta)
         return pickle.dumps(payload)
@@ -391,12 +407,16 @@ class ClusteredClientRunner:
                         **base_row,
                         "direction": "client_to_server",
                         "payload_type": log_meta.get("request_payload_type"),
-                        "payload_shape": log_meta.get("activation_shape"),
-                        "payload_bytes": len(data),
-                        "latency_ms": latency_ms,
-                        "bandwidth_MBps": upload_MBps,
-                        "bandwidth_Mbps": upload_Mbps,
-                    }
+                    "payload_shape": log_meta.get("activation_shape"),
+                    "payload_bytes": len(data),
+                    "latency_ms": latency_ms,
+                    "bandwidth_MBps": upload_MBps,
+                    "bandwidth_Mbps": upload_Mbps,
+                    "weighted_loss": result.get("weighted_loss") if isinstance(result, dict) else None,
+                    "quality_score_min": result.get("quality_score_min") if isinstance(result, dict) else None,
+                    "quality_score_max": result.get("quality_score_max") if isinstance(result, dict) else None,
+                    "quality_score_mean": result.get("quality_score_mean") if isinstance(result, dict) else None,
+                }
                 )
                 response_payload_type = log_meta.get("response_payload_type")
                 grad = result.get("grad_activations") if isinstance(result, dict) else None
@@ -527,12 +547,12 @@ class ClusteredClientRunner:
         num_samples = 0
         with torch.no_grad():
             batch_idx = 0
-            for X, y in loader:
+            for batch in loader:
+                X, y, _ = self._unpack_stream_batch(batch)
                 batch_idx += 1
                 X, y = self._prepare_batch_for_lstm(X, y)
-                # Preserve the full sequence across the split so the server-side
-                # LSTM continues the recurrent stack over all timesteps.
-                activations = self.client_model(X)
+                # The active split contract sends only the last hidden state [B, H].
+                activations = self.client_model(X)[:, -1, :]
                 log_enabled = self.comm_log_eval and should_log_index(batch_idx, self.comm_log_every_n_batches)
                 log_meta = {
                     "log_enabled": log_enabled,
@@ -554,6 +574,8 @@ class ClusteredClientRunner:
                             self.runtime_cfg.client_id,
                             activations,
                             y,
+                            quality_scores=None,
+                            quality_score_metadata=None,
                             meta={"scheduler_epoch": epoch, "local_epoch": epoch, "batch_id": batch_idx},
                         ),
                         log_meta=log_meta,
@@ -567,6 +589,8 @@ class ClusteredClientRunner:
                             self.runtime_cfg.client_id,
                             activations,
                             None,
+                            quality_scores=None,
+                            quality_score_metadata=None,
                             meta={"scheduler_epoch": epoch, "local_epoch": epoch, "batch_id": batch_idx},
                         ),
                         log_meta=log_meta,
@@ -660,24 +684,39 @@ class ClusteredClientRunner:
         self._save_progress()
         return summary
 
-    def _train_single_batch(self, X: torch.Tensor, y: torch.Tensor) -> float:
+    def _train_single_batch(self, X: torch.Tensor, y: torch.Tensor, batch_meta: Dict[str, Any]) -> float:
         X, y = self._prepare_batch_for_lstm(X, y)
         self.optimizer.zero_grad(set_to_none=True)
         local_epoch = int(self.progress.get("completed_epochs", 0)) + 1
         batch_id = int(self.progress.get("current_epoch_batch_count", 0)) + 1
+        quality_scores = batch_meta.get("quality_scores")
+        if quality_scores is not None and not torch.is_tensor(quality_scores):
+            quality_scores = torch.tensor(quality_scores, dtype=torch.float32)
 
         use_cudnn = not (self.device.type == "cuda")
         with torch.backends.cudnn.flags(enabled=use_cudnn):
-            # Preserve the full sequence across the split so the server-side
-            # LSTM continues the recurrent stack over all timesteps.
-            activations = self.client_model(X)
+            # The active split contract sends only the last hidden state [B, H].
+            activations = self.client_model(X)[:, -1, :]
+            payload_meta = {
+                "scheduler_epoch": local_epoch,
+                "local_epoch": local_epoch,
+                "batch_id": batch_id,
+                "mode": str(batch_meta.get("mode", "train")),
+                "window_start_indices": batch_meta.get("window_start_indices", []),
+                "window_end_indices": batch_meta.get("window_end_indices", []),
+                "window_start_timestamps": batch_meta.get("window_start_timestamps", []),
+                "window_end_timestamps": batch_meta.get("window_end_timestamps", []),
+                "target_timestamps": batch_meta.get("target_timestamps", []),
+            }
             result = self._post_pickle(
                 f"{self.current_server_url}/train_step",
                 self._pack_payload(
                     self.runtime_cfg.client_id,
                     activations,
                     y,
-                    meta={"scheduler_epoch": local_epoch, "local_epoch": local_epoch, "batch_id": batch_id},
+                    quality_scores=quality_scores,
+                    quality_score_metadata=batch_meta.get("quality_score_metadata", {}),
+                    meta=payload_meta,
                 ),
                 log_meta={
                     "log_enabled": self.comm_log_train and should_log_index(batch_id, self.comm_log_every_n_batches),
@@ -721,11 +760,11 @@ class ClusteredClientRunner:
             summary = self._finalize_epoch(epoch_number, avg_train_loss)
             return {"status": "epoch_completed", "summary": summary, **self.status()}
 
-        X, y = batch
-        loss = self._train_single_batch(X, y)
+        X, y, batch_meta = self._unpack_stream_batch(batch)
+        loss = self._train_single_batch(X, y, batch_meta)
         self.progress["current_epoch_loss_sum"] = float(self.progress.get("current_epoch_loss_sum", 0.0)) + loss
         self.progress["current_epoch_batch_count"] = int(self.progress.get("current_epoch_batch_count", 0)) + 1
-        self.progress["stream_window_offset"] = int(self.progress.get("stream_window_offset", 0)) + int(self.runtime_cfg.batch_size)
+        self.progress["stream_window_offset"] = int(self.progress.get("stream_window_offset", 0)) + int(X.shape[0])
         self._save_progress()
         return {
             "status": "batch_processed",

@@ -11,6 +11,8 @@ from typing import Iterable
 
 import pandas as pd
 
+DQ_METADATA_PREFIX = "__dq_"
+
 
 DEFAULT_DATASET_PATH = Path("dataset") / "dataset.csv"
 DEFAULT_ASSIGNMENT_PATH = Path("dataset") / "cluster-assignment.csv"
@@ -39,7 +41,7 @@ def ensure_dir(path: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build cluster pickle files with sign-normalized demand and metadata features.")
+    parser = argparse.ArgumentParser(description="Build cluster pickle files with metadata features.")
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET_PATH, help="Wide demand CSV path.")
     parser.add_argument("--assignments", type=Path, default=DEFAULT_ASSIGNMENT_PATH, help="Cluster assignment CSV path.")
     parser.add_argument("--metadata", type=Path, default=DEFAULT_METADATA_PATH, help="Client metadata CSV path.")
@@ -51,15 +53,6 @@ def parse_args() -> argparse.Namespace:
 def _normalize_group_text(series: pd.Series) -> pd.Series:
     cleaned = series.fillna("UNKNOWN").astype(str).str.strip()
     return cleaned.replace({"": "UNKNOWN", "nan": "UNKNOWN", "None": "UNKNOWN"})
-
-
-def _auto_flip_series(series: pd.Series) -> tuple[pd.Series, bool]:
-    numeric = pd.to_numeric(series, errors="coerce")
-    valid = numeric.dropna()
-    should_flip = bool(not valid.empty and (valid < 0).all())
-    if should_flip:
-        numeric = -numeric
-    return numeric, should_flip
 
 
 def _prepare_metadata(metadata_path: Path) -> tuple[pd.DataFrame, list[str], dict]:
@@ -105,7 +98,6 @@ def _prepare_metadata(metadata_path: Path) -> tuple[pd.DataFrame, list[str], dic
         if not pd.api.types.is_numeric_dtype(metadata_export[col]):
             metadata_export[col] = _normalize_group_text(metadata_export[col])
     metadata_export = metadata_export.rename(columns={"ID": "source_id"})
-    metadata_export["sign_flipped"] = False
     metadata_export = metadata_export.merge(raw_feature_frame, on="id", how="left")
 
     static_feature_columns = numeric_feature_columns + categorical_feature_columns
@@ -124,7 +116,7 @@ def _prepare_metadata(metadata_path: Path) -> tuple[pd.DataFrame, list[str], dic
 
 def _iter_client_columns(frame: pd.DataFrame, timestamp_col: str) -> Iterable[str]:
     for col in frame.columns:
-        if col != timestamp_col:
+        if col != timestamp_col and not str(col).startswith(DQ_METADATA_PREFIX):
             yield str(col)
 
 
@@ -153,11 +145,8 @@ def preprocess_clusters(
     dataset = dataset.rename(columns=rename_map)
     client_cols = [rename_map[col] for col in client_cols]
 
-    sign_flip_map: dict[str, bool] = {}
     for client_id in client_cols:
-        flipped, was_flipped = _auto_flip_series(dataset[client_id])
-        dataset[client_id] = flipped
-        sign_flip_map[client_id] = was_flipped
+        dataset[client_id] = pd.to_numeric(dataset[client_id], errors="coerce")
 
     log(f"Reading cluster assignments from {assignment_path}")
     assignments = pd.read_csv(assignment_path).copy()
@@ -176,7 +165,6 @@ def preprocess_clusters(
     )
 
     metadata_export = assignments[["id", "Cluster"]].merge(metadata_export, on="id", how="left")
-    metadata_export["sign_flipped"] = metadata_export["id"].map(lambda cid: bool(sign_flip_map.get(cid, False)))
     for feature_col in static_feature_columns:
         if feature_col not in metadata_export.columns:
             metadata_export[feature_col] = 0.0
@@ -237,11 +225,9 @@ def preprocess_clusters(
         "matched_assignment_clients": int(len(matched_assignments)),
         "assignment_clients_missing_from_dataset": int(len(missing_from_dataset)),
         "assignment_client_ids_missing_from_dataset": missing_from_dataset[:50],
-        "num_sign_flipped_clients": int(sum(1 for value in sign_flip_map.values() if value)),
         "clusters": cluster_summaries,
     }
     feature_manifest.update(manifest)
-    feature_manifest["sign_flip_rule"] = "flip_only_when_all_non_null_values_are_strictly_negative"
 
     manifest_path = output_dir / "feature_manifest.json"
     manifest_path.write_text(json.dumps(feature_manifest, indent=2), encoding="utf-8")

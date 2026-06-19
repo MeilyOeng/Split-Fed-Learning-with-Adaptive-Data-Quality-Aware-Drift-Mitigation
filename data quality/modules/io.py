@@ -20,35 +20,6 @@ from .schema import (
 )
 
 
-def normalize_consumption_sign(
-    frame: pd.DataFrame,
-    client_cols: Iterable[str],
-) -> pd.DataFrame:
-    """Normalize predominantly negative demand columns to positive consumption.
-
-    The raw smart-meter dataset stores demand as negative values. This helper
-    applies ``y = -y`` to client columns that are predominantly negative so the
-    rest of the pipeline operates on positive consumption values.
-
-    The normalization is intentionally idempotent at the dataset level: columns
-    that are already mostly positive are left unchanged. This prevents double
-    flipping when fault-injected CSVs are reloaded later for scoring.
-    """
-    normalized = frame.copy(deep=False)
-    for col in client_cols:
-        values = pd.to_numeric(normalized[col], errors="coerce")
-        finite = values.dropna()
-        if finite.empty:
-            normalized[col] = values
-            continue
-        negative_fraction = float((finite <= 0).mean())
-        if negative_fraction > 0.5:
-            normalized[col] = -values
-        else:
-            normalized[col] = values
-    return normalized
-
-
 def _pairwise_score(mask: pd.Series, success_mask: pd.Series) -> float:
     """Return a score over valid adjacent pairs."""
     valid_pairs = int(mask.sum())
@@ -345,7 +316,7 @@ def load_wide_demand_dataframe(
     configured_freq: Optional[str] = None,
     min_numeric_fraction: float = 0.5,
 ) -> WideDemandDataset:
-    """Standardize a wide demand DataFrame"""
+    """Standardize a wide demand DataFrame without modifying demand sign."""
     if df.empty:
         raise ValueError("Input demand DataFrame is empty.")
 
@@ -365,7 +336,6 @@ def load_wide_demand_dataframe(
     )
     for col in client_cols:
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
-    frame = normalize_consumption_sign(frame, client_cols)
 
     frequency = infer_frequency(frame[ts_col], configured_freq=configured_freq)
     diagnostics = build_wide_demand_diagnostics(

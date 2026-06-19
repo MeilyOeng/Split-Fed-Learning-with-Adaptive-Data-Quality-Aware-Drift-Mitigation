@@ -109,9 +109,6 @@ def load_inputs():
     # Convert all client columns to numeric safely
     raw.iloc[:, 1:] = raw.iloc[:, 1:].apply(pd.to_numeric, errors="coerce")
 
-    # Now invert sign
-    raw.iloc[:, 1:] = -raw.iloc[:, 1:]
-
     ts_col = TIMESTAMP_COL
     if ts_col not in raw.columns:
         ts_col = raw.columns[0]

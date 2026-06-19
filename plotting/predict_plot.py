@@ -425,124 +425,6 @@ def inverse_transform(arr: np.ndarray, normalize: bool, method: str, mean: float
     return arr
 
 
-def apply_runtime_sign_transform(arr: np.ndarray, sign_flip_enabled: bool) -> Tuple[np.ndarray, bool]:
-    """Mirror stream_service._transform_series() for offline reconstruction.
-
-    The runtime only flips a series when sign flipping is enabled *and* the
-    loaded finite values are all negative. This matters because cluster pickle
-    files may already contain positive sign-normalized values, while raw-CSV
-    fallback data may still be negative.
-    """
-    values = np.asarray(arr, dtype=np.float32).copy()
-    if not sign_flip_enabled:
-        return values, False
-    finite = values[np.isfinite(values)]
-    should_flip = bool(finite.size > 0 and np.all(finite < 0))
-    if should_flip:
-        values = -values
-    return values, should_flip
-
-
-def recompute_normalization_stats(
-    values: np.ndarray,
-    *,
-    method: str,
-    window_size: int,
-    horizon: int,
-    num_train_windows: Optional[int],
-    train_ratio: float,
-    val_ratio: float,
-    test_ratio: float,
-) -> Tuple[float, float]:
-    series = np.asarray(values, dtype=np.float32).reshape(-1)
-    if series.size == 0:
-        return 0.0, 1.0
-
-    if num_train_windows is None:
-        _, train_end = get_split_bounds(
-            len(series),
-            window_size,
-            horizon,
-            train_ratio,
-            val_ratio,
-            test_ratio,
-        )["train"]
-    else:
-        train_end = max(0, int(num_train_windows))
-
-    train_value_end = min(len(series), train_end + window_size + horizon)
-    train_values = series[:train_value_end]
-    if train_values.size == 0:
-        return 0.0, 1.0
-
-    if method.lower() == "minmax":
-        min_v = float(np.min(train_values))
-        max_v = float(np.max(train_values))
-        return min_v, max(max_v - min_v, 1e-8)
-
-    mean = float(np.mean(train_values))
-    scale = float(np.std(train_values, ddof=1)) if train_values.size > 1 else 1.0
-    if not np.isfinite(scale) or scale < 1e-8:
-        scale = 1.0
-    return mean, scale
-
-
-def choose_sign_replay_values(
-    original_values: np.ndarray,
-    *,
-    sign_flip_enabled: bool,
-    normalize: bool,
-    normalize_method: str,
-    saved_mean: float,
-    saved_scale: float,
-    window_size: int,
-    horizon: int,
-    num_train_windows: Optional[int],
-    train_ratio: float,
-    val_ratio: float,
-    test_ratio: float,
-) -> Tuple[np.ndarray, bool, str, Optional[float], Optional[float]]:
-    raw_values = np.asarray(original_values, dtype=np.float32).copy()
-    current_values, current_runtime_flipped = apply_runtime_sign_transform(raw_values, sign_flip_enabled)
-
-    if not sign_flip_enabled:
-        return current_values, current_runtime_flipped, "current_rule_disabled", None, None
-    if not normalize:
-        return current_values, current_runtime_flipped, "current_rule_no_norm_match", None, None
-
-    candidate_map = {
-        "raw": (raw_values, False),
-        "flipped": (-raw_values, True),
-    }
-    candidate_errors: Dict[str, float] = {}
-    for candidate_name, (candidate_values, _) in candidate_map.items():
-        candidate_mean, candidate_scale = recompute_normalization_stats(
-            candidate_values,
-            method=normalize_method,
-            window_size=window_size,
-            horizon=horizon,
-            num_train_windows=num_train_windows,
-            train_ratio=train_ratio,
-            val_ratio=val_ratio,
-            test_ratio=test_ratio,
-        )
-        candidate_errors[candidate_name] = abs(candidate_mean - saved_mean) + abs(candidate_scale - saved_scale)
-
-    current_name = "flipped" if current_runtime_flipped else "raw"
-    current_error = candidate_errors[current_name]
-    best_name = min(candidate_errors, key=candidate_errors.get)
-    best_error = candidate_errors[best_name]
-
-    # Preserve the current rule for newly generated artifacts unless the saved
-    # normalization stats clearly indicate an older sign convention.
-    if current_error <= 1e-5 or best_name == current_name or best_error + 1e-5 >= current_error:
-        return current_values, current_runtime_flipped, "current_rule", current_error, current_error
-
-    selected_values, selected_runtime_flipped = candidate_map[best_name]
-    mode = "legacy_force_flip" if best_name == "flipped" else "legacy_force_raw"
-    return selected_values, selected_runtime_flipped, mode, current_error, best_error
-
-
 def compute_metrics(preds: np.ndarray, targets: np.ndarray) -> Dict[str, Optional[float]]:
     preds = preds.reshape(-1)
     targets = targets.reshape(-1)
@@ -656,7 +538,6 @@ class ClientArtifactConfig:
     eval_mode: str
     normalize: bool
     normalize_method: str
-    sign_flip: bool
     mean: float
     scale: float
     num_train_windows: Optional[int]
@@ -687,7 +568,6 @@ def load_client_artifact_config(output_dir: Path, cluster_id: str, client_id: st
         eval_mode=str(training.get("eval_mode", "final_shared")),
         normalize=bool(normalization.get("normalize", True)),
         normalize_method=str(normalization.get("method", "zscore")),
-        sign_flip=bool(normalization.get("sign_flip", False)),
         mean=float(normalization.get("mean", 0.0)),
         scale=float(normalization.get("scale", 1.0)),
         num_train_windows=(None if normalization.get("num_train_windows") is None else int(normalization["num_train_windows"])),
@@ -1354,25 +1234,7 @@ def evaluate_one_client(
 
     original_values = cdf["value"].to_numpy(dtype=np.float32)
     timestamps = cdf["Fecha_Hora"].to_numpy()
-    working_values, runtime_sign_flipped, sign_replay_mode, sign_match_error_current, sign_match_error_selected = choose_sign_replay_values(
-        original_values,
-        sign_flip_enabled=artifact_cfg.sign_flip,
-        normalize=artifact_cfg.normalize,
-        normalize_method=artifact_cfg.normalize_method,
-        saved_mean=artifact_cfg.mean,
-        saved_scale=artifact_cfg.scale,
-        window_size=window_size,
-        horizon=forecast_horizon,
-        num_train_windows=artifact_cfg.num_train_windows,
-        train_ratio=train_ratio,
-        val_ratio=val_ratio,
-        test_ratio=test_ratio,
-    )
-    if sign_replay_mode.startswith("legacy_"):
-        log(
-            f"     sign replay={sign_replay_mode} "
-            f"(current_error={sign_match_error_current:.6g}, selected_error={sign_match_error_selected:.6g})"
-        )
+    working_values = original_values
 
     X_all, y_all_working, ts_all = build_all_windows(working_values, timestamps, window_size, forecast_horizon)
     if len(X_all) == 0:
@@ -1440,8 +1302,7 @@ def evaluate_one_client(
     y_true_working = y_test_working.reshape(-1, 1)
 
     # Match online evaluation: metrics are computed after inverse
-    # normalization, on the same sign-transformed working values seen by the
-    # live stream service.
+    # normalization on the stored canonical dataset values.
     preds_eval = preds_working
     y_true_eval = y_true_working
     metrics = compute_metrics(preds_eval, y_true_eval)
@@ -1479,11 +1340,6 @@ def evaluate_one_client(
         "server_global_step": int(server_ckpt.get("global_step", -1)) if isinstance(server_ckpt, dict) else None,
         "normalize": bool(artifact_cfg.normalize),
         "normalize_method": artifact_cfg.normalize_method,
-        "sign_flip": bool(artifact_cfg.sign_flip),
-        "runtime_sign_flipped": bool(runtime_sign_flipped),
-        "sign_replay_mode": sign_replay_mode,
-        "sign_match_error_current": sign_match_error_current,
-        "sign_match_error_selected": sign_match_error_selected,
         "norm_mean": float(artifact_cfg.mean),
         "norm_scale": float(artifact_cfg.scale),
         "plot_path": str(plot_path),

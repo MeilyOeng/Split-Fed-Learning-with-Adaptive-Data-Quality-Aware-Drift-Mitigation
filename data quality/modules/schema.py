@@ -20,6 +20,8 @@ DEFAULT_TIMESTAMP_CANDIDATES: Sequence[str] = (
     "ts",
 )
 
+DATA_QUALITY_METADATA_PREFIX = "__dq_"
+
 
 @dataclass(frozen=True)
 class WideDemandDataset:
@@ -96,6 +98,8 @@ def candidate_value_columns(
         if col in ignore:
             continue
         if str(col).startswith("Unnamed:"):
+            continue
+        if str(col).startswith(DATA_QUALITY_METADATA_PREFIX):
             continue
         out.append(str(col))
     return out

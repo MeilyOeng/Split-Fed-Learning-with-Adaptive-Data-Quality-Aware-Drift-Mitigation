@@ -19,6 +19,9 @@ from .statistics import (
     stuck_segment_mask,
 )
 
+MISSING_TIMESTAMP_COL = "__dq_missing_timestamp__"
+DUPLICATE_TIMESTAMP_COUNT_COL = "__dq_duplicate_timestamp_count__"
+
 
 @dataclass(frozen=True)
 class DimensionScores:
@@ -73,6 +76,17 @@ def _get_timestamp_series(dataset: WideDemandDataset) -> pd.Series:
     return pd.to_datetime(dataset.frame[dataset.timestamp_col], errors="coerce")
 
 
+def _get_optional_numeric_column(
+    dataset: WideDemandDataset,
+    column_name: str,
+    *,
+    default: float = 0.0,
+) -> pd.Series:
+    if column_name not in dataset.frame.columns:
+        return pd.Series(default, index=dataset.frame.index, dtype=float)
+    return pd.to_numeric(dataset.frame[column_name], errors="coerce").fillna(default)
+
+
 def _resolve_reference_time(clean_ts: pd.Series, config: dict) -> pd.Timestamp | pd.NaT:
     freshness_cfg = dict((config.get("freshness", {}) or {}))
     configured_ref = freshness_cfg.get("reference_time")
@@ -117,10 +131,16 @@ class CompletenessScorer:
         valid_non_null_count = int((current_series.notna() & current_ts.notna()).sum())
         observed_ts = pd.DatetimeIndex(current_ts.dropna().unique())
         observed_covered = int(observed_ts.intersection(expected_ts).shape[0])
+        missing_timestamp_flags = _get_optional_numeric_column(current, MISSING_TIMESTAMP_COL, default=0.0)
+        missing_timestamp_count = int((missing_timestamp_flags > 0).sum())
 
         c1 = float(valid_non_null_count / max(1, expected_count)) if column_present else 0.0
         c2 = 1.0 if column_present and parseable_count > 0 else 0.0
-        c3 = float(observed_covered / max(1, expected_count)) if column_present and diag.timestamp_col_present else 0.0
+        if column_present and diag.timestamp_col_present:
+            effective_observed = max(0, observed_covered - missing_timestamp_count)
+            c3 = float(effective_observed / max(1, expected_count))
+        else:
+            c3 = 0.0
 
         weights = dict((self.config.get("subcheck_weights", {}) or {}).get("completeness", {}) or {})
         completeness = _weighted_average({"C1": c1, "C2": c2, "C3": c3}, weights)
@@ -203,15 +223,23 @@ class ConsistencyScorer:
         if column_present and diag.timestamp_col_present:
             timestamps = _get_timestamp_series(current)
             valid_ts = timestamps.dropna().reset_index(drop=True)
+            duplicate_counts = _get_optional_numeric_column(current, DUPLICATE_TIMESTAMP_COUNT_COL, default=0.0)
+            duplicate_count = int(duplicate_counts.clip(lower=0).sum())
             if valid_ts.shape[0] <= 1:
                 cs1 = 1.0 if valid_ts.shape[0] == 1 else 0.0
                 cs2 = cs1
+                if duplicate_count > 0:
+                    cs1 = 0.0
+                    cs2 = 0.0
             else:
                 deltas = valid_ts.diff().dropna()
                 tolerance = max(pd.Timedelta(seconds=1), current.frequency * 0.1)
-                cs1 = float((deltas.sub(current.frequency).abs() <= tolerance).mean())
-                cs2 = float((deltas > pd.Timedelta(0)).mean())
-            observed_count = int(valid_ts.shape[0])
+                regular_count = int((deltas.sub(current.frequency).abs() <= tolerance).sum())
+                positive_count = int((deltas > pd.Timedelta(0)).sum())
+                total_deltas = int(len(deltas) + duplicate_count)
+                cs1 = float(regular_count / max(1, total_deltas))
+                cs2 = float(positive_count / max(1, total_deltas))
+            observed_count = int(valid_ts.shape[0] + duplicate_count)
             cs3 = float(valid_ts.nunique() / max(1, observed_count))
         else:
             cs1 = 0.0

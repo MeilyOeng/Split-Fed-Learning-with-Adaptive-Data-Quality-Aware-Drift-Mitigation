@@ -26,6 +26,10 @@ def main() -> int:
     parser.add_argument("--pca-model-output", default=None, type=Path, help="Where to save the fitted PCA JSON when --pca-mode=fit.")
     parser.add_argument("--window-size-steps", type=int, default=168, help="Window size in time steps.")
     parser.add_argument("--stride-steps", type=int, default=24, help="Stride in time steps.")
+    parser.add_argument("--forecast-horizon", type=int, default=1, help="Forecast horizon in time steps.")
+    parser.add_argument("--train-ratio", type=float, default=0.7, help="Runtime train split ratio.")
+    parser.add_argument("--val-ratio", type=float, default=0.1, help="Runtime validation split ratio.")
+    parser.add_argument("--test-ratio", type=float, default=0.2, help="Runtime test split ratio.")
     parser.add_argument("--timestamp-col", default=None, help="Explicit timestamp column.")
     parser.add_argument("--configured-freq", default=None, help="Explicit expected sampling frequency, e.g. 1h.")
     parser.add_argument("--clients", nargs="*", default=None, help="Optional subset of client ids.")
@@ -40,6 +44,10 @@ def main() -> int:
         baseline_artifact_path=args.baseline_artifact,
         window_size_steps=args.window_size_steps,
         stride_steps=args.stride_steps,
+        forecast_horizon=args.forecast_horizon,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        test_ratio=args.test_ratio,
         timestamp_col=args.timestamp_col,
         configured_freq=args.configured_freq,
         selected_clients=args.clients,

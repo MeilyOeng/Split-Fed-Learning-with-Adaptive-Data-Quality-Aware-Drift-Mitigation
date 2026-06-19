@@ -36,6 +36,8 @@ SIMPLE_FAULT_META = {
 
 _ORIG_ROW_ID_COL = "__dq_orig_row_id__"
 _IS_DUPLICATE_COL = "__dq_is_duplicate__"
+_MISSING_TIMESTAMP_COL = "__dq_missing_timestamp__"
+_DUPLICATE_TIMESTAMP_COUNT_COL = "__dq_duplicate_timestamp_count__"
 
 
 @dataclass
@@ -621,8 +623,61 @@ class WideDemandFaultInjector:
                 ["dimension", "subcheck", "client_id", "start_time"],
                 kind="mergesort",
             ).reset_index(drop=True)
-        clean_frame = frame.drop(columns=[_ORIG_ROW_ID_COL, _IS_DUPLICATE_COL], errors="ignore")
+        restore_expected_timestamps = bool(
+            self.config.get("restore_expected_timestamps_after_injection", True)
+        )
+        if restore_expected_timestamps:
+            clean_frame = self._restore_expected_timestamp_grid(
+                frame=frame,
+                original_frame=original_frame,
+                client_cols=client_cols,
+                ts_col=ts_col,
+            )
+        else:
+            clean_frame = frame.drop(
+                columns=[
+                    _ORIG_ROW_ID_COL,
+                    _IS_DUPLICATE_COL,
+                    _MISSING_TIMESTAMP_COL,
+                    _DUPLICATE_TIMESTAMP_COUNT_COL,
+                ],
+                errors="ignore",
+            )
         return clean_frame, report_df
+
+    def _restore_expected_timestamp_grid(
+        self,
+        *,
+        frame: pd.DataFrame,
+        original_frame: pd.DataFrame,
+        client_cols: Sequence[str],
+        ts_col: str,
+    ) -> pd.DataFrame:
+        row_ids = np.arange(len(original_frame), dtype=int)
+        nonduplicate = (
+            frame.loc[~frame[_IS_DUPLICATE_COL].astype(bool)]
+            .set_index(_ORIG_ROW_ID_COL, drop=False)
+            .reindex(row_ids)
+        )
+        duplicate_counts = (
+            frame.loc[frame[_IS_DUPLICATE_COL].astype(bool), _ORIG_ROW_ID_COL]
+            .value_counts()
+            .to_dict()
+        )
+
+        restored = pd.DataFrame(
+            {
+                ts_col: pd.to_datetime(original_frame[ts_col], errors="coerce").reset_index(drop=True),
+            }
+        )
+        for client_id in client_cols:
+            restored[client_id] = pd.to_numeric(nonduplicate[client_id], errors="coerce").to_numpy(dtype=float)
+        restored[_MISSING_TIMESTAMP_COL] = nonduplicate[_ORIG_ROW_ID_COL].isna().astype(int).to_numpy()
+        restored[_DUPLICATE_TIMESTAMP_COUNT_COL] = np.asarray(
+            [int(duplicate_counts.get(int(row_id), 0)) for row_id in row_ids],
+            dtype=int,
+        )
+        return restored
 
     def _build_final_corruption_summary(
         self,

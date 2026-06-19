@@ -228,8 +228,11 @@ def _push_weights(server_url: str, state_dict: Dict[str, torch.Tensor], log_path
                 "num_parameters": num_parameters,
             },
         )
-        print(f"[FedServer]   weights loaded on {server_url} "
-              f"(step={body.get('global_step','?')})")
+        print(
+            f"[FedServer]   weights loaded on {server_url} "
+            f"(step={body.get('global_step','?')} optimizer_id={body.get('optimizer_id','?')} "
+            f"optimizer_policy={body.get('optimizer_reset_policy','?')})"
+        )
         return True
     except Exception as e:
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
