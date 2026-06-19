@@ -34,6 +34,19 @@ def main() -> int:
     parser.add_argument("--configured-freq", default=None, help="Explicit expected sampling frequency, e.g. 1h.")
     parser.add_argument("--clients", nargs="*", default=None, help="Optional subset of client ids.")
     parser.add_argument("--max-windows", type=int, default=None, help="Optional cap for quick validation runs.")
+    parser.add_argument(
+        "--artifact-mode",
+        choices=["full", "runtime_scores"],
+        default="full",
+        help="Use 'full' for surrogate-model training features, or 'runtime_scores' for lightweight SplitFed window scores.",
+    )
+    parser.add_argument("--chunk-size", type=int, default=5000, help="CSV chunk size for streaming output.")
+    parser.add_argument(
+        "--progress-every-windows",
+        type=int,
+        default=5000,
+        help="Emit progress every N generated windows; use 0 to disable.",
+    )
     args = parser.parse_args()
 
     build_demand_label_dataset(
@@ -55,6 +68,10 @@ def main() -> int:
         pca_mode=args.pca_mode,
         pca_model_path=args.pca_model_path,
         pca_model_output_path=args.pca_model_output,
+        artifact_mode=args.artifact_mode,
+        return_dataframe=False,
+        chunk_size=args.chunk_size,
+        progress_every_windows=(args.progress_every_windows or None),
     )
     return 0
 
