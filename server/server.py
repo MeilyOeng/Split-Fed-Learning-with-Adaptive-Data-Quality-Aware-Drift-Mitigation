@@ -335,6 +335,7 @@ class SplitLearningServerState:
             raise RuntimeError(f"Duplicate contribution from client {client_id} in round {self.round_id}")
 
         self.global_step += 1
+        input_was_2d = activations_cpu.dim() == 2
         activations = self._ensure_lstm_input_3d(activations_cpu.to(self.device))
         targets = targets_cpu.to(self.device)
         if targets.dim() == 1:
@@ -358,6 +359,8 @@ class SplitLearningServerState:
         weighted_loss_value = float(weighted_loss.item())
         weighted_loss.backward()
         grad_activations = activations.grad.detach().cpu()
+        if input_was_2d and grad_activations.dim() == 3 and grad_activations.size(1) == 1:
+            grad_activations = grad_activations.squeeze(1)
 
         self.pending_accum_steps += 1
         self.seen_clients_total.add(client_id)
