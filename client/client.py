@@ -23,7 +23,10 @@ from models.split_lstm import build_split_lstm
 from utils.comm_logging import append_comm_row, calc_bandwidth, should_log_index, tensor_nbytes, tensor_shape
 from utils.runtime_utils import (
     _get_env,
+    augment_sequence_inputs_with_quality,
     build_lstm_config_from_env,
+    compute_model_input_size,
+    derive_dq_mode,
     get_device_info,
     parse_bool,
     read_json,
@@ -87,10 +90,18 @@ class ClientRuntimeConfig:
     early_stopping_metric: str
     early_stopping_start_from_epoch: int
     server_port: int
+    use_quality_as_input: bool
+    use_quality_weights: bool
+    dq_mode: str
+    quality_score_path: str
+    base_input_size: Optional[int]
+    model_input_size: Optional[int]
 
 
 class ClusteredClientRunner:
     def __init__(self) -> None:
+        use_quality_as_input = parse_bool(_get_env("USE_QUALITY_AS_INPUT", "false"))
+        use_quality_weights = parse_bool(_get_env("USE_QUALITY_WEIGHTS", "false"))
         self.runtime_cfg = ClientRuntimeConfig(
             client_id=_get_env("CLIENT_ID", "9900002"),
             cluster_id=str(_get_env("CLUSTER_ID", "0")).replace("cluster_", ""),
@@ -107,6 +118,12 @@ class ClusteredClientRunner:
             early_stopping_metric=_get_env("EARLY_STOPPING_METRIC", "val_raw_mae"),
             early_stopping_start_from_epoch=int(_get_env("EARLY_STOPPING_START_FROM_EPOCH", "30")),
             server_port=int(_get_env("SERVER_PORT", "5002")),
+            use_quality_as_input=use_quality_as_input,
+            use_quality_weights=use_quality_weights,
+            dq_mode=derive_dq_mode(use_quality_weights, use_quality_as_input),
+            quality_score_path=str(_get_env("QUALITY_SCORE_PATH", "") or "").strip(),
+            base_input_size=None,
+            model_input_size=None,
         )
         self.device = resolve_device()
         self.device_info = get_device_info(self.device, process_role_default="client")
@@ -123,6 +140,7 @@ class ClusteredClientRunner:
         self.comm_log_train = parse_bool(_get_env("COMM_LOG_TRAIN", "true"), default=True)
         self.comm_log_eval = parse_bool(_get_env("COMM_LOG_EVAL", "false"), default=False)
         self.comm_log_every_n_batches = max(1, int(_get_env("COMM_LOG_EVERY_N_BATCHES", "1")))
+        self.progress_save_every_n_batches = max(1, int(_get_env("SAVE_PROGRESS_EVERY_N_BATCHES", "1")))
         self.comm_log_path = client_comm_log_path(self.runtime_cfg.cluster_id, self.runtime_cfg.client_id)
 
         self.client_model = self._build_model().to(self.device)
@@ -148,10 +166,19 @@ class ClusteredClientRunner:
             self.train_iter = iter(self.train_dataset)
 
         self._save_run_config()
-        print(f"[Client {self.runtime_cfg.client_id}] device_info={self.device_info} client_lr={self.runtime_cfg.learning_rate}", flush=True)
+        print(
+            f"[Client {self.runtime_cfg.client_id}] device_info={self.device_info} "
+            f"client_lr={self.runtime_cfg.learning_rate} dq_mode={self.runtime_cfg.dq_mode} "
+            f"use_quality_as_input={self.runtime_cfg.use_quality_as_input} "
+            f"use_quality_weights={self.runtime_cfg.use_quality_weights} "
+            f"base_input_size={self.runtime_cfg.base_input_size} "
+            f"model_input_size={self.runtime_cfg.model_input_size}",
+            flush=True,
+        )
 
     def _build_model(self) -> nn.Module:
         cfg, split_layer = build_lstm_config_from_env()
+        self._validate_model_input_contract(int(cfg.input_size))
         client_model, _ = build_split_lstm(cfg, split_layer)
         return client_model
 
@@ -167,12 +194,14 @@ class ClusteredClientRunner:
                 "server_port": self.runtime_cfg.server_port,
                 "model": {
                     "input_size": cfg.input_size,
+                    "base_input_size": self.runtime_cfg.base_input_size,
                     "hidden_size": cfg.hidden_size,
                     "num_layers": cfg.num_layers,
                     "split_layer": split_layer,
                     "dropout": cfg.dropout,
                     "bidirectional": cfg.bidirectional,
                     "output_size": cfg.output_size,
+                    "quality_feature_appended": self.runtime_cfg.use_quality_as_input,
                 },
                 "training": {
                     "batch_size": self.runtime_cfg.batch_size,
@@ -185,6 +214,16 @@ class ClusteredClientRunner:
                     "early_stopping_metric": self.runtime_cfg.early_stopping_metric,
                     "early_stopping_start_from_epoch": self.runtime_cfg.early_stopping_start_from_epoch,
                     "eval_mode": self.runtime_cfg.eval_mode,
+                    "save_progress_every_n_batches": self.progress_save_every_n_batches,
+                },
+                "data_quality": {
+                    "use_quality_as_input": self.runtime_cfg.use_quality_as_input,
+                    "use_quality_weights": self.runtime_cfg.use_quality_weights,
+                    "dq_mode": self.runtime_cfg.dq_mode,
+                    "base_input_size": self.runtime_cfg.base_input_size,
+                    "model_input_size": self.runtime_cfg.model_input_size,
+                    "quality_feature_appended": self.runtime_cfg.use_quality_as_input,
+                    "quality_score_path": self.runtime_cfg.quality_score_path or None,
                 },
                 "normalization": self.norm_stats,
                 "device": self.device_info,
@@ -221,7 +260,7 @@ class ClusteredClientRunner:
             "stream_window_offset": 0,
         }
 
-    def _save_progress(self) -> None:
+    def _save_progress(self, *, force: bool = False) -> None:
         self.progress["history"] = self.train_history
         self.progress["best_val_score"] = None if self.best_val_score == float("inf") else self.best_val_score
         self.progress["best_epoch"] = self.best_epoch
@@ -229,6 +268,10 @@ class ClusteredClientRunner:
         self.progress["early_stopped"] = self.early_stopped
         self.progress["stop_reason"] = self.stop_reason
         self.progress["train_stream_active"] = self.train_stream_active
+        if not force:
+            batch_count = int(self.progress.get("current_epoch_batch_count", 0))
+            if batch_count <= 0 or not should_log_index(batch_count, self.progress_save_every_n_batches):
+                return
         write_json(client_progress_path(self.runtime_cfg.cluster_id, self.runtime_cfg.client_id), self.progress)
 
     def _maybe_load_checkpoint(self) -> int:
@@ -281,7 +324,7 @@ class ClusteredClientRunner:
             self.train_stream_active = True
             self.train_epoch_exhausted = False
             self.prefetched_train_batch = None
-            self._save_progress()
+            self._save_progress(force=True)
 
     def _prefetch_train_batch(self) -> bool:
         self._ensure_train_stream()
@@ -312,9 +355,9 @@ class ClusteredClientRunner:
         self.train_epoch_exhausted = False
         self.prefetched_train_batch = None
         self.progress["stream_window_offset"] = 0
-        self._save_progress()
+        self._save_progress(force=True)
 
-    def _fetch_norm_stats(self) -> Optional[Dict[str, float]]:
+    def _fetch_norm_stats(self) -> Dict[str, Any]:
         resp = self.session.get(
             f"{self.runtime_cfg.data_stream_api_url}/stream/norm_stats",
             params={"client_id": self.runtime_cfg.client_id, "cluster_id": self.runtime_cfg.cluster_id},
@@ -322,6 +365,73 @@ class ClusteredClientRunner:
         )
         resp.raise_for_status()
         return resp.json()
+
+    @staticmethod
+    def _coerce_optional_int(value: Any) -> Optional[int]:
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _coerce_optional_bool(value: Any) -> Optional[bool]:
+        if value in (None, ""):
+            return None
+        if isinstance(value, bool):
+            return value
+        return parse_bool(str(value))
+
+    def _validate_model_input_contract(self, model_input_size: int) -> None:
+        if not isinstance(self.norm_stats, dict):
+            raise ValueError("Expected stream /stream/norm_stats to return a JSON object.")
+
+        base_input_size = self._coerce_optional_int(self.norm_stats.get("base_input_size"))
+        if base_input_size is None:
+            base_input_size = self._coerce_optional_int(self.norm_stats.get("input_size"))
+        if base_input_size is None:
+            raise ValueError("Stream /stream/norm_stats did not provide base input size metadata.")
+
+        self.runtime_cfg.base_input_size = int(base_input_size)
+        self.runtime_cfg.model_input_size = int(model_input_size)
+        expected_model_input_size = compute_model_input_size(base_input_size, self.runtime_cfg.use_quality_as_input)
+        if model_input_size != expected_model_input_size:
+            suffix = (
+                f"{base_input_size}+1"
+                if self.runtime_cfg.use_quality_as_input
+                else str(base_input_size)
+            )
+            raise ValueError(
+                "MODEL_INPUT_SIZE mismatch: "
+                f"stream/base input size is {base_input_size}, "
+                f"USE_QUALITY_AS_INPUT={self.runtime_cfg.use_quality_as_input} requires {suffix}, "
+                f"but MODEL_INPUT_SIZE is {model_input_size}."
+            )
+
+        stream_use_quality_as_input = self._coerce_optional_bool(self.norm_stats.get("use_quality_as_input"))
+        if (
+            stream_use_quality_as_input is not None
+            and stream_use_quality_as_input != self.runtime_cfg.use_quality_as_input
+        ):
+            raise ValueError(
+                "Runtime mismatch: client USE_QUALITY_AS_INPUT="
+                f"{self.runtime_cfg.use_quality_as_input} but stream reports "
+                f"use_quality_as_input={stream_use_quality_as_input}."
+            )
+
+        stream_model_input_size = self._coerce_optional_int(self.norm_stats.get("model_input_size"))
+        if stream_model_input_size is not None and stream_model_input_size != model_input_size:
+            raise ValueError(
+                "MODEL_INPUT_SIZE mismatch between client and stream metadata: "
+                f"stream model_input_size={stream_model_input_size}, client MODEL_INPUT_SIZE={model_input_size}."
+            )
+
+        stream_dq_mode = str(self.norm_stats.get("dq_mode", "") or "").strip()
+        if stream_dq_mode and stream_dq_mode != self.runtime_cfg.dq_mode:
+            raise ValueError(
+                f"Runtime mismatch: client dq_mode={self.runtime_cfg.dq_mode}, stream dq_mode={stream_dq_mode}."
+            )
 
     def _prepare_batch_for_lstm(self, X: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if X.dim() == 2:
@@ -343,6 +453,23 @@ class ClusteredClientRunner:
                 X, y = batch
                 return X, y, {}
         raise TypeError(f"Unsupported stream batch type: {type(batch).__name__}")
+
+    def _augment_inputs_with_quality(self, X: torch.Tensor, batch_meta: Dict[str, Any], mode: str) -> torch.Tensor:
+        X_aug = augment_sequence_inputs_with_quality(
+            X,
+            batch_meta.get("quality_scores"),
+            enabled=self.runtime_cfg.use_quality_as_input,
+            mode=mode,
+        )
+        if X_aug.dim() != 3:
+            raise ValueError(f"Expected model input with 3 dims, got shape={tuple(X_aug.shape)} during mode={mode}")
+        expected_input_size = self.runtime_cfg.model_input_size
+        if expected_input_size is not None and int(X_aug.size(-1)) != int(expected_input_size):
+            raise ValueError(
+                f"Augmented input size mismatch during mode={mode}: "
+                f"expected feature_dim={expected_input_size}, got {int(X_aug.size(-1))}"
+            )
+        return X_aug
 
     def _pack_payload(
         self,
@@ -548,9 +675,10 @@ class ClusteredClientRunner:
         with torch.no_grad():
             batch_idx = 0
             for batch in loader:
-                X, y, _ = self._unpack_stream_batch(batch)
+                X, y, batch_meta = self._unpack_stream_batch(batch)
                 batch_idx += 1
                 X, y = self._prepare_batch_for_lstm(X, y)
+                X = self._augment_inputs_with_quality(X, batch_meta, mode=mode)
                 # The active split contract sends only the last hidden state [B, H].
                 activations = self.client_model(X)[:, -1, :]
                 log_enabled = self.comm_log_eval and should_log_index(batch_idx, self.comm_log_every_n_batches)
@@ -613,6 +741,11 @@ class ClusteredClientRunner:
             "epoch": epoch,
             "client_id": self.runtime_cfg.client_id,
             "cluster_id": self.runtime_cfg.cluster_id,
+            "dq_mode": self.runtime_cfg.dq_mode,
+            "use_quality_as_input": self.runtime_cfg.use_quality_as_input,
+            "use_quality_weights": self.runtime_cfg.use_quality_weights,
+            "base_input_size": self.runtime_cfg.base_input_size,
+            "model_input_size": self.runtime_cfg.model_input_size,
             "num_batches": num_batches,
             "num_samples": num_samples,
             "server_loss": (total_server_loss / num_batches) if mode == "val" else None,
@@ -669,6 +802,11 @@ class ClusteredClientRunner:
         summary = {
             "client_id": self.runtime_cfg.client_id,
             "cluster_id": self.runtime_cfg.cluster_id,
+            "dq_mode": self.runtime_cfg.dq_mode,
+            "use_quality_as_input": self.runtime_cfg.use_quality_as_input,
+            "use_quality_weights": self.runtime_cfg.use_quality_weights,
+            "base_input_size": self.runtime_cfg.base_input_size,
+            "model_input_size": self.runtime_cfg.model_input_size,
             "num_epochs": self.runtime_cfg.num_epochs,
             "completed_epochs": self.progress["completed_epochs"],
             "best_epoch": self.best_epoch,
@@ -681,11 +819,13 @@ class ClusteredClientRunner:
             "epochs_without_improvement": self.epochs_without_improvement,
         }
         write_json(client_train_metrics_path(self.runtime_cfg.cluster_id, self.runtime_cfg.client_id), summary)
-        self._save_progress()
+        self._save_progress(force=True)
         return summary
 
     def _train_single_batch(self, X: torch.Tensor, y: torch.Tensor, batch_meta: Dict[str, Any]) -> float:
         X, y = self._prepare_batch_for_lstm(X, y)
+        mode = str(batch_meta.get("mode", "train"))
+        X = self._augment_inputs_with_quality(X, batch_meta, mode=mode)
         self.optimizer.zero_grad(set_to_none=True)
         local_epoch = int(self.progress.get("completed_epochs", 0)) + 1
         batch_id = int(self.progress.get("current_epoch_batch_count", 0)) + 1
@@ -701,7 +841,7 @@ class ClusteredClientRunner:
                 "scheduler_epoch": local_epoch,
                 "local_epoch": local_epoch,
                 "batch_id": batch_id,
-                "mode": str(batch_meta.get("mode", "train")),
+                "mode": mode,
                 "window_start_indices": batch_meta.get("window_start_indices", []),
                 "window_end_indices": batch_meta.get("window_end_indices", []),
                 "window_start_timestamps": batch_meta.get("window_start_timestamps", []),
@@ -793,6 +933,11 @@ class ClusteredClientRunner:
         return {
             "client_id": self.runtime_cfg.client_id,
             "cluster_id": self.runtime_cfg.cluster_id,
+            "dq_mode": self.runtime_cfg.dq_mode,
+            "use_quality_as_input": self.runtime_cfg.use_quality_as_input,
+            "use_quality_weights": self.runtime_cfg.use_quality_weights,
+            "base_input_size": self.runtime_cfg.base_input_size,
+            "model_input_size": self.runtime_cfg.model_input_size,
             "completed_epochs": int(self.progress.get("completed_epochs", 0)),
             "current_epoch_batch_count": int(self.progress.get("current_epoch_batch_count", 0)),
             "train_stream_active": self.train_stream_active,

@@ -50,6 +50,13 @@ Thumbs.db
 # Project specific
 *.log
 tests/
+!tests/
+tests/*
+!tests/test_fault_alignment_scoring.py
+!tests/test_positive_clean_dataset.py
+!tests/test_runtime_quality_artifact.py
+!tests/test_split_lstm.py
+!tests/test_quality_runtime_modes.py
 dataset/
 outputs/
 plots/

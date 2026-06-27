@@ -21,6 +21,69 @@ def parse_bool(raw: Optional[str], default: bool = False) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "y")
 
 
+def derive_dq_mode(use_quality_weights: bool, use_quality_as_input: bool) -> str:
+    if not use_quality_weights and not use_quality_as_input:
+        return "none"
+    if use_quality_weights and not use_quality_as_input:
+        return "loss_weight"
+    if not use_quality_weights and use_quality_as_input:
+        return "input_feature"
+    return "input_feature_and_loss_weight"
+
+
+def quality_scores_needed(use_quality_weights: bool, use_quality_as_input: bool) -> bool:
+    return bool(use_quality_weights or use_quality_as_input)
+
+
+def compute_model_input_size(base_input_size: int, use_quality_as_input: bool) -> int:
+    return int(base_input_size) + (1 if use_quality_as_input else 0)
+
+
+def augment_sequence_inputs_with_quality(
+    X: torch.Tensor,
+    quality_scores: Any,
+    *,
+    enabled: bool,
+    mode: str,
+) -> torch.Tensor:
+    if not enabled:
+        return X
+    if X.dim() != 3:
+        raise ValueError(
+            f"Quality-as-input requires X with shape [B, T, F], got shape={tuple(X.shape)} during mode={mode}"
+        )
+    if quality_scores is None:
+        raise ValueError(f"quality_scores missing while USE_QUALITY_AS_INPUT=true during mode={mode}")
+
+    if not torch.is_tensor(quality_scores):
+        quality_tensor = torch.as_tensor(quality_scores, dtype=X.dtype, device=X.device)
+    else:
+        quality_tensor = quality_scores.to(device=X.device, dtype=X.dtype)
+
+    if quality_tensor.dim() == 0:
+        quality_tensor = quality_tensor.reshape(1)
+    elif quality_tensor.dim() == 2 and quality_tensor.size(-1) == 1:
+        quality_tensor = quality_tensor.squeeze(-1)
+    else:
+        quality_tensor = quality_tensor.reshape(-1)
+
+    batch_size = int(X.size(0))
+    if quality_tensor.numel() != batch_size:
+        raise ValueError(
+            f"quality_scores size mismatch during mode={mode}: expected batch_size={batch_size}, got {quality_tensor.numel()}"
+        )
+    if not torch.isfinite(quality_tensor).all():
+        raise ValueError(f"quality_scores contain non-finite values during mode={mode}")
+    if torch.any((quality_tensor < 0.0) | (quality_tensor > 1.0)):
+        raise ValueError(
+            f"quality_scores must be within [0, 1] during mode={mode}; "
+            f"min={float(quality_tensor.min().item()):.6f} max={float(quality_tensor.max().item()):.6f}"
+        )
+
+    q = quality_tensor.view(batch_size, 1, 1).expand(-1, X.size(1), 1)
+    return torch.cat([X, q], dim=-1)
+
+
 def get_env(name: str, default: Optional[str] = None) -> Optional[str]:
     val = os.environ.get(name)
     if val is None or val.strip() == "":

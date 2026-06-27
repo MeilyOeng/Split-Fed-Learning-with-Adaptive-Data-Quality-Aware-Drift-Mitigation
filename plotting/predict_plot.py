@@ -536,6 +536,9 @@ class ClientArtifactConfig:
     model_cfg: LSTMConfig
     split_layer: int
     eval_mode: str
+    use_quality_as_input: bool
+    use_quality_weights: bool
+    dq_mode: str
     normalize: bool
     normalize_method: str
     mean: float
@@ -552,6 +555,7 @@ def load_client_artifact_config(output_dir: Path, cluster_id: str, client_id: st
     cfg = load_json(cfg_path)
     model = cfg.get("model", {})
     training = cfg.get("training", {})
+    data_quality = cfg.get("data_quality", {})
     normalization = cfg.get("normalization", {})
     return ClientArtifactConfig(
         cluster_id=str(cluster_id),
@@ -566,6 +570,9 @@ def load_client_artifact_config(output_dir: Path, cluster_id: str, client_id: st
         ),
         split_layer=int(model.get("split_layer", 2)),
         eval_mode=str(training.get("eval_mode", "final_shared")),
+        use_quality_as_input=bool(data_quality.get("use_quality_as_input", False)),
+        use_quality_weights=bool(data_quality.get("use_quality_weights", False)),
+        dq_mode=str(data_quality.get("dq_mode", "none")),
         normalize=bool(normalization.get("normalize", True)),
         normalize_method=str(normalization.get("method", "zscore")),
         mean=float(normalization.get("mean", 0.0)),
@@ -1210,6 +1217,12 @@ def evaluate_one_client(
     last_n_plot: int,
 ) -> Dict:
     artifact_cfg = load_client_artifact_config(output_dir, cluster_id, client_id)
+    if artifact_cfg.use_quality_as_input:
+        raise ValueError(
+            "predict_plot.py does not reconstruct per-window quality scores required for models trained with "
+            "USE_QUALITY_AS_INPUT=true. Use runtime-generated test artifacts or extend this plotting pipeline to "
+            "supply matching quality-score features."
+        )
     checkpoint_mode = resolve_checkpoint_mode(checkpoint_mode_arg, artifact_cfg)
     if not (1 <= artifact_cfg.split_layer < artifact_cfg.model_cfg.num_layers):
         raise ValueError(

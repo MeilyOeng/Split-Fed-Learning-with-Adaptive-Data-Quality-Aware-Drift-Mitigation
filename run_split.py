@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Event
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 from fed_server.fed_server import run_fedavg_round
@@ -23,6 +23,8 @@ from utils.runtime_utils import (
     client_test_metrics_path,
     client_train_metrics_path,
     cluster_dir,
+    compute_model_input_size,
+    derive_dq_mode,
     ensure_dir,
     get_json,
     load_env_file,
@@ -77,28 +79,33 @@ def refresh_runtime_settings_from_env() -> None:
     TEST_CLUSTER_DATA_DIR = Path(os.environ.get("TEST_CLUSTER_DATA_DIR", str(CLUSTER_DATA_DIR)))
 
 
-def configure_model_input_size(env: dict) -> None:
+def _safe_int(raw: Any) -> Optional[int]:
+    if raw in (None, ""):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_base_input_size(env: dict, *, require_manifest: bool) -> tuple[Optional[int], list[str], Path]:
     manifest_path = TRAIN_CLUSTER_DATA_DIR / "feature_manifest.json"
-    auto_model_input_size = parse_bool(os.environ.get("AUTO_MODEL_INPUT_SIZE", "true"), default=True)
-    use_static_features = parse_bool(os.environ.get("USE_STATIC_FEATURES", "false"), default=False)
-    requested_static_columns = _parse_optional_csv(os.environ.get("STATIC_FEATURE_COLUMNS"))
-    requested_static_groups = _parse_optional_csv(os.environ.get("STATIC_FEATURE_GROUPS"))
-    if not auto_model_input_size:
-        return
+    use_static_features = parse_bool(env.get("USE_STATIC_FEATURES", "false"), default=False)
     if not use_static_features:
-        previous = str(env.get("MODEL_INPUT_SIZE", "1"))
-        env["MODEL_INPUT_SIZE"] = "1"
-        if previous != "1":
-            log("MODEL_INPUT_SIZE overridden to 1 because USE_STATIC_FEATURES=false")
-        return
+        return 1, [], manifest_path
+
     if not manifest_path.exists():
-        raise FileNotFoundError(
-            f"USE_STATIC_FEATURES=true requires {manifest_path}. "
-            "Run data/clustering_processing.py first or disable static features."
-        )
+        if require_manifest:
+            raise FileNotFoundError(
+                f"USE_STATIC_FEATURES=true requires {manifest_path}. "
+                "Run data/clustering_processing.py first or disable static features."
+            )
+        return None, [], manifest_path
 
     manifest = read_json(manifest_path)
     available_static_columns = list(manifest.get("static_feature_columns", []) or [])
+    requested_static_columns = _parse_optional_csv(env.get("STATIC_FEATURE_COLUMNS"))
+    requested_static_groups = _parse_optional_csv(env.get("STATIC_FEATURE_GROUPS"))
     if requested_static_groups and requested_static_columns:
         raise ValueError("Use either STATIC_FEATURE_COLUMNS or STATIC_FEATURE_GROUPS, not both.")
 
@@ -134,17 +141,82 @@ def configure_model_input_size(env: dict) -> None:
         selected_static_columns = requested_static_columns
     else:
         selected_static_columns = available_static_columns
-    input_size = 1 + len(selected_static_columns)
-    previous = str(env.get("MODEL_INPUT_SIZE", "1"))
-    env["MODEL_INPUT_SIZE"] = str(input_size)
-    if previous != str(input_size):
-        log(f"MODEL_INPUT_SIZE overridden from {previous} to {input_size} using {manifest_path}")
+    return 1 + len(selected_static_columns), selected_static_columns, manifest_path
+
+
+def configure_model_input_size(env: dict) -> dict[str, Any]:
+    auto_model_input_size = parse_bool(env.get("AUTO_MODEL_INPUT_SIZE", "true"), default=True)
+    use_static_features = parse_bool(env.get("USE_STATIC_FEATURES", "false"), default=False)
+    use_quality_weights = parse_bool(env.get("USE_QUALITY_WEIGHTS", "false"), default=False)
+    use_quality_as_input = parse_bool(env.get("USE_QUALITY_AS_INPUT", "false"), default=False)
+    dq_mode = derive_dq_mode(use_quality_weights, use_quality_as_input)
+    requested_static_columns = _parse_optional_csv(env.get("STATIC_FEATURE_COLUMNS"))
+    requested_static_groups = _parse_optional_csv(env.get("STATIC_FEATURE_GROUPS"))
+
+    base_input_size, selected_static_columns, manifest_path = _resolve_base_input_size(
+        env,
+        require_manifest=auto_model_input_size,
+    )
+    if base_input_size is not None:
+        env["BASE_INPUT_SIZE"] = str(base_input_size)
+    env["DQ_MODE"] = dq_mode
+    env["QUALITY_FEATURE_APPENDED"] = "true" if use_quality_as_input else "false"
+
+    if auto_model_input_size:
+        if base_input_size is None:
+            raise ValueError("Unable to determine base input size while AUTO_MODEL_INPUT_SIZE=true")
+        model_input_size = compute_model_input_size(base_input_size, use_quality_as_input)
+        previous = str(env.get("MODEL_INPUT_SIZE", "1"))
+        env["MODEL_INPUT_SIZE"] = str(model_input_size)
+        if previous != str(model_input_size):
+            log(
+                f"MODEL_INPUT_SIZE overridden from {previous} to {model_input_size} "
+                f"(base_input_size={base_input_size}, use_quality_as_input={use_quality_as_input})"
+            )
+    else:
+        model_input_size = _safe_int(env.get("MODEL_INPUT_SIZE"))
+
+    if not use_static_features:
+        return {
+            "use_static_features": use_static_features,
+            "use_quality_weights": use_quality_weights,
+            "use_quality_as_input": use_quality_as_input,
+            "dq_mode": dq_mode,
+            "quality_feature_appended": use_quality_as_input,
+            "base_input_size": base_input_size,
+            "model_input_size": model_input_size,
+            "quality_score_path": str(env.get("QUALITY_SCORE_PATH", "")).strip() or None,
+        }
+
+    if not manifest_path.exists():
+        return {
+            "use_static_features": use_static_features,
+            "use_quality_weights": use_quality_weights,
+            "use_quality_as_input": use_quality_as_input,
+            "dq_mode": dq_mode,
+            "quality_feature_appended": use_quality_as_input,
+            "base_input_size": base_input_size,
+            "model_input_size": model_input_size,
+            "quality_score_path": str(env.get("QUALITY_SCORE_PATH", "")).strip() or None,
+        }
+
     if requested_static_columns:
         log(f"Using selected static features: {selected_static_columns}")
     elif requested_static_groups:
         log(f"Using static feature groups {requested_static_groups}: {selected_static_columns}")
     else:
         log(f"Using all static features ({len(selected_static_columns)}) from {manifest_path}")
+
+    return {
+        "use_static_features": use_static_features,
+        "use_quality_weights": use_quality_weights,
+        "use_quality_as_input": use_quality_as_input,
+        "dq_mode": dq_mode,
+        "quality_feature_appended": use_quality_as_input,
+        "base_input_size": base_input_size,
+        "model_input_size": model_input_size,
+        "quality_score_path": str(env.get("QUALITY_SCORE_PATH", "")).strip() or None,
+    }
 
 
 def load_cluster_ids(path: Path) -> List[str]:
@@ -1193,6 +1265,8 @@ def main() -> int:
             "COMM_LOG_EVAL": os.environ.get("COMM_LOG_EVAL", "false"),
             "COMM_LOG_STREAM": os.environ.get("COMM_LOG_STREAM", "false"),
             "COMM_LOG_EVERY_N_BATCHES": os.environ.get("COMM_LOG_EVERY_N_BATCHES", "1"),
+            "SAVE_PROGRESS_EVERY_N_BATCHES": os.environ.get("SAVE_PROGRESS_EVERY_N_BATCHES", "1"),
+            "WRITE_COMMUNICATION_LOG": os.environ.get("WRITE_COMMUNICATION_LOG", "true"),
             "USE_STATIC_FEATURES": os.environ.get("USE_STATIC_FEATURES", "false"),
             "STATIC_FEATURE_COLUMNS": os.environ.get("STATIC_FEATURE_COLUMNS", ""),
             "STATIC_FEATURE_GROUPS": os.environ.get("STATIC_FEATURE_GROUPS", ""),
@@ -1202,6 +1276,7 @@ def main() -> int:
             "VAL_CLUSTER_DATA_DIR": os.environ.get("VAL_CLUSTER_DATA_DIR", str(VAL_CLUSTER_DATA_DIR)),
             "TEST_CLUSTER_DATA_DIR": os.environ.get("TEST_CLUSTER_DATA_DIR", str(TEST_CLUSTER_DATA_DIR)),
             "USE_QUALITY_WEIGHTS": os.environ.get("USE_QUALITY_WEIGHTS", "false"),
+            "USE_QUALITY_AS_INPUT": os.environ.get("USE_QUALITY_AS_INPUT", "false"),
             "QUALITY_SCORE_PATH": os.environ.get("QUALITY_SCORE_PATH", ""),
             "QUALITY_SCORE_GRANULARITY": os.environ.get("QUALITY_SCORE_GRANULARITY", "window"),
             "STRICT_QUALITY_SCORE_MATCHING": os.environ.get("STRICT_QUALITY_SCORE_MATCHING", "true"),
@@ -1211,7 +1286,7 @@ def main() -> int:
             "QUALITY_SCORE_EPS": os.environ.get("QUALITY_SCORE_EPS", "1e-8"),
         }
     )
-    configure_model_input_size(env)
+    quality_runtime = configure_model_input_size(env)
 
     total_epochs = int(env["NUM_EPOCHS"])
     detected_clusters = load_cluster_ids(ASSIGNMENTS_PATH)
@@ -1241,15 +1316,22 @@ def main() -> int:
     log(f"Server LR: {env['SERVER_LR']}")
     log(f"Configured ACCUM_STEPS_SERVER: {env['ACCUM_STEPS_SERVER']} (runtime enforces len(round_clients) per logical round)")
     log(f"Checkpoint every rounds: {env['CHECKPOINT_EVERY_ROUNDS']}")
-    log(
-        f"Quality weights: enabled={env['USE_QUALITY_WEIGHTS']} "
-        f"path={env['QUALITY_SCORE_PATH'] or '<disabled>'} "
-        f"granularity={env['QUALITY_SCORE_GRANULARITY']} strict={env['STRICT_QUALITY_SCORE_MATCHING']}"
-    )
+    log(f"DQ mode: {quality_runtime['dq_mode']}")
+    log(f"Quality weights enabled: {quality_runtime['use_quality_weights']}")
+    log(f"Quality-as-input enabled: {quality_runtime['use_quality_as_input']}")
+    log(f"Quality score path: {quality_runtime['quality_score_path'] or '<disabled>'}")
+    log(f"Quality score granularity: {env['QUALITY_SCORE_GRANULARITY']}")
+    log(f"Strict quality score matching: {env['STRICT_QUALITY_SCORE_MATCHING']}")
+    if quality_runtime.get("base_input_size") is not None:
+        log(f"Base input size: {quality_runtime['base_input_size']}")
+    log(f"Quality feature appended: {quality_runtime['quality_feature_appended']}")
+    log(f"Final MODEL_INPUT_SIZE: {quality_runtime['model_input_size']}")
     log(
         f"Communication logging: train={env['COMM_LOG_TRAIN']} eval={env['COMM_LOG_EVAL']} "
         f"stream={env['COMM_LOG_STREAM']} every_n_batches={env['COMM_LOG_EVERY_N_BATCHES']}"
     )
+    log(f"Progress persistence every_n_batches={env['SAVE_PROGRESS_EVERY_N_BATCHES']}")
+    log(f"Write aggregated communication_log.csv={env['WRITE_COMMUNICATION_LOG']}")
     log(f"Cluster parallel local epochs: {parse_bool(env.get('RUN_CLUSTERS_IN_PARALLEL'), default=True) and len(cluster_ids) > 1}")
     log(
         f"Local epochs per global FedAvg round: {max(1, int(env['LOCAL_EPOCHS_PER_GLOBAL_ROUND']))} "
@@ -1264,7 +1346,7 @@ def main() -> int:
         log(f"Cluster {cid}: {len(cluster_clients[cid])} client(s) -> {cluster_clients[cid]}")
 
     started = []
-    model_configs = {"servers": [], "clients": []}
+    model_configs = {"runtime": quality_runtime, "servers": [], "clients": []}
     stop_event = Event()
 
     try:
@@ -1349,6 +1431,7 @@ def main() -> int:
             "eval_mode": env["EVAL_MODE"],
             "model_num_layers": int(env["MODEL_NUM_LAYERS"]),
             "model_split_layer": int(env["MODEL_SPLIT_LAYER"]),
+            **quality_runtime,
             "clients": train_client_rows,
             "clusters": train_cluster_summary,
             "global_summary": train_global_summary,
@@ -1362,6 +1445,7 @@ def main() -> int:
             "eval_mode": env["EVAL_MODE"],
             "model_num_layers": int(env["MODEL_NUM_LAYERS"]),
             "model_split_layer": int(env["MODEL_SPLIT_LAYER"]),
+            **quality_runtime,
             "clients": test_client_rows,
             "clusters": test_cluster_summary,
             "global_summary": test_global_summary,
@@ -1374,7 +1458,7 @@ def main() -> int:
         if test_client_rows:
             write_csv(RESULTS_DIR / "test_report.csv", test_client_rows, list(test_client_rows[0].keys()))
         comm_raw_rows, comm_report_rows, fedavg_report_rows = build_communication_reports(cluster_ids, cluster_clients)
-        if comm_raw_rows:
+        if comm_raw_rows and parse_bool(env.get("WRITE_COMMUNICATION_LOG", "true"), default=True):
             write_csv(RESULTS_DIR / "communication_log.csv", comm_raw_rows, COMM_LOG_FIELDNAMES)
         if comm_report_rows:
             write_csv(RESULTS_DIR / "communication_report.csv", comm_report_rows, list(comm_report_rows[0].keys()))

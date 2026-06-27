@@ -15,6 +15,7 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from utils.comm_logging import append_comm_row, tensor_shape
+from utils.runtime_utils import derive_dq_mode, quality_scores_needed
 
 app = Flask(__name__)
 
@@ -44,10 +45,18 @@ USE_STATIC_FEATURES = os.environ.get("USE_STATIC_FEATURES", "false").lower() in 
 STATIC_FEATURE_COLUMNS_RAW = os.environ.get("STATIC_FEATURE_COLUMNS", "")
 STATIC_FEATURE_GROUPS_RAW = os.environ.get("STATIC_FEATURE_GROUPS", "")
 USE_QUALITY_WEIGHTS = os.environ.get("USE_QUALITY_WEIGHTS", "false").lower() in ("1", "true", "yes", "y")
+USE_QUALITY_AS_INPUT = os.environ.get("USE_QUALITY_AS_INPUT", "false").lower() in ("1", "true", "yes", "y")
 QUALITY_SCORE_PATH = str(os.environ.get("QUALITY_SCORE_PATH", "")).strip()
 QUALITY_SCORE_GRANULARITY = str(os.environ.get("QUALITY_SCORE_GRANULARITY", "window")).strip().lower()
 STRICT_QUALITY_SCORE_MATCHING = os.environ.get("STRICT_QUALITY_SCORE_MATCHING", "true").lower() in ("1", "true", "yes", "y")
 QUALITY_SCORE_FALLBACK = float(os.environ.get("QUALITY_SCORE_FALLBACK", "1.0"))
+DQ_MODE = derive_dq_mode(USE_QUALITY_WEIGHTS, USE_QUALITY_AS_INPUT)
+QUALITY_NEEDED = quality_scores_needed(USE_QUALITY_WEIGHTS, USE_QUALITY_AS_INPUT)
+MODEL_INPUT_SIZE_RAW = str(os.environ.get("MODEL_INPUT_SIZE", "")).strip()
+try:
+    MODEL_INPUT_SIZE = int(MODEL_INPUT_SIZE_RAW) if MODEL_INPUT_SIZE_RAW else None
+except ValueError:
+    MODEL_INPUT_SIZE = None
 
 if abs((TRAIN_RATIO + VAL_RATIO + TEST_RATIO) - 1.0) > 1e-6:
     raise ValueError("TRAIN_RATIO + VAL_RATIO + TEST_RATIO must sum to 1.0")
@@ -64,9 +73,15 @@ client_input_sizes: Dict[Tuple[str, int], int] = {}
 client_offsets: Dict[Tuple[str, int, str], int] = {}
 quality_score_index: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
 quality_score_summary: Dict[str, Any] = {
-    "enabled": USE_QUALITY_WEIGHTS,
+    "enabled": QUALITY_NEEDED,
     "loaded": False,
     "path": QUALITY_SCORE_PATH or None,
+    "quality_score_path": QUALITY_SCORE_PATH or None,
+    "use_quality_weights": USE_QUALITY_WEIGHTS,
+    "use_quality_as_input": USE_QUALITY_AS_INPUT,
+    "quality_needed": QUALITY_NEEDED,
+    "dq_mode": DQ_MODE,
+    "granularity": QUALITY_SCORE_GRANULARITY,
 }
 offset_lock = Lock()
 
@@ -349,16 +364,23 @@ def load_cluster_data() -> None:
 
 def _load_quality_score_index() -> None:
     global quality_score_summary
-    if not USE_QUALITY_WEIGHTS:
+    if not QUALITY_NEEDED:
         quality_score_summary = {
             "enabled": False,
             "loaded": False,
             "path": QUALITY_SCORE_PATH or None,
+            "quality_score_path": QUALITY_SCORE_PATH or None,
             "granularity": QUALITY_SCORE_GRANULARITY,
+            "use_quality_weights": USE_QUALITY_WEIGHTS,
+            "use_quality_as_input": USE_QUALITY_AS_INPUT,
+            "quality_needed": False,
+            "dq_mode": DQ_MODE,
         }
         return
     if not QUALITY_SCORE_PATH:
-        raise ValueError("USE_QUALITY_WEIGHTS=true requires QUALITY_SCORE_PATH to be set.")
+        raise ValueError(
+            "USE_QUALITY_WEIGHTS=true or USE_QUALITY_AS_INPUT=true requires QUALITY_SCORE_PATH to be set."
+        )
 
     quality_path = os.path.join(BASE_DIR, QUALITY_SCORE_PATH) if not os.path.isabs(QUALITY_SCORE_PATH) else QUALITY_SCORE_PATH
     if not os.path.exists(quality_path):
@@ -402,7 +424,12 @@ def _load_quality_score_index() -> None:
         "enabled": True,
         "loaded": True,
         "path": quality_path,
+        "quality_score_path": quality_path,
         "granularity": QUALITY_SCORE_GRANULARITY,
+        "use_quality_weights": USE_QUALITY_WEIGHTS,
+        "use_quality_as_input": USE_QUALITY_AS_INPUT,
+        "quality_needed": True,
+        "dq_mode": DQ_MODE,
         "row_count": int(len(df)),
         "client_count": int(df["client_id"].astype(str).nunique()),
         "modes": sorted({str(mode).strip().lower() for mode in df["mode"].dropna().astype(str)}),
@@ -410,7 +437,7 @@ def _load_quality_score_index() -> None:
 
 
 def _quality_record_for_window(client_id: int, mode: str, window_start_index: int) -> Dict[str, Any]:
-    if not USE_QUALITY_WEIGHTS:
+    if not QUALITY_NEEDED:
         return {
             "quality_score": 1.0,
             "match_status": "disabled",
@@ -454,9 +481,19 @@ def health():
             "normalize": NORMALIZE,
             "normalize_method": NORMALIZE_METHOD,
             "use_static_features": USE_STATIC_FEATURES,
+            "use_quality_as_input": USE_QUALITY_AS_INPUT,
+            "use_quality_weights": USE_QUALITY_WEIGHTS,
+            "dq_mode": DQ_MODE,
+            "quality_needed": QUALITY_NEEDED,
             "requested_static_feature_groups": _parse_optional_csv(STATIC_FEATURE_GROUPS_RAW),
             "requested_static_feature_columns": _parse_optional_csv(STATIC_FEATURE_COLUMNS_RAW),
             "input_sizes": input_sizes,
+            "base_input_sizes": input_sizes,
+            "stream_input_sizes": input_sizes,
+            "model_input_size": MODEL_INPUT_SIZE,
+            "quality_input_enabled": USE_QUALITY_AS_INPUT,
+            "quality_weights_enabled": USE_QUALITY_WEIGHTS,
+            "quality_score_path": quality_score_summary.get("path"),
             "cluster_data_dirs": MODE_CLUSTER_DIRS,
             "quality_scores": quality_score_summary,
         }
@@ -473,6 +510,7 @@ def stream_norm_stats():
         return jsonify({"error": f"Unknown cluster/client: {cluster_id}/{client_id}"}), 404
     mean, scale = client_norm_stats[key]
     counts = _series_counts_for_client(cluster_id, client_id)
+    base_input_size = int(client_input_sizes.get(key, 1))
     static_feature_count = int(
         client_static_features.get(_series_key("train", cluster_id, client_id), torch.empty(0)).numel()
     )
@@ -484,14 +522,23 @@ def stream_norm_stats():
         "mean": mean,
         "scale": scale,
         "use_static_features": USE_STATIC_FEATURES,
+        "use_quality_as_input": USE_QUALITY_AS_INPUT,
+        "use_quality_weights": USE_QUALITY_WEIGHTS,
+        "dq_mode": DQ_MODE,
+        "quality_needed": QUALITY_NEEDED,
         "requested_static_feature_groups": _parse_optional_csv(STATIC_FEATURE_GROUPS_RAW),
         "requested_static_feature_columns": _parse_optional_csv(STATIC_FEATURE_COLUMNS_RAW),
-        "input_size": int(client_input_sizes.get(key, 1)),
+        "input_size": base_input_size,
+        "base_input_size": base_input_size,
+        "stream_input_size": base_input_size,
+        "model_input_size": MODEL_INPUT_SIZE,
         "static_feature_count": static_feature_count,
         "num_train_windows": counts["train"],
         "num_val_windows": counts["val"],
         "num_test_windows": counts["test"],
+        "quality_input_enabled": USE_QUALITY_AS_INPUT,
         "quality_weights_enabled": USE_QUALITY_WEIGHTS,
+        "quality_score_path": quality_score_summary.get("path"),
         "quality_score_granularity": QUALITY_SCORE_GRANULARITY,
     }
     if COMM_LOG_STREAM:

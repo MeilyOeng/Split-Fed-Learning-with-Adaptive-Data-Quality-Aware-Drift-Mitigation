@@ -17,10 +17,11 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from models.split_lstm import build_split_lstm
-from utils.comm_logging import append_comm_row, calc_bandwidth, tensor_nbytes, tensor_shape
+from utils.comm_logging import append_comm_row, calc_bandwidth, should_log_index, tensor_nbytes, tensor_shape
 from utils.runtime_utils import (
     _get_env,
     build_lstm_config_from_env,
+    derive_dq_mode,
     get_device_info,
     parse_bool,
     resolve_device,
@@ -54,6 +55,9 @@ class ServerRuntimeConfig:
     save_every_rounds: int
     output_dir: str
     use_quality_weights: bool
+    use_quality_as_input: bool
+    dq_mode: str
+    quality_score_path: str
     quality_score_min: float
     quality_score_max: float
     quality_score_eps: float
@@ -61,13 +65,18 @@ class ServerRuntimeConfig:
 
 class SplitLearningServerState:
     def __init__(self) -> None:
+        use_quality_weights = parse_bool(_get_env("USE_QUALITY_WEIGHTS", "false"))
+        use_quality_as_input = parse_bool(_get_env("USE_QUALITY_AS_INPUT", "false"))
         self.runtime_cfg = ServerRuntimeConfig(
             cluster_id=_get_env("CLUSTER_ID", "0"),
             learning_rate=float(_get_env("SERVER_LR", _get_env("LEARNING_RATE", "1e-3"))),
             accum_steps_target=max(1, int(_get_env("ACCUM_STEPS_SERVER", "1"))),
             save_every_rounds=max(0, int(_get_env("CHECKPOINT_EVERY_ROUNDS", "1"))),
             output_dir=_get_env("OUTPUT_DIR", server_output_dir(_get_env("CLUSTER_ID", "0"))),
-            use_quality_weights=parse_bool(_get_env("USE_QUALITY_WEIGHTS", "false")),
+            use_quality_weights=use_quality_weights,
+            use_quality_as_input=use_quality_as_input,
+            dq_mode=derive_dq_mode(use_quality_weights, use_quality_as_input),
+            quality_score_path=str(_get_env("QUALITY_SCORE_PATH", "") or "").strip(),
             quality_score_min=float(_get_env("QUALITY_SCORE_MIN", "0.05")),
             quality_score_max=float(_get_env("QUALITY_SCORE_MAX", "1.0")),
             quality_score_eps=float(_get_env("QUALITY_SCORE_EPS", "1e-8")),
@@ -83,6 +92,7 @@ class SplitLearningServerState:
         self.lock = Lock()
         self.comm_log_train = parse_bool(_get_env("COMM_LOG_TRAIN", "true"))
         self.comm_log_eval = parse_bool(_get_env("COMM_LOG_EVAL", "false"))
+        self.comm_log_every_n_batches = max(1, int(_get_env("COMM_LOG_EVERY_N_BATCHES", "1")))
         self.comm_log_path = server_comm_log_path(self.runtime_cfg.cluster_id)
 
         self.global_step = 0
@@ -121,12 +131,22 @@ class SplitLearningServerState:
         print(
             f"[Server cluster={self.runtime_cfg.cluster_id}] device_info={self.device_info} "
             f"server_lr={self.runtime_cfg.learning_rate} accum_steps_target={self.runtime_cfg.accum_steps_target} "
-            f"use_quality_weights={self.runtime_cfg.use_quality_weights} output_dir={self.runtime_cfg.output_dir}",
+            f"use_quality_weights={self.runtime_cfg.use_quality_weights} "
+            f"use_quality_as_input={self.runtime_cfg.use_quality_as_input} "
+            f"dq_mode={self.runtime_cfg.dq_mode} "
+            f"quality_score_path={self.runtime_cfg.quality_score_path or '<disabled>'} "
+            f"output_dir={self.runtime_cfg.output_dir}",
             flush=True,
         )
 
     def _append_comm_row(self, row: Dict[str, Any]) -> None:
         append_comm_row(self.comm_log_path, row)
+
+    def _should_log_batch(self, batch_id: Any) -> bool:
+        try:
+            return should_log_index(int(batch_id), self.comm_log_every_n_batches)
+        except (TypeError, ValueError):
+            return True
 
     @staticmethod
     def _optimizer_reset_policy() -> str:
@@ -263,6 +283,8 @@ class SplitLearningServerState:
             "pending_accum_steps": self.pending_accum_steps,
             "active_accum_steps_target": self.active_accum_steps_target,
             "use_quality_weights": self.runtime_cfg.use_quality_weights,
+            "use_quality_as_input": self.runtime_cfg.use_quality_as_input,
+            "dq_mode": self.runtime_cfg.dq_mode,
             "optimizer_step_count": self.optimizer_step_count,
             "global_step": self.global_step,
         }
@@ -568,6 +590,9 @@ def config():
             "server_lr": state.runtime_cfg.learning_rate,
             "save_every_rounds": state.runtime_cfg.save_every_rounds,
             "use_quality_weights": state.runtime_cfg.use_quality_weights,
+            "use_quality_as_input": state.runtime_cfg.use_quality_as_input,
+            "dq_mode": state.runtime_cfg.dq_mode,
+            "quality_score_path": state.runtime_cfg.quality_score_path or None,
             "optimizer_id": id(state.optimizer),
             "optimizer_reset_policy": state._optimizer_reset_policy(),
             "device": state.device_info,
@@ -617,7 +642,7 @@ def train_step():
             latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
             upload_MBps, upload_Mbps = calc_bandwidth(request_bytes, latency_ms)
             download_MBps, download_Mbps = calc_bandwidth(len(response_blob), latency_ms)
-            if state.comm_log_train:
+            if state.comm_log_train and state._should_log_batch(payload.get("batch_id")):
                 state._append_comm_row(
                     {
                         "level": "split",
@@ -694,7 +719,7 @@ def validate_step():
         )
         response_blob = pickle.dumps(result)
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
-        if state.comm_log_eval:
+        if state.comm_log_eval and state._should_log_batch(payload.get("batch_id")):
             upload_MBps, upload_Mbps = calc_bandwidth(request_bytes, latency_ms)
             state._append_comm_row(
                 {
@@ -737,7 +762,7 @@ def inference_step():
             payload["activations"])
         response_blob = pickle.dumps(result)
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
-        if state.comm_log_eval:
+        if state.comm_log_eval and state._should_log_batch(payload.get("batch_id")):
             upload_MBps, upload_Mbps = calc_bandwidth(request_bytes, latency_ms)
             state._append_comm_row(
                 {
