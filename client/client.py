@@ -832,6 +832,10 @@ class ClusteredClientRunner:
         quality_scores = batch_meta.get("quality_scores")
         if quality_scores is not None and not torch.is_tensor(quality_scores):
             quality_scores = torch.tensor(quality_scores, dtype=torch.float32)
+        send_quality_scores = quality_scores if self.runtime_cfg.use_quality_weights else None
+        send_quality_score_metadata = (
+            batch_meta.get("quality_score_metadata", {}) if self.runtime_cfg.use_quality_weights else None
+        )
 
         use_cudnn = not (self.device.type == "cuda")
         with torch.backends.cudnn.flags(enabled=use_cudnn):
@@ -854,8 +858,8 @@ class ClusteredClientRunner:
                     self.runtime_cfg.client_id,
                     activations,
                     y,
-                    quality_scores=quality_scores,
-                    quality_score_metadata=batch_meta.get("quality_score_metadata", {}),
+                    quality_scores=send_quality_scores,
+                    quality_score_metadata=send_quality_score_metadata,
                     meta=payload_meta,
                 ),
                 log_meta={
