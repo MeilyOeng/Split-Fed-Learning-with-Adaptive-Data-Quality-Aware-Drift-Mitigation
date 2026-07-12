@@ -23,6 +23,55 @@ QUALITY_DIMENSIONS = [
 ]
 
 
+def final_score_method(config: Optional[dict] = None) -> str:
+    """Return the configured final-score method. Defaults to the historical PCA path."""
+    config = config or {}
+    final_cfg = dict(config.get("final_score", {}) or {})
+    method = str(final_cfg.get("method", "pca")).strip().lower()
+    if method not in {"pca", "average"}:
+        raise ValueError("final_score.method must be either 'pca' or 'average'.")
+    return method
+
+
+def dimension_weights(config: Optional[dict] = None) -> np.ndarray:
+    """Return non-negative dimension weights in QUALITY_DIMENSIONS order."""
+    config = config or {}
+    final_cfg = dict(config.get("final_score", {}) or {})
+    raw_weights = dict(final_cfg.get("dimension_weights", {}) or {})
+    weights = np.asarray(
+        [float(raw_weights.get(dimension, 1.0)) for dimension in QUALITY_DIMENSIONS],
+        dtype=float,
+    )
+    if np.any(~np.isfinite(weights)):
+        raise ValueError("final_score.dimension_weights must be finite numbers.")
+    if np.any(weights < 0):
+        raise ValueError("final_score.dimension_weights must be non-negative.")
+    if float(weights.sum()) <= 0.0:
+        raise ValueError("At least one final_score.dimension_weights value must be positive.")
+    return weights
+
+
+def compute_average_quality_score(scores_df: pd.DataFrame, config: Optional[dict] = None) -> np.ndarray:
+    """Compute a client-local weighted average over quality dimensions."""
+    missing = [col for col in QUALITY_DIMENSIONS if col not in scores_df.columns]
+    if missing:
+        raise ValueError(f"Missing columns for average quality scoring: {missing}")
+    weights = dimension_weights(config)
+    values = scores_df.loc[:, QUALITY_DIMENSIONS].astype(float).to_numpy(dtype=float)
+    if np.any(~np.isfinite(values)):
+        raise ValueError("Quality dimension scores must be finite for average final scoring.")
+    averaged = values @ weights / float(weights.sum())
+    return np.clip(averaged, 0.0, 1.0)
+
+
+def compute_quality_aggregation_weights(quality_score: np.ndarray, sample_count: np.ndarray) -> np.ndarray:
+    """Normalize quality mass into aggregation weights."""
+    weight_mass = quality_score.astype(float) * sample_count.astype(float)
+    if np.allclose(weight_mass.sum(), 0.0):
+        return np.full(len(quality_score), 1.0 / max(1, len(quality_score)), dtype=float)
+    return weight_mass / weight_mass.sum()
+
+
 def _safe_correlation(x: np.ndarray, y: np.ndarray, epsilon: float = 1e-12) -> float:
     """Return a stable correlation or NaN when either vector is effectively constant."""
     x_std = float(np.nanstd(x))
@@ -128,38 +177,44 @@ class DemandPCAQualityModel:
 def compute_pca_quality_scores(
     scores_df: pd.DataFrame,
     config: Optional[dict] = None,
-) -> tuple[pd.DataFrame, DemandPCAQualityModel]:
-    """Attach PCA-based quality scores and aggregation weights."""
+) -> tuple[pd.DataFrame, Optional[DemandPCAQualityModel]]:
+    """Attach final quality scores and aggregation weights."""
     config = config or {}
+    method = final_score_method(config)
     pca_cfg = dict(config.get("pca", {}) or {})
     epsilon = float(pca_cfg.get("epsilon", 1e-9))
 
     required_cols = ["client_id", "sample_count", *QUALITY_DIMENSIONS]
     missing = [col for col in required_cols if col not in scores_df.columns]
     if missing:
-        raise ValueError(f"Missing columns for PCA quality scoring: {missing}")
+        raise ValueError(f"Missing columns for quality scoring: {missing}")
 
-    model = DemandPCAQualityModel.fit(scores_df)
-    raw_scores = model.transform(scores_df)
-    row_mean = scores_df.loc[:, QUALITY_DIMENSIONS].mean(axis=1).to_numpy(dtype=float)
-    if np.allclose(raw_scores, raw_scores[0]):
-        quality_score = row_mean.copy()
+    model: Optional[DemandPCAQualityModel]
+    average_score = compute_average_quality_score(scores_df, config)
+    if method == "average":
+        model = None
+        raw_scores = np.full(len(scores_df), np.nan, dtype=float)
+        quality_score = average_score.copy()
     else:
-        raw_min = float(raw_scores.min())
-        raw_max = float(raw_scores.max())
-        if raw_max - raw_min <= epsilon:
-            quality_score = row_mean.copy()
+        model = DemandPCAQualityModel.fit(scores_df)
+        raw_scores = model.transform(scores_df)
+        if np.allclose(raw_scores, raw_scores[0]):
+            quality_score = average_score.copy()
         else:
-            quality_score = (raw_scores - raw_min) / (raw_max - raw_min)
+            raw_min = float(raw_scores.min())
+            raw_max = float(raw_scores.max())
+            if raw_max - raw_min <= epsilon:
+                quality_score = average_score.copy()
+            else:
+                quality_score = (raw_scores - raw_min) / (raw_max - raw_min)
 
+    quality_score = np.clip(quality_score, 0.0, 1.0)
     sample_count = scores_df["sample_count"].to_numpy(dtype=float)
-    weight_mass = quality_score * sample_count
-    if np.allclose(weight_mass.sum(), 0.0):
-        aggregation_weight = np.full(len(scores_df), 1.0 / max(1, len(scores_df)), dtype=float)
-    else:
-        aggregation_weight = weight_mass / weight_mass.sum()
+    aggregation_weight = compute_quality_aggregation_weights(quality_score, sample_count)
 
     out = scores_df.loc[:, ["client_id", *QUALITY_DIMENSIONS, "sample_count"]].copy()
+    out["score_method"] = method
+    out["average_score"] = average_score
     out["pca_raw_score"] = raw_scores
     out["quality_score"] = quality_score
     out["aggregation_weight"] = aggregation_weight
@@ -170,6 +225,8 @@ def compute_pca_quality_scores(
         "consistency",
         "accuracy",
         "freshness",
+        "score_method",
+        "average_score",
         "pca_raw_score",
         "quality_score",
         "sample_count",
@@ -190,5 +247,17 @@ def compute_pca_quality_scores_from_csv(
     out_df, model = compute_pca_quality_scores(scores_df, config=config)
     save_csv(out_df, output_path)
     if model_output_path is not None:
-        save_json(model.to_dict(), model_output_path)
+        if model is None:
+            save_json(
+                {
+                    "score_method": final_score_method(config),
+                    "feature_names": QUALITY_DIMENSIONS,
+                    "dimension_weights": dimension_weights(config).tolist(),
+                },
+                model_output_path,
+            )
+        else:
+            payload = model.to_dict()
+            payload["score_method"] = "pca"
+            save_json(payload, model_output_path)
     return out_df, model

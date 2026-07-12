@@ -61,6 +61,7 @@ dataset/
 outputs/
 plots/
 notes/
+note/
 *.pdf
 .dist/
 *.csv
@@ -74,3 +75,4 @@ simple_plots/
 # comparison_training_plots.py
 # comparison_outputs/
 simple_plots_clean_vs_faulty/
+analysis/

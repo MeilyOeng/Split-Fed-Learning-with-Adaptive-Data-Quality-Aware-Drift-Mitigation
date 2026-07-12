@@ -15,7 +15,13 @@ import pandas as pd
 from .baseline import load_baseline_artifact
 from .features import extract_client_window_features
 from .io import load_yaml_config, save_json
-from .pca_quality import DemandPCAQualityModel, QUALITY_DIMENSIONS
+from .pca_quality import (
+    DemandPCAQualityModel,
+    QUALITY_DIMENSIONS,
+    compute_average_quality_score,
+    dimension_weights,
+    final_score_method,
+)
 from .scoring import WideDemandQualityScorer
 from .windowing import iter_client_windows, load_window_source
 
@@ -231,7 +237,20 @@ def _prepare_pca_model(
     pca_mode: str,
     pca_model_path: Optional[Path | str],
     pca_model_output_path: Optional[Path | str],
-) -> DemandPCAQualityModel:
+    score_config: Optional[dict] = None,
+) -> Optional[DemandPCAQualityModel]:
+    score_config = score_config or {}
+    if final_score_method(score_config) == "average":
+        if pca_model_output_path is not None:
+            save_json(
+                {
+                    "score_method": "average",
+                    "feature_names": QUALITY_DIMENSIONS,
+                    "dimension_weights": dimension_weights(score_config).tolist(),
+                },
+                pca_model_output_path,
+            )
+        return None
     if pca_mode == "fit":
         dims = pd.read_csv(
             base_path,
@@ -265,12 +284,16 @@ def _finalize_csv_output(
     pca_model_path: Optional[Path | str],
     pca_model_output_path: Optional[Path | str],
     chunk_size: int,
+    score_config: Optional[dict] = None,
 ) -> None:
+    score_config = score_config or {}
+    method = final_score_method(score_config)
     model = _prepare_pca_model(
         base_path,
         pca_mode=pca_mode,
         pca_model_path=pca_model_path,
         pca_model_output_path=pca_model_output_path,
+        score_config=score_config,
     )
 
     wrote_header = False
@@ -284,10 +307,16 @@ def _finalize_csv_output(
                 "freshness": chunk["y_freshness"].astype(float),
             }
         )
-        raw_scores = model.transform(dimension_df)
-        normalized = _normalize_quality_score(raw_scores, dimension_df, model)
-        chunk["y_final"] = normalized
-        chunk["quality_score"] = normalized
+        if method == "average":
+            final_scores = compute_average_quality_score(dimension_df, score_config)
+        else:
+            if model is None:
+                raise ValueError("PCA final scoring requires a PCA model.")
+            raw_scores = model.transform(dimension_df)
+            final_scores = _normalize_quality_score(raw_scores, dimension_df, model)
+        chunk["score_method"] = method
+        chunk["y_final"] = final_scores
+        chunk["quality_score"] = final_scores
         chunk["dimension_completeness"] = chunk["y_completeness"].astype(float)
         chunk["dimension_validity"] = chunk["y_validity"].astype(float)
         chunk["dimension_consistency"] = chunk["y_consistency"].astype(float)
@@ -389,6 +418,7 @@ def _build_csv_artifact(
             pca_model_path=pca_model_path,
             pca_model_output_path=pca_model_output_path,
             chunk_size=chunk_size,
+            score_config=score_config,
         )
 
     if return_dataframe:
@@ -512,19 +542,35 @@ def build_demand_label_dataset(
         }
     )
 
-    if pca_mode == "fit":
-        model = DemandPCAQualityModel.fit(dimension_df)
+    method = final_score_method(score_config)
+    if method == "average":
         if pca_model_output_path is not None:
-            save_json(model.to_dict(), pca_model_output_path)
-    elif pca_mode == "transform":
-        if pca_model_path is None:
-            raise ValueError("pca_model_path is required when pca_mode='transform'.")
-        model = _load_pca_model(pca_model_path)
+            save_json(
+                {
+                    "score_method": "average",
+                    "feature_names": QUALITY_DIMENSIONS,
+                    "dimension_weights": dimension_weights(score_config).tolist(),
+                },
+                pca_model_output_path,
+            )
+        dataset["y_final"] = compute_average_quality_score(dimension_df, score_config)
     else:
-        raise ValueError("pca_mode must be 'fit' or 'transform'.")
+        if pca_mode == "fit":
+            model = DemandPCAQualityModel.fit(dimension_df)
+            if pca_model_output_path is not None:
+                payload = model.to_dict()
+                payload["score_method"] = "pca"
+                save_json(payload, pca_model_output_path)
+        elif pca_mode == "transform":
+            if pca_model_path is None:
+                raise ValueError("pca_model_path is required when pca_mode='transform'.")
+            model = _load_pca_model(pca_model_path)
+        else:
+            raise ValueError("pca_mode must be 'fit' or 'transform'.")
 
-    raw_scores = model.transform(dimension_df)
-    dataset["y_final"] = _normalize_quality_score(raw_scores, dimension_df, model)
+        raw_scores = model.transform(dimension_df)
+        dataset["y_final"] = _normalize_quality_score(raw_scores, dimension_df, model)
+    dataset["score_method"] = method
     dataset["quality_score"] = dataset["y_final"].astype(float)
     dataset["dimension_completeness"] = dataset["y_completeness"].astype(float)
     dataset["dimension_validity"] = dataset["y_validity"].astype(float)

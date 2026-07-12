@@ -21,22 +21,35 @@ def parse_bool(raw: Optional[str], default: bool = False) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "y")
 
 
-def derive_dq_mode(use_quality_weights: bool, use_quality_as_input: bool) -> str:
-    if not use_quality_weights and not use_quality_as_input:
-        return "none"
-    if use_quality_weights and not use_quality_as_input:
-        return "loss_weight"
-    if not use_quality_weights and use_quality_as_input:
-        return "input_feature"
-    return "input_feature_and_loss_weight"
+def derive_dq_mode(
+    use_quality_weights: bool,
+    use_quality_as_input: bool,
+    use_quality_aggregation_weights: bool = False,
+) -> str:
+    active = []
+    if use_quality_as_input:
+        active.append("input_feature")
+    if use_quality_weights:
+        active.append("window_loss_weight")
+    if use_quality_aggregation_weights:
+        active.append("soft_client_gradient_weight")
+    return "none" if not active else "_and_".join(active)
 
 
-def quality_scores_needed(use_quality_weights: bool, use_quality_as_input: bool) -> bool:
-    return bool(use_quality_weights or use_quality_as_input)
+def quality_scores_needed(
+    use_quality_weights: bool,
+    use_quality_as_input: bool,
+    use_quality_aggregation_weights: bool = False,
+) -> bool:
+    return bool(use_quality_weights or use_quality_as_input or use_quality_aggregation_weights)
 
 
-def compute_model_input_size(base_input_size: int, use_quality_as_input: bool) -> int:
-    return int(base_input_size) + (1 if use_quality_as_input else 0)
+def compute_model_input_size(
+    base_input_size: int,
+    use_quality_as_input: bool,
+    quality_input_dim: int = 1,
+) -> int:
+    return int(base_input_size) + (int(quality_input_dim) if use_quality_as_input else 0)
 
 
 def augment_sequence_inputs_with_quality(
@@ -60,17 +73,20 @@ def augment_sequence_inputs_with_quality(
     else:
         quality_tensor = quality_scores.to(device=X.device, dtype=X.dtype)
 
-    if quality_tensor.dim() == 0:
-        quality_tensor = quality_tensor.reshape(1)
-    elif quality_tensor.dim() == 2 and quality_tensor.size(-1) == 1:
-        quality_tensor = quality_tensor.squeeze(-1)
-    else:
-        quality_tensor = quality_tensor.reshape(-1)
-
     batch_size = int(X.size(0))
-    if quality_tensor.numel() != batch_size:
+    if quality_tensor.dim() == 0:
+        quality_tensor = quality_tensor.reshape(1, 1)
+    elif quality_tensor.dim() == 1:
+        quality_tensor = quality_tensor.view(-1, 1)
+    elif quality_tensor.dim() == 2:
+        pass
+    else:
+        quality_tensor = quality_tensor.reshape(batch_size, -1)
+
+    if quality_tensor.size(0) != batch_size:
         raise ValueError(
-            f"quality_scores size mismatch during mode={mode}: expected batch_size={batch_size}, got {quality_tensor.numel()}"
+            f"quality_scores size mismatch during mode={mode}: expected batch_size={batch_size}, "
+            f"got first_dim={quality_tensor.size(0)}"
         )
     if not torch.isfinite(quality_tensor).all():
         raise ValueError(f"quality_scores contain non-finite values during mode={mode}")
@@ -80,7 +96,7 @@ def augment_sequence_inputs_with_quality(
             f"min={float(quality_tensor.min().item()):.6f} max={float(quality_tensor.max().item()):.6f}"
         )
 
-    q = quality_tensor.view(batch_size, 1, 1).expand(-1, X.size(1), 1)
+    q = quality_tensor.view(batch_size, 1, -1).expand(-1, X.size(1), -1)
     return torch.cat([X, q], dim=-1)
 
 

@@ -227,6 +227,10 @@ def client_train_metrics_path(output_dir: Path, cluster_id: str, client_id: str)
     return output_dir / f"cluster_{cluster_id}" / f"client_{client_id}_train_metrics.json"
 
 
+def client_test_predictions_path(output_dir: Path, cluster_id: str, client_id: str) -> Path:
+    return output_dir / f"cluster_{cluster_id}" / f"client_{client_id}_test_predictions.csv"
+
+
 def client_checkpoint_candidates(output_dir: Path, cluster_id: str, client_id: str, checkpoint_mode: str) -> List[Path]:
     cluster_dir = output_dir / f"cluster_{cluster_id}"
     best = cluster_dir / f"client_{client_id}_best_checkpoint.pt"
@@ -602,6 +606,28 @@ def maybe_load_saved_test_metrics(output_dir: Path, cluster_id: str, client_id: 
         return None
 
 
+
+
+def load_online_prediction_points(path: Path) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    if not path.exists():
+        return None
+    df = pd.read_csv(path)
+    required = {"timestamp", "y_true", "y_pred"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"Online prediction artifact is missing columns {missing}: {path}")
+    y_true = pd.to_numeric(df["y_true"], errors="coerce").to_numpy(dtype=np.float32).reshape(-1, 1)
+    y_pred = pd.to_numeric(df["y_pred"], errors="coerce").to_numpy(dtype=np.float32).reshape(-1, 1)
+    timestamps = pd.to_datetime(df["timestamp"], errors="coerce").to_numpy()
+    valid = np.isfinite(y_true.reshape(-1)) & np.isfinite(y_pred.reshape(-1))
+    if not np.all(valid):
+        y_true = y_true[valid]
+        y_pred = y_pred[valid]
+        timestamps = timestamps[valid]
+    if y_true.size == 0:
+        raise ValueError(f"Online prediction artifact has no valid rows: {path}")
+    return timestamps, y_true, y_pred
+
 def save_prediction_points_csv(path: Path, timestamps: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> None:
     ensure_dir(path.parent)
     errors = (y_pred.reshape(-1) - y_true.reshape(-1))
@@ -926,6 +952,18 @@ def build_rank_report(rows: List[Dict], metric: str, top_k: int) -> Dict[str, Li
         "mape",
         "smape",
         "r2",
+        "recomputed_mae",
+        "recomputed_rmse",
+        "recomputed_mse",
+        "recomputed_mape",
+        "recomputed_smape",
+        "recomputed_r2",
+        "delta_recomputed_vs_report_mae",
+        "delta_recomputed_vs_report_rmse",
+        "delta_recomputed_vs_report_mse",
+        "delta_recomputed_vs_report_mape",
+        "delta_recomputed_vs_report_smape",
+        "delta_recomputed_vs_report_r2",
         "prediction_csv",
         "plot_path",
     ]
@@ -1217,6 +1255,63 @@ def evaluate_one_client(
     last_n_plot: int,
 ) -> Dict:
     artifact_cfg = load_client_artifact_config(output_dir, cluster_id, client_id)
+    online_points = load_online_prediction_points(client_test_predictions_path(output_dir, cluster_id, client_id))
+    if online_points is not None:
+        ts_test, y_true_eval, preds_eval = online_points
+        metrics = compute_metrics(preds_eval, y_true_eval)
+        plot_path = plots_dir / "predictions" / f"cluster_{cluster_id}" / f"{client_id}.png"
+        prediction_csv = predictions_dir / f"cluster_{cluster_id}" / f"client_{client_id}_predictions.csv"
+        plot_client_forecast(
+            plot_path,
+            ts_test,
+            y_true_eval,
+            preds_eval,
+            cluster_id=cluster_id,
+            client_id=client_id,
+            metrics=metrics,
+            last_n=last_n_plot,
+        )
+        save_prediction_points_csv(prediction_csv, ts_test, y_true_eval, preds_eval)
+        saved_test = maybe_load_saved_test_metrics(output_dir, cluster_id, client_id)
+        saved_raw = None if saved_test is None else saved_test.get("raw_metrics", {})
+        saved_mae = None if not saved_raw else clean_metric_value(saved_raw.get("mae"))
+        saved_rmse = None if not saved_raw else clean_metric_value(saved_raw.get("rmse"))
+        saved_r2 = None if not saved_raw else clean_metric_value(saved_raw.get("r2"))
+        saved_smape = None if not saved_raw else clean_metric_value(saved_raw.get("smape"))
+        return {
+            "cluster_id": str(cluster_id),
+            "client_id": str(client_id),
+            "checkpoint_mode": "online_test_artifact",
+            "artifact_eval_mode": artifact_cfg.eval_mode,
+            "num_test_samples": int(len(y_true_eval)),
+            "checkpoint_client": None,
+            "checkpoint_server": None,
+            "client_checkpoint_epoch": None,
+            "server_global_step": None,
+            "normalize": bool(artifact_cfg.normalize),
+            "normalize_method": artifact_cfg.normalize_method,
+            "norm_mean": float(artifact_cfg.mean),
+            "norm_scale": float(artifact_cfg.scale),
+            "plot_path": str(plot_path),
+            "prediction_csv": str(prediction_csv),
+            "saved_test_mae": saved_mae,
+            "saved_test_rmse": saved_rmse,
+            "saved_test_r2": saved_r2,
+            "saved_test_smape": saved_smape,
+            "delta_vs_saved_mae": (None if saved_mae is None or metrics["mae"] is None else float(metrics["mae"] - saved_mae)),
+            "delta_vs_saved_rmse": (None if saved_rmse is None or metrics["rmse"] is None else float(metrics["rmse"] - saved_rmse)),
+            "delta_vs_saved_r2": (None if saved_r2 is None or metrics["r2"] is None else float(metrics["r2"] - saved_r2)),
+            "delta_vs_saved_smape": (None if saved_smape is None or metrics["smape"] is None else float(metrics["smape"] - saved_smape)),
+            **metrics,
+            "_plot_payload": {
+                "cluster_id": str(cluster_id),
+                "client_id": str(client_id),
+                "timestamps": pd.to_datetime(ts_test).astype(str).tolist(),
+                "y_true": y_true_eval.reshape(-1).tolist(),
+                "y_pred": preds_eval.reshape(-1).tolist(),
+                "metrics": metrics,
+            },
+        }
     if artifact_cfg.use_quality_as_input:
         raise ValueError(
             "predict_plot.py does not reconstruct per-window quality scores required for models trained with "
@@ -1384,9 +1479,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run local prediction and fairness analysis from saved split-learning checkpoints.")
     p.add_argument("--project-root", type=Path, default=Path("."), help="Project root containing dataset/ and output/")
     p.add_argument("--dataset-dir", type=Path, default=Path("dataset"), help="Dataset directory")
-    p.add_argument("--cluster-output-dir", type=Path, default=Path("dataset") / "output", help="Directory containing cluster_*.pkl files used to rebuild prediction timelines.")
+    p.add_argument("--cluster-output-dir", type=Path, default="dataset/output_clean", help="Directory containing cluster_*.pkl files used to rebuild prediction timelines.")
     p.add_argument("--raw-csv-path", type=Path, default=Path("dataset") / "dataset.csv", help="Wide-format raw CSV used when cluster pickle files are missing or unreadable.")
-    p.add_argument("--output-dir", type=Path, default=Path("outputs/output-20260613-185635"), help="Training output directory")
+    p.add_argument("--output-dir", type=Path, default=Path("outputs/output-dq-faulty-train-clean-test"), help="Training output directory")
     p.add_argument("--test-report", type=Path, default=None, help="Per-client split-learning test report CSV. Defaults to output/results/test_report.csv with fallbacks.")
     p.add_argument("--baseline-report", type=Path, default=None, help="Baseline LSTM metrics CSV. Defaults to dataset/lstm_results_updated.csv with fallbacks.")
     p.add_argument("--assignments-path", type=Path, default=Path("dataset") / "cluster-assignment.csv", help="Cluster assignment CSV used to map baseline rows to clusters.")
@@ -1554,6 +1649,10 @@ def main() -> int:
     for row in per_client_rows:
         key = (str(row["cluster_id"]), str(row["client_id"]))
         meta = prediction_meta.get(key)
+        report_metrics = {
+            metric_name: row.get(metric_name)
+            for metric_name in ("mse", "mae", "rmse", "mape", "smape", "r2")
+        }
         row["prediction_csv"] = None
         row["plot_path"] = None
         row["checkpoint_client"] = None
@@ -1569,6 +1668,9 @@ def main() -> int:
         row["delta_recomputed_vs_report_mse"] = None
         row["delta_recomputed_vs_report_mae"] = None
         row["delta_recomputed_vs_report_rmse"] = None
+        row["delta_recomputed_vs_report_mape"] = None
+        row["delta_recomputed_vs_report_smape"] = None
+        row["delta_recomputed_vs_report_r2"] = None
         if meta is None:
             continue
         row["prediction_csv"] = meta.get("prediction_csv")
@@ -1577,21 +1679,18 @@ def main() -> int:
         row["checkpoint_server"] = meta.get("checkpoint_server")
         row["client_checkpoint_epoch"] = meta.get("client_checkpoint_epoch")
         row["server_global_step"] = meta.get("server_global_step")
-        for metric_name in ("mse", "mae", "rmse", "mape", "smape", "r2"):
-            if meta.get(metric_name) is not None:
-                row[metric_name] = meta.get(metric_name)
         row["recomputed_mse"] = meta.get("mse")
         row["recomputed_mae"] = meta.get("mae")
         row["recomputed_rmse"] = meta.get("rmse")
         row["recomputed_mape"] = meta.get("mape")
         row["recomputed_r2"] = meta.get("r2")
         row["recomputed_smape"] = meta.get("smape")
-        if meta.get("mse") is not None and row.get("mse") is not None:
-            row["delta_recomputed_vs_report_mse"] = float(meta["mse"] - row["mse"])
-        if meta.get("mae") is not None and row.get("mae") is not None:
-            row["delta_recomputed_vs_report_mae"] = float(meta["mae"] - row["mae"])
-        if meta.get("rmse") is not None and row.get("rmse") is not None:
-            row["delta_recomputed_vs_report_rmse"] = float(meta["rmse"] - row["rmse"])
+        for metric_name in ("mse", "mae", "rmse", "mape", "smape", "r2"):
+            if meta.get(metric_name) is None or report_metrics.get(metric_name) is None:
+                continue
+            row[f"delta_recomputed_vs_report_{metric_name}"] = float(
+                meta[metric_name] - report_metrics[metric_name]
+            )
 
     cluster_rows = summarize_cluster_rows(per_client_rows)
     global_summary = build_global_summary(per_client_rows)

@@ -56,6 +56,10 @@ class ServerRuntimeConfig:
     output_dir: str
     use_quality_weights: bool
     use_quality_as_input: bool
+    use_quality_aggregation_weights: bool
+    quality_aggregation_mode: str
+    quality_aggregation_q_min: float
+    quality_aggregation_eps: float
     dq_mode: str
     quality_score_path: str
     quality_score_min: float
@@ -67,6 +71,16 @@ class SplitLearningServerState:
     def __init__(self) -> None:
         use_quality_weights = parse_bool(_get_env("USE_QUALITY_WEIGHTS", "false"))
         use_quality_as_input = parse_bool(_get_env("USE_QUALITY_AS_INPUT", "false"))
+        use_quality_aggregation_weights = parse_bool(_get_env("USE_QUALITY_AGGREGATION_WEIGHTS", "false"))
+        quality_aggregation_mode = str(_get_env("QUALITY_AGGREGATION_MODE", "soft_client_gradient") or "soft_client_gradient").strip()
+        quality_aggregation_q_min = float(_get_env("QUALITY_AGGREGATION_Q_MIN", "0.5"))
+        quality_aggregation_eps = float(_get_env("QUALITY_AGGREGATION_EPS", "1e-8"))
+        if use_quality_aggregation_weights and quality_aggregation_mode != "soft_client_gradient":
+            raise ValueError("QUALITY_AGGREGATION_MODE currently supports only 'soft_client_gradient'.")
+        if not (0.0 <= quality_aggregation_q_min <= 1.0):
+            raise ValueError("QUALITY_AGGREGATION_Q_MIN must be within [0, 1].")
+        if quality_aggregation_eps <= 0.0:
+            raise ValueError("QUALITY_AGGREGATION_EPS must be positive.")
         self.runtime_cfg = ServerRuntimeConfig(
             cluster_id=_get_env("CLUSTER_ID", "0"),
             learning_rate=float(_get_env("SERVER_LR", _get_env("LEARNING_RATE", "1e-3"))),
@@ -75,7 +89,11 @@ class SplitLearningServerState:
             output_dir=_get_env("OUTPUT_DIR", server_output_dir(_get_env("CLUSTER_ID", "0"))),
             use_quality_weights=use_quality_weights,
             use_quality_as_input=use_quality_as_input,
-            dq_mode=derive_dq_mode(use_quality_weights, use_quality_as_input),
+            use_quality_aggregation_weights=use_quality_aggregation_weights,
+            quality_aggregation_mode=quality_aggregation_mode,
+            quality_aggregation_q_min=quality_aggregation_q_min,
+            quality_aggregation_eps=quality_aggregation_eps,
+            dq_mode=derive_dq_mode(use_quality_weights, use_quality_as_input, use_quality_aggregation_weights),
             quality_score_path=str(_get_env("QUALITY_SCORE_PATH", "") or "").strip(),
             quality_score_min=float(_get_env("QUALITY_SCORE_MIN", "0.05")),
             quality_score_max=float(_get_env("QUALITY_SCORE_MAX", "1.0")),
@@ -106,6 +124,7 @@ class SplitLearningServerState:
         self.seen_clients_window: Set[str] = set()
         self.round_total_contrib_count = 0
         self.window_contrib_count = 0
+        self.accum_quality_weight_sum = 0.0
         # try loading latest checkpoint on startup
         latest_path = server_checkpoint_path(self.runtime_cfg.cluster_id, "latest.pt") 
         extra, ok = try_load_torch_checkpoint(
@@ -133,6 +152,9 @@ class SplitLearningServerState:
             f"server_lr={self.runtime_cfg.learning_rate} accum_steps_target={self.runtime_cfg.accum_steps_target} "
             f"use_quality_weights={self.runtime_cfg.use_quality_weights} "
             f"use_quality_as_input={self.runtime_cfg.use_quality_as_input} "
+            f"use_quality_aggregation_weights={self.runtime_cfg.use_quality_aggregation_weights} "
+            f"quality_aggregation_mode={self.runtime_cfg.quality_aggregation_mode} "
+            f"quality_aggregation_q_min={self.runtime_cfg.quality_aggregation_q_min} "
             f"dq_mode={self.runtime_cfg.dq_mode} "
             f"quality_score_path={self.runtime_cfg.quality_score_path or '<disabled>'} "
             f"output_dir={self.runtime_cfg.output_dir}",
@@ -185,16 +207,19 @@ class SplitLearningServerState:
             "optimizer_step_count": self.optimizer_step_count,
             "round_id": self.round_id,
         }
-    # averaging gradients if effective_accum_steps > 1 to ensure consistent scale regardless of how many steps were accumulated
-    def _average_parameter_gradients(self, effective_accum_steps: int) -> None:
-        if effective_accum_steps <= 1:
+    # Normalize gradients by the current accumulation window denominator before optimizer.step().
+    def _normalize_parameter_gradients(self, normalizer: float) -> None:
+        if normalizer <= 0.0:
+            raise ValueError(f"Gradient normalizer must be positive, got {normalizer}")
+        if abs(float(normalizer) - 1.0) <= 1e-12:
             return
         for p in self.model.parameters():
             if p.grad is not None:
-                p.grad.div_(effective_accum_steps)
+                p.grad.div_(float(normalizer))
 
     def _reset_window_tracking(self) -> None:
         self.pending_accum_steps = 0
+        self.accum_quality_weight_sum = 0.0
         self.seen_clients_window.clear()
         self.window_contrib_count = 0
 
@@ -214,9 +239,16 @@ class SplitLearningServerState:
         quality_scores_cpu: Optional[torch.Tensor],
         batch_size: int,
     ) -> torch.Tensor:
+        quality_required = (
+            self.runtime_cfg.use_quality_weights
+            or self.runtime_cfg.use_quality_aggregation_weights
+        )
         if quality_scores_cpu is None:
-            if self.runtime_cfg.use_quality_weights:
-                raise ValueError("quality_scores missing while USE_QUALITY_WEIGHTS=true")
+            if quality_required:
+                raise ValueError(
+                    "quality_scores missing while server-side quality mode is enabled "
+                    "(USE_QUALITY_WEIGHTS=true or USE_QUALITY_AGGREGATION_WEIGHTS=true)"
+                )
             return torch.ones(batch_size, dtype=torch.float32, device=self.device)
 
         quality_scores = quality_scores_cpu.to(self.device, dtype=torch.float32)
@@ -230,6 +262,16 @@ class SplitLearningServerState:
             raise ValueError(
                 f"quality_scores size mismatch: expected batch_size={batch_size}, got {quality_scores.numel()}"
             )
+        if self.runtime_cfg.use_quality_aggregation_weights:
+            if not torch.isfinite(quality_scores).all():
+                raise ValueError("quality_scores contain non-finite values while USE_QUALITY_AGGREGATION_WEIGHTS=true")
+            if torch.any((quality_scores < 0.0) | (quality_scores > 1.0)):
+                raise ValueError(
+                    "quality_scores must be within [0, 1] while USE_QUALITY_AGGREGATION_WEIGHTS=true; "
+                    f"min={float(quality_scores.min().item()):.6f} max={float(quality_scores.max().item()):.6f}"
+                )
+        if self.runtime_cfg.use_quality_aggregation_weights:
+            return quality_scores
         return quality_scores.clamp(
             min=self.runtime_cfg.quality_score_min,
             max=self.runtime_cfg.quality_score_max,
@@ -284,6 +326,11 @@ class SplitLearningServerState:
             "active_accum_steps_target": self.active_accum_steps_target,
             "use_quality_weights": self.runtime_cfg.use_quality_weights,
             "use_quality_as_input": self.runtime_cfg.use_quality_as_input,
+            "use_quality_aggregation_weights": self.runtime_cfg.use_quality_aggregation_weights,
+            "quality_aggregation_mode": self.runtime_cfg.quality_aggregation_mode,
+            "quality_aggregation_q_min": self.runtime_cfg.quality_aggregation_q_min,
+            "quality_aggregation_eps": self.runtime_cfg.quality_aggregation_eps,
+            "accum_quality_weight_sum": self.accum_quality_weight_sum,
             "dq_mode": self.runtime_cfg.dq_mode,
             "optimizer_step_count": self.optimizer_step_count,
             "global_step": self.global_step,
@@ -294,13 +341,20 @@ class SplitLearningServerState:
             return {"flushed": False, **self.round_state(), "reason": reason}
         effective_accum_steps = self.pending_accum_steps
         round_id_snapshot = self.round_id
-        self._average_parameter_gradients(effective_accum_steps)
+        accum_quality_weight_sum_snapshot = float(self.accum_quality_weight_sum)
+        if self.runtime_cfg.use_quality_aggregation_weights:
+            effective_normalizer = accum_quality_weight_sum_snapshot + self.runtime_cfg.quality_aggregation_eps
+        else:
+            effective_normalizer = float(effective_accum_steps)
+        self._normalize_parameter_gradients(effective_normalizer)
         self.optimizer.step()
         self.optimizer_step_count += 1
         self._log_optimizer_event(
             "step_during_normal_split_training",
             reason=reason,
             effective_accum_steps=effective_accum_steps,
+            effective_accumulation_normalizer=effective_normalizer,
+            accum_quality_weight_sum=accum_quality_weight_sum_snapshot,
             increment_round=increment_round,
             pending_accum_steps_before_reset=effective_accum_steps,
             round_id_snapshot=round_id_snapshot,
@@ -310,6 +364,8 @@ class SplitLearningServerState:
             "zero_grad_after_normal_update",
             reason=reason,
             effective_accum_steps=effective_accum_steps,
+            effective_accumulation_normalizer=effective_normalizer,
+            accum_quality_weight_sum=accum_quality_weight_sum_snapshot,
             increment_round=increment_round,
             round_id_snapshot=round_id_snapshot,
         )
@@ -322,18 +378,23 @@ class SplitLearningServerState:
         print(
             f"[Server] flush reason={reason} cluster={self.runtime_cfg.cluster_id} round_id={finished_round_id} "
             f"effective_accum_steps={effective_accum_steps} active_target={self.active_accum_steps_target} "
+            f"effective_normalizer={effective_normalizer:.6f} "
+            f"accum_quality_weight_sum={accum_quality_weight_sum_snapshot:.6f} "
             f"window_clients={window_clients} optimizer_steps={self.optimizer_step_count}",
             flush=True,
         )
         if increment_round and self.runtime_cfg.save_every_rounds > 0 and finished_round_id % self.runtime_cfg.save_every_rounds == 0:
             self._save_latest(flush=False)
+        state_after_flush = self.round_state()
         return {
+            **state_after_flush,
             "flushed": True,
             "reason": reason,
             "finished_round_id": finished_round_id,
             "effective_accum_steps": effective_accum_steps,
+            "effective_accumulation_normalizer": effective_normalizer,
+            "flushed_accum_quality_weight_sum": accum_quality_weight_sum_snapshot,
             "window_clients": window_clients,
-            **self.round_state(),
         }
 
     def _flush_before_eval_if_needed(self, reason: str) -> Optional[Dict[str, Any]]:
@@ -372,17 +433,35 @@ class SplitLearningServerState:
         else:
             per_sample_loss = per_sample_loss.reshape(-1)
         quality_scores = self._prepare_quality_scores(quality_scores_cpu, int(per_sample_loss.numel()))
+        loss_quality_scores = quality_scores.clamp(
+            min=self.runtime_cfg.quality_score_min,
+            max=self.runtime_cfg.quality_score_max,
+        )
         if self.runtime_cfg.use_quality_weights:
-            weighted_loss = (per_sample_loss * quality_scores).sum() / quality_scores.sum().clamp_min(
+            weighted_loss = (per_sample_loss * loss_quality_scores).sum() / loss_quality_scores.sum().clamp_min(
                 self.runtime_cfg.quality_score_eps
             )
         else:
             weighted_loss = per_sample_loss.mean()
         weighted_loss_value = float(weighted_loss.item())
-        weighted_loss.backward()
+        client_mean_quality = float(quality_scores.mean().item())
+        client_soft_quality = 1.0
+        effective_loss = weighted_loss
+        if self.runtime_cfg.use_quality_aggregation_weights:
+            q_min = self.runtime_cfg.quality_aggregation_q_min
+            client_soft_quality = float(q_min + (1.0 - q_min) * client_mean_quality)
+            # Design A: clients receive gradients scaled by their own soft quality immediately.
+            # Server parameter gradients are normalized later by the current accumulation-window
+            # soft-quality sum, because the full denominator is only known at flush time.
+            effective_loss = weighted_loss * client_soft_quality
+            self.accum_quality_weight_sum += client_soft_quality
+        effective_loss_value = float(effective_loss.item())
+        effective_loss.backward()
         grad_activations = activations.grad.detach().cpu()
         if input_was_2d and grad_activations.dim() == 3 and grad_activations.size(1) == 1:
             grad_activations = grad_activations.squeeze(1)
+
+        accum_quality_weight_sum_snapshot = float(self.accum_quality_weight_sum)
 
         self.pending_accum_steps += 1
         self.seen_clients_total.add(client_id)
@@ -412,7 +491,8 @@ class SplitLearningServerState:
         print(
             f"[Server] train_step cluster={self.runtime_cfg.cluster_id} round_id={finished_round_id if finished_round_id is not None else self.round_id} "
             f"client={client_id} raw_loss={raw_loss:.6f} weighted_loss={weighted_loss_value:.6f} "
-            f"quality_mean={float(quality_scores.mean().item()):.6f} seen_total={seen_clients_total_snapshot} "
+            f"effective_loss={effective_loss_value:.6f} quality_mean={client_mean_quality:.6f} "
+            f"soft_quality={client_soft_quality:.6f} accum_quality_weight_sum={accum_quality_weight_sum_snapshot:.6f} seen_total={seen_clients_total_snapshot} "
             f"seen_window={seen_clients_window_snapshot} pending_accum={self.pending_accum_steps} "
             f"target_accum={active_accum_steps_target_snapshot} window_complete={window_complete} round_complete={round_complete}",
             flush=True,
@@ -421,9 +501,13 @@ class SplitLearningServerState:
             "grad_activations": grad_activations,
             "loss": raw_loss,
             "weighted_loss": weighted_loss_value,
+            "effective_loss": effective_loss_value,
+            "client_mean_quality": client_mean_quality,
+            "client_soft_quality": client_soft_quality,
+            "accum_quality_weight_sum": accum_quality_weight_sum_snapshot,
             "quality_score_min": float(quality_scores.min().item()),
             "quality_score_max": float(quality_scores.max().item()),
-            "quality_score_mean": float(quality_scores.mean().item()),
+            "quality_score_mean": client_mean_quality,
             "window_complete": window_complete,
             "round_complete": round_complete,
             "flush_info": flush_info,
@@ -591,6 +675,10 @@ def config():
             "save_every_rounds": state.runtime_cfg.save_every_rounds,
             "use_quality_weights": state.runtime_cfg.use_quality_weights,
             "use_quality_as_input": state.runtime_cfg.use_quality_as_input,
+            "use_quality_aggregation_weights": state.runtime_cfg.use_quality_aggregation_weights,
+            "quality_aggregation_mode": state.runtime_cfg.quality_aggregation_mode,
+            "quality_aggregation_q_min": state.runtime_cfg.quality_aggregation_q_min,
+            "quality_aggregation_eps": state.runtime_cfg.quality_aggregation_eps,
             "dq_mode": state.runtime_cfg.dq_mode,
             "quality_score_path": state.runtime_cfg.quality_score_path or None,
             "optimizer_id": id(state.optimizer),
@@ -671,6 +759,10 @@ def train_step():
                         "grad_bytes": tensor_nbytes(result.get("grad_activations")),
                         "loss": result.get("loss"),
                         "weighted_loss": result.get("weighted_loss"),
+                        "effective_loss": result.get("effective_loss"),
+                        "client_mean_quality": result.get("client_mean_quality"),
+                        "client_soft_quality": result.get("client_soft_quality"),
+                        "accum_quality_weight_sum": result.get("accum_quality_weight_sum"),
                         "quality_score_min": result.get("quality_score_min"),
                         "quality_score_max": result.get("quality_score_max"),
                         "quality_score_mean": result.get("quality_score_mean"),

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import csv
 import os
 import pickle
 import random
@@ -65,12 +66,57 @@ def client_test_metrics_path(cluster_id: str, client_id: str) -> str:
     return os.path.join(_cluster_output_dir(cluster_id), f"client_{client_id}_test_metrics.json")
 
 
+def client_test_predictions_path(cluster_id: str, client_id: str) -> str:
+    return os.path.join(_cluster_output_dir(cluster_id), f"client_{client_id}_test_predictions.csv")
+
+
 def client_progress_path(cluster_id: str, client_id: str) -> str:
     return os.path.join(_cluster_output_dir(cluster_id), f"client_{client_id}_progress.json")
 
 
 def client_comm_log_path(cluster_id: str, client_id: str) -> str:
     return os.path.join(_cluster_output_dir(cluster_id), f"client_{client_id}_comm.csv")
+
+
+def write_prediction_points_csv(
+    path: str,
+    *,
+    timestamps,
+    window_start_indices,
+    window_end_indices,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    true_values = y_true.reshape(-1)
+    pred_values = y_pred.reshape(-1)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "timestamp",
+                "window_start_index",
+                "window_end_index",
+                "y_true",
+                "y_pred",
+                "abs_error",
+                "sq_error",
+            ],
+        )
+        writer.writeheader()
+        for idx, (true_value, pred_value) in enumerate(zip(true_values, pred_values)):
+            err = float(pred_value - true_value)
+            writer.writerow(
+                {
+                    "timestamp": timestamps[idx] if idx < len(timestamps) else "",
+                    "window_start_index": window_start_indices[idx] if idx < len(window_start_indices) else "",
+                    "window_end_index": window_end_indices[idx] if idx < len(window_end_indices) else "",
+                    "y_true": float(true_value),
+                    "y_pred": float(pred_value),
+                    "abs_error": abs(err),
+                    "sq_error": err * err,
+                }
+            )
 
 
 @dataclass
@@ -92,8 +138,10 @@ class ClientRuntimeConfig:
     server_port: int
     use_quality_as_input: bool
     use_quality_weights: bool
+    use_quality_aggregation_weights: bool
     dq_mode: str
     quality_score_path: str
+    quality_input_dim: int
     base_input_size: Optional[int]
     model_input_size: Optional[int]
 
@@ -102,6 +150,7 @@ class ClusteredClientRunner:
     def __init__(self) -> None:
         use_quality_as_input = parse_bool(_get_env("USE_QUALITY_AS_INPUT", "false"))
         use_quality_weights = parse_bool(_get_env("USE_QUALITY_WEIGHTS", "false"))
+        use_quality_aggregation_weights = parse_bool(_get_env("USE_QUALITY_AGGREGATION_WEIGHTS", "false"))
         self.runtime_cfg = ClientRuntimeConfig(
             client_id=_get_env("CLIENT_ID", "9900002"),
             cluster_id=str(_get_env("CLUSTER_ID", "0")).replace("cluster_", ""),
@@ -120,8 +169,10 @@ class ClusteredClientRunner:
             server_port=int(_get_env("SERVER_PORT", "5002")),
             use_quality_as_input=use_quality_as_input,
             use_quality_weights=use_quality_weights,
-            dq_mode=derive_dq_mode(use_quality_weights, use_quality_as_input),
+            use_quality_aggregation_weights=use_quality_aggregation_weights,
+            dq_mode=derive_dq_mode(use_quality_weights, use_quality_as_input, use_quality_aggregation_weights),
             quality_score_path=str(_get_env("QUALITY_SCORE_PATH", "") or "").strip(),
+            quality_input_dim=int(_get_env("QUALITY_INPUT_DIM", "1")),
             base_input_size=None,
             model_input_size=None,
         )
@@ -171,6 +222,7 @@ class ClusteredClientRunner:
             f"client_lr={self.runtime_cfg.learning_rate} dq_mode={self.runtime_cfg.dq_mode} "
             f"use_quality_as_input={self.runtime_cfg.use_quality_as_input} "
             f"use_quality_weights={self.runtime_cfg.use_quality_weights} "
+            f"use_quality_aggregation_weights={self.runtime_cfg.use_quality_aggregation_weights} "
             f"base_input_size={self.runtime_cfg.base_input_size} "
             f"model_input_size={self.runtime_cfg.model_input_size}",
             flush=True,
@@ -219,6 +271,7 @@ class ClusteredClientRunner:
                 "data_quality": {
                     "use_quality_as_input": self.runtime_cfg.use_quality_as_input,
                     "use_quality_weights": self.runtime_cfg.use_quality_weights,
+                    "use_quality_aggregation_weights": self.runtime_cfg.use_quality_aggregation_weights,
                     "dq_mode": self.runtime_cfg.dq_mode,
                     "base_input_size": self.runtime_cfg.base_input_size,
                     "model_input_size": self.runtime_cfg.model_input_size,
@@ -395,10 +448,18 @@ class ClusteredClientRunner:
 
         self.runtime_cfg.base_input_size = int(base_input_size)
         self.runtime_cfg.model_input_size = int(model_input_size)
-        expected_model_input_size = compute_model_input_size(base_input_size, self.runtime_cfg.use_quality_as_input)
+        stream_quality_input_dim = self._coerce_optional_int(self.norm_stats.get("quality_input_dim"))
+        if stream_quality_input_dim is None:
+            stream_quality_input_dim = self.runtime_cfg.quality_input_dim
+        self.runtime_cfg.quality_input_dim = int(stream_quality_input_dim)
+        expected_model_input_size = compute_model_input_size(
+            base_input_size,
+            self.runtime_cfg.use_quality_as_input,
+            self.runtime_cfg.quality_input_dim,
+        )
         if model_input_size != expected_model_input_size:
             suffix = (
-                f"{base_input_size}+1"
+                f"{base_input_size}+{self.runtime_cfg.quality_input_dim}"
                 if self.runtime_cfg.use_quality_as_input
                 else str(base_input_size)
             )
@@ -669,6 +730,7 @@ class ClusteredClientRunner:
         route = "/validate_step" if mode == "val" else "/inference_step"
         self.client_model.eval()
         preds_norm, trues_norm = [], []
+        target_timestamps, window_start_indices, window_end_indices = [], [], []
         total_server_loss = 0.0
         num_batches = 0
         num_samples = 0
@@ -727,6 +789,9 @@ class ClusteredClientRunner:
                 batch_true = y.detach().cpu().numpy().astype(np.float32)
                 preds_norm.append(batch_preds.reshape(-1, 1))
                 trues_norm.append(batch_true.reshape(-1, 1))
+                target_timestamps.extend(batch_meta.get("target_timestamps", []))
+                window_start_indices.extend(batch_meta.get("window_start_indices", []))
+                window_end_indices.extend(batch_meta.get("window_end_indices", []))
                 num_batches += 1
                 num_samples += int(batch_true.shape[0])
         self.client_model.train()
@@ -744,6 +809,7 @@ class ClusteredClientRunner:
             "dq_mode": self.runtime_cfg.dq_mode,
             "use_quality_as_input": self.runtime_cfg.use_quality_as_input,
             "use_quality_weights": self.runtime_cfg.use_quality_weights,
+            "use_quality_aggregation_weights": self.runtime_cfg.use_quality_aggregation_weights,
             "base_input_size": self.runtime_cfg.base_input_size,
             "model_input_size": self.runtime_cfg.model_input_size,
             "num_batches": num_batches,
@@ -753,7 +819,17 @@ class ClusteredClientRunner:
             "raw_metrics": self._compute_metrics(preds_raw, trues_raw),
             "normalization": self.norm_stats,
             "eval_mode": self.runtime_cfg.eval_mode,
+            "prediction_points_path": client_test_predictions_path(self.runtime_cfg.cluster_id, self.runtime_cfg.client_id) if mode == "test" else None,
         }
+        if mode == "test":
+            write_prediction_points_csv(
+                client_test_predictions_path(self.runtime_cfg.cluster_id, self.runtime_cfg.client_id),
+                timestamps=target_timestamps,
+                window_start_indices=window_start_indices,
+                window_end_indices=window_end_indices,
+                y_true=trues_raw,
+                y_pred=preds_raw,
+            )
         if save_json_path:
             write_json(save_json_path, result)
         return result
@@ -805,6 +881,7 @@ class ClusteredClientRunner:
             "dq_mode": self.runtime_cfg.dq_mode,
             "use_quality_as_input": self.runtime_cfg.use_quality_as_input,
             "use_quality_weights": self.runtime_cfg.use_quality_weights,
+            "use_quality_aggregation_weights": self.runtime_cfg.use_quality_aggregation_weights,
             "base_input_size": self.runtime_cfg.base_input_size,
             "model_input_size": self.runtime_cfg.model_input_size,
             "num_epochs": self.runtime_cfg.num_epochs,
@@ -829,12 +906,18 @@ class ClusteredClientRunner:
         self.optimizer.zero_grad(set_to_none=True)
         local_epoch = int(self.progress.get("completed_epochs", 0)) + 1
         batch_id = int(self.progress.get("current_epoch_batch_count", 0)) + 1
-        quality_scores = batch_meta.get("quality_scores")
-        if quality_scores is not None and not torch.is_tensor(quality_scores):
-            quality_scores = torch.tensor(quality_scores, dtype=torch.float32)
-        send_quality_scores = quality_scores if self.runtime_cfg.use_quality_weights else None
+        quality_weight_scores = batch_meta.get("quality_weight_scores")
+        if quality_weight_scores is None:
+            quality_weight_scores = batch_meta.get("quality_scores")
+        if quality_weight_scores is not None and not torch.is_tensor(quality_weight_scores):
+            quality_weight_scores = torch.tensor(quality_weight_scores, dtype=torch.float32)
+        server_needs_quality = (
+            self.runtime_cfg.use_quality_weights
+            or self.runtime_cfg.use_quality_aggregation_weights
+        )
+        send_quality_scores = quality_weight_scores if server_needs_quality else None
         send_quality_score_metadata = (
-            batch_meta.get("quality_score_metadata", {}) if self.runtime_cfg.use_quality_weights else None
+            batch_meta.get("quality_score_metadata", {}) if server_needs_quality else None
         )
 
         use_cudnn = not (self.device.type == "cuda")
@@ -940,6 +1023,7 @@ class ClusteredClientRunner:
             "dq_mode": self.runtime_cfg.dq_mode,
             "use_quality_as_input": self.runtime_cfg.use_quality_as_input,
             "use_quality_weights": self.runtime_cfg.use_quality_weights,
+            "use_quality_aggregation_weights": self.runtime_cfg.use_quality_aggregation_weights,
             "base_input_size": self.runtime_cfg.base_input_size,
             "model_input_size": self.runtime_cfg.model_input_size,
             "completed_epochs": int(self.progress.get("completed_epochs", 0)),

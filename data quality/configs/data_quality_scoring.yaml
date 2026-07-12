@@ -57,5 +57,16 @@ subcheck_weights:
     F2: 1.0
     F3: 1.0
 
+final_score:
+  # method: pca keeps the historical global PCA/min-max score.
+  # method: average computes a client/window-local weighted mean of the five dimensions.
+  method: average
+  dimension_weights:
+    completeness: 1.0
+    validity: 1.0
+    consistency: 1.0
+    accuracy: 1.0
+    freshness: 1.0
+
 pca:
   epsilon: 1.0e-9

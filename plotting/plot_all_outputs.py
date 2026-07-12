@@ -469,7 +469,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--range-points", "--range-point", dest="range_points", type=int, default=None, help="Number of final points to display in the prediction line plots.")
     p.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE, help="Baseline LSTM CSV with cell_id/client_id and mae.")
     p.add_argument("--assignments", type=Path, default=DEFAULT_ASSIGNMENTS, help="Cluster assignment CSV with ID and Cluster.")
-    p.add_argument("--output-dir", type=Path, default=Path("plots"), help="Directory where the two plots are saved.")
+    p.add_argument("--output-dir", type=Path, default=Path("plots/outputs"), help="Directory where the two plots are saved.")
     return p.parse_args()
 
 

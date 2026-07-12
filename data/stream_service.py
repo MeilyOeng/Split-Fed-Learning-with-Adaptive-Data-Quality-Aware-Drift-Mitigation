@@ -24,10 +24,18 @@ CLUSTER_DIR = os.environ.get("CLUSTER_DIR", DEFAULT_CLUSTER_DIR)
 TRAIN_CLUSTER_DATA_DIR = os.environ.get("TRAIN_CLUSTER_DATA_DIR", CLUSTER_DIR)
 VAL_CLUSTER_DATA_DIR = os.environ.get("VAL_CLUSTER_DATA_DIR", CLUSTER_DIR)
 TEST_CLUSTER_DATA_DIR = os.environ.get("TEST_CLUSTER_DATA_DIR", CLUSTER_DIR)
+TRAIN_TARGET_CLUSTER_DATA_DIR = os.environ.get("TRAIN_TARGET_CLUSTER_DATA_DIR", TRAIN_CLUSTER_DATA_DIR)
+VAL_TARGET_CLUSTER_DATA_DIR = os.environ.get("VAL_TARGET_CLUSTER_DATA_DIR", VAL_CLUSTER_DATA_DIR)
+TEST_TARGET_CLUSTER_DATA_DIR = os.environ.get("TEST_TARGET_CLUSTER_DATA_DIR", TEST_CLUSTER_DATA_DIR)
 MODE_CLUSTER_DIRS = {
     "train": TRAIN_CLUSTER_DATA_DIR,
     "val": VAL_CLUSTER_DATA_DIR,
     "test": TEST_CLUSTER_DATA_DIR,
+}
+MODE_TARGET_CLUSTER_DIRS = {
+    "train": TRAIN_TARGET_CLUSTER_DATA_DIR,
+    "val": VAL_TARGET_CLUSTER_DATA_DIR,
+    "test": TEST_TARGET_CLUSTER_DATA_DIR,
 }
 
 STREAM_CLUSTER_ID = os.environ.get("STREAM_CLUSTER_ID")
@@ -46,12 +54,16 @@ STATIC_FEATURE_COLUMNS_RAW = os.environ.get("STATIC_FEATURE_COLUMNS", "")
 STATIC_FEATURE_GROUPS_RAW = os.environ.get("STATIC_FEATURE_GROUPS", "")
 USE_QUALITY_WEIGHTS = os.environ.get("USE_QUALITY_WEIGHTS", "false").lower() in ("1", "true", "yes", "y")
 USE_QUALITY_AS_INPUT = os.environ.get("USE_QUALITY_AS_INPUT", "false").lower() in ("1", "true", "yes", "y")
+USE_QUALITY_AGGREGATION_WEIGHTS = os.environ.get("USE_QUALITY_AGGREGATION_WEIGHTS", "false").lower() in ("1", "true", "yes", "y")
 QUALITY_SCORE_PATH = str(os.environ.get("QUALITY_SCORE_PATH", "")).strip()
+QUALITY_INPUT_COLUMNS_RAW = str(os.environ.get("QUALITY_INPUT_COLUMNS", "quality_score")).strip()
+QUALITY_INPUT_COLUMNS = [col.strip() for col in QUALITY_INPUT_COLUMNS_RAW.split(",") if col.strip()] or ["quality_score"]
+QUALITY_WEIGHT_COLUMN = str(os.environ.get("QUALITY_WEIGHT_COLUMN", "quality_score")).strip() or "quality_score"
 QUALITY_SCORE_GRANULARITY = str(os.environ.get("QUALITY_SCORE_GRANULARITY", "window")).strip().lower()
 STRICT_QUALITY_SCORE_MATCHING = os.environ.get("STRICT_QUALITY_SCORE_MATCHING", "true").lower() in ("1", "true", "yes", "y")
 QUALITY_SCORE_FALLBACK = float(os.environ.get("QUALITY_SCORE_FALLBACK", "1.0"))
-DQ_MODE = derive_dq_mode(USE_QUALITY_WEIGHTS, USE_QUALITY_AS_INPUT)
-QUALITY_NEEDED = quality_scores_needed(USE_QUALITY_WEIGHTS, USE_QUALITY_AS_INPUT)
+DQ_MODE = derive_dq_mode(USE_QUALITY_WEIGHTS, USE_QUALITY_AS_INPUT, USE_QUALITY_AGGREGATION_WEIGHTS)
+QUALITY_NEEDED = quality_scores_needed(USE_QUALITY_WEIGHTS, USE_QUALITY_AS_INPUT, USE_QUALITY_AGGREGATION_WEIGHTS)
 MODEL_INPUT_SIZE_RAW = str(os.environ.get("MODEL_INPUT_SIZE", "")).strip()
 try:
     MODEL_INPUT_SIZE = int(MODEL_INPUT_SIZE_RAW) if MODEL_INPUT_SIZE_RAW else None
@@ -65,6 +77,10 @@ if QUALITY_SCORE_GRANULARITY != "window":
 
 client_series: Dict[Tuple[str, str, int], torch.Tensor] = {}
 client_timestamps: Dict[Tuple[str, str, int], List[pd.Timestamp]] = {}
+client_frequency_deltas: Dict[Tuple[str, str, int], pd.Timedelta] = {}
+client_target_series: Dict[Tuple[str, str, int], torch.Tensor] = {}
+client_target_timestamps: Dict[Tuple[str, str, int], List[pd.Timestamp]] = {}
+client_target_lookup: Dict[Tuple[str, str, int], Dict[pd.Timestamp, torch.Tensor]] = {}
 client_static_features: Dict[Tuple[str, str, int], torch.Tensor] = {}
 client_norm_stats: Dict[Tuple[str, int], Tuple[float, float]] = {}
 client_split_bounds: Dict[Tuple[str, str, int], Dict[str, Tuple[int, int]]] = {}
@@ -79,9 +95,13 @@ quality_score_summary: Dict[str, Any] = {
     "quality_score_path": QUALITY_SCORE_PATH or None,
     "use_quality_weights": USE_QUALITY_WEIGHTS,
     "use_quality_as_input": USE_QUALITY_AS_INPUT,
+    "use_quality_aggregation_weights": USE_QUALITY_AGGREGATION_WEIGHTS,
     "quality_needed": QUALITY_NEEDED,
     "dq_mode": DQ_MODE,
     "granularity": QUALITY_SCORE_GRANULARITY,
+    "quality_input_columns": QUALITY_INPUT_COLUMNS if USE_QUALITY_AS_INPUT else [],
+    "quality_input_dim": len(QUALITY_INPUT_COLUMNS) if USE_QUALITY_AS_INPUT else 0,
+    "quality_weight_column": QUALITY_WEIGHT_COLUMN,
 }
 offset_lock = Lock()
 
@@ -203,6 +223,28 @@ def _normalize_tensor(tensor: torch.Tensor, mean: float, scale: float) -> torch.
     return (tensor - mean) / scale
 
 
+def _infer_frequency_delta(timestamps: List[pd.Timestamp]) -> pd.Timedelta:
+    valid = [pd.Timestamp(ts) for ts in timestamps if not pd.isna(ts)]
+    if len(valid) < 2:
+        raise ValueError("Cannot infer timestamp frequency from fewer than two valid timestamps")
+    deltas = []
+    previous = valid[0]
+    for current in valid[1:]:
+        delta = current - previous
+        if delta > pd.Timedelta(0):
+            deltas.append(delta)
+        previous = current
+    if not deltas:
+        raise ValueError("Cannot infer positive timestamp frequency from input series")
+    return pd.Series(deltas).median()
+
+
+def _target_timestamp_for_window(timestamps: List[pd.Timestamp], window_end_idx: int, frequency_delta: pd.Timedelta) -> pd.Timestamp:
+    if window_end_idx >= len(timestamps) or pd.isna(timestamps[window_end_idx]):
+        raise KeyError(f"Missing input timestamp at window_end_idx={window_end_idx}")
+    return pd.Timestamp(timestamps[window_end_idx]) + (frequency_delta * FORECAST_HORIZON)
+
+
 def _clean_optional_float(value: Any) -> Optional[float]:
     if value is None or pd.isna(value):
         return None
@@ -275,6 +317,7 @@ def _prepare_from_dataframe(
         else:
             timestamps = [pd.NaT] * len(rows)
         client_timestamps[mode_series_key] = timestamps
+        client_frequency_deltas[mode_series_key] = _infer_frequency_delta(timestamps)
         client_split_bounds[mode_series_key] = _get_split_bounds(len(values))
         client_window_counts[mode_series_key] = {
             k: max(0, end - start) for k, (start, end) in client_split_bounds[mode_series_key].items()
@@ -292,6 +335,68 @@ def _prepare_from_dataframe(
             )
         client_static_features[mode_series_key] = static_features
         client_input_sizes[stable_client_key] = current_input_size
+
+
+def _prepare_target_from_dataframe(
+    df: pd.DataFrame,
+    cluster_id: str,
+    source_mode: str,
+    *,
+    timestamp_col: str = "Fecha_Hora",
+    value_col: str = "value",
+) -> None:
+    if timestamp_col not in df.columns:
+        raise ValueError(f"Target data for mode={source_mode}, cluster={cluster_id} must include {timestamp_col}")
+    df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
+    df = df.dropna(subset=[timestamp_col]).sort_values(["id", timestamp_col], kind="stable")
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+
+    for client_id, rows in df.groupby("id", sort=False):
+        rows = rows.copy()
+        rows[value_col] = rows[value_col].ffill().bfill()
+        if rows[value_col].isna().any():
+            raise ValueError(
+                f"NaNs remain after target fill for source_mode={source_mode}, cluster={cluster_id}, client={client_id}"
+            )
+        normalized_client_id = _normalize_client_id(client_id)
+        client_int = int(normalized_client_id)
+        mode_series_key = _series_key(source_mode, cluster_id, client_int)
+        values = torch.as_tensor(rows[value_col].to_numpy(dtype=float), dtype=torch.float32)
+        timestamps = pd.to_datetime(rows[timestamp_col], errors="coerce").tolist()
+        lookup: Dict[pd.Timestamp, torch.Tensor] = {}
+        for idx, timestamp in enumerate(timestamps):
+            if pd.isna(timestamp):
+                continue
+            key = pd.Timestamp(timestamp)
+            if key in lookup:
+                raise ValueError(
+                    f"Duplicate target timestamp for mode={source_mode}, cluster={cluster_id}, client={client_int}: {key}"
+                )
+            lookup[key] = values[idx]
+        client_target_series[mode_series_key] = values.contiguous()
+        client_target_timestamps[mode_series_key] = timestamps
+        client_target_lookup[mode_series_key] = lookup
+
+
+def _prepare_target_from_payload(payload: Any, cluster_id: str, source_mode: str) -> None:
+    if isinstance(payload, pd.DataFrame):
+        _prepare_target_from_dataframe(payload, cluster_id, source_mode)
+        return
+    if not isinstance(payload, dict):
+        raise TypeError(f"Unsupported target cluster pickle payload type: {type(payload).__name__}")
+
+    timeseries = payload.get("timeseries")
+    if not isinstance(timeseries, pd.DataFrame):
+        raise ValueError("Target cluster pickle payload must contain a pandas DataFrame under the timeseries key.")
+    timestamp_col = str(payload.get("timestamp_col", "Fecha_Hora"))
+    value_col = str(payload.get("value_col", "value"))
+    _prepare_target_from_dataframe(
+        timeseries,
+        cluster_id,
+        source_mode,
+        timestamp_col=timestamp_col,
+        value_col=value_col,
+    )
 
 
 def _prepare_from_payload(payload: Any, cluster_id: str, source_mode: str) -> None:
@@ -357,9 +462,46 @@ def _load_cluster_data_for_mode(source_mode: str, cluster_dir: str) -> None:
         _prepare_from_dataframe(rows.reset_index(drop=True), str(cluster_id), source_mode)
 
 
+def _load_target_cluster_data_for_mode(source_mode: str, cluster_dir: str) -> None:
+    loaded_any = False
+    if os.path.isdir(cluster_dir):
+        for file in sorted(os.listdir(cluster_dir)):
+            if not file.endswith(".pkl"):
+                continue
+            cluster_id = file.split("_")[1].split(".")[0]
+            if STREAM_CLUSTER_ID and str(cluster_id) != str(STREAM_CLUSTER_ID):
+                continue
+            payload = pd.read_pickle(os.path.join(cluster_dir, file))
+            _prepare_target_from_payload(payload, str(cluster_id), source_mode)
+            loaded_any = True
+    if loaded_any:
+        return
+
+    if os.path.abspath(cluster_dir) != os.path.abspath(CLUSTER_DIR):
+        raise FileNotFoundError(
+            f"No target cluster pickle files found for mode={source_mode} in {cluster_dir}. "
+            "Run data/clustering_processing.py for that dataset first."
+        )
+
+    dataset_path = os.path.join(BASE_DIR, "dataset", "dataset.csv")
+    assignment_path = os.path.join(BASE_DIR, "dataset", "cluster-assignment.csv")
+    dataset = pd.read_csv(dataset_path)
+    cluster_assignments = pd.read_csv(assignment_path)
+    merged = dataset.melt(id_vars=["Fecha_Hora"], var_name="id", value_name="value")
+    merged["id"] = merged["id"].astype(int)
+    merged["Fecha_Hora"] = pd.to_datetime(merged["Fecha_Hora"], errors="coerce")
+    merged = merged.merge(cluster_assignments, left_on="id", right_on="ID")
+    merged = merged.sort_values(["Cluster", "id", "Fecha_Hora"], kind="stable")
+    for cluster_id, rows in merged.groupby("Cluster", sort=False):
+        if STREAM_CLUSTER_ID and str(cluster_id) != str(STREAM_CLUSTER_ID):
+            continue
+        _prepare_target_from_dataframe(rows.reset_index(drop=True), str(cluster_id), source_mode)
+
+
 def load_cluster_data() -> None:
     for mode in ("train", "val", "test"):
         _load_cluster_data_for_mode(mode, MODE_CLUSTER_DIRS[mode])
+        _load_target_cluster_data_for_mode(mode, MODE_TARGET_CLUSTER_DIRS[mode])
 
 
 def _load_quality_score_index() -> None:
@@ -373,13 +515,18 @@ def _load_quality_score_index() -> None:
             "granularity": QUALITY_SCORE_GRANULARITY,
             "use_quality_weights": USE_QUALITY_WEIGHTS,
             "use_quality_as_input": USE_QUALITY_AS_INPUT,
+            "use_quality_aggregation_weights": USE_QUALITY_AGGREGATION_WEIGHTS,
             "quality_needed": False,
             "dq_mode": DQ_MODE,
+            "quality_input_columns": QUALITY_INPUT_COLUMNS if USE_QUALITY_AS_INPUT else [],
+            "quality_input_dim": len(QUALITY_INPUT_COLUMNS) if USE_QUALITY_AS_INPUT else 0,
+            "quality_weight_column": QUALITY_WEIGHT_COLUMN,
         }
         return
     if not QUALITY_SCORE_PATH:
         raise ValueError(
-            "USE_QUALITY_WEIGHTS=true or USE_QUALITY_AS_INPUT=true requires QUALITY_SCORE_PATH to be set."
+            "USE_QUALITY_WEIGHTS=true, USE_QUALITY_AS_INPUT=true, or "
+            "USE_QUALITY_AGGREGATION_WEIGHTS=true requires QUALITY_SCORE_PATH to be set."
         )
 
     quality_path = os.path.join(BASE_DIR, QUALITY_SCORE_PATH) if not os.path.isabs(QUALITY_SCORE_PATH) else QUALITY_SCORE_PATH
@@ -399,6 +546,15 @@ def _load_quality_score_index() -> None:
         raise ValueError(
             f"Quality score CSV must contain either 'quality_score' or 'y_final'. Path: {quality_path}"
         )
+    missing_input_columns = [col for col in QUALITY_INPUT_COLUMNS if col not in df.columns]
+    if USE_QUALITY_AS_INPUT and missing_input_columns:
+        raise ValueError(
+            f"QUALITY_INPUT_COLUMNS contains missing column(s): {missing_input_columns}. Path: {quality_path}"
+        )
+    if USE_QUALITY_WEIGHTS and QUALITY_WEIGHT_COLUMN not in df.columns:
+        raise ValueError(
+            f"QUALITY_WEIGHT_COLUMN={QUALITY_WEIGHT_COLUMN!r} is not present in {quality_path}"
+        )
 
     for _, row in df.iterrows():
         client_id = _normalize_client_id(row["client_id"])
@@ -407,8 +563,11 @@ def _load_quality_score_index() -> None:
         key = (client_id, mode, window_start_index)
         if key in quality_score_index:
             raise ValueError(f"Duplicate quality score key found: {key} in {quality_path}")
+        quality_score = float(row[score_column])
         quality_score_index[key] = {
-            "quality_score": float(row[score_column]),
+            "quality_score": quality_score,
+            "quality_input_values": [float(row[col]) for col in QUALITY_INPUT_COLUMNS],
+            "quality_weight_score": float(row[QUALITY_WEIGHT_COLUMN]) if QUALITY_WEIGHT_COLUMN in row else quality_score,
             "window_start_index": window_start_index,
             "window_end_index": (None if "window_end_index" not in df.columns or pd.isna(row["window_end_index"]) else int(row["window_end_index"])),
             "window_start": (None if "window_start" not in df.columns or pd.isna(row["window_start"]) else str(row["window_start"])),
@@ -428,11 +587,15 @@ def _load_quality_score_index() -> None:
         "granularity": QUALITY_SCORE_GRANULARITY,
         "use_quality_weights": USE_QUALITY_WEIGHTS,
         "use_quality_as_input": USE_QUALITY_AS_INPUT,
+        "use_quality_aggregation_weights": USE_QUALITY_AGGREGATION_WEIGHTS,
         "quality_needed": True,
         "dq_mode": DQ_MODE,
         "row_count": int(len(df)),
         "client_count": int(df["client_id"].astype(str).nunique()),
         "modes": sorted({str(mode).strip().lower() for mode in df["mode"].dropna().astype(str)}),
+        "quality_input_columns": QUALITY_INPUT_COLUMNS if USE_QUALITY_AS_INPUT else [],
+        "quality_input_dim": len(QUALITY_INPUT_COLUMNS) if USE_QUALITY_AS_INPUT else 0,
+        "quality_weight_column": QUALITY_WEIGHT_COLUMN,
     }
 
 
@@ -440,6 +603,8 @@ def _quality_record_for_window(client_id: int, mode: str, window_start_index: in
     if not QUALITY_NEEDED:
         return {
             "quality_score": 1.0,
+            "quality_input_values": [1.0 for _ in QUALITY_INPUT_COLUMNS],
+            "quality_weight_score": 1.0,
             "match_status": "disabled",
         }
 
@@ -456,6 +621,8 @@ def _quality_record_for_window(client_id: int, mode: str, window_start_index: in
 
     return {
         "quality_score": QUALITY_SCORE_FALLBACK,
+        "quality_input_values": [QUALITY_SCORE_FALLBACK for _ in QUALITY_INPUT_COLUMNS],
+        "quality_weight_score": QUALITY_SCORE_FALLBACK,
         "match_status": "fallback",
     }
 
@@ -483,6 +650,7 @@ def health():
             "use_static_features": USE_STATIC_FEATURES,
             "use_quality_as_input": USE_QUALITY_AS_INPUT,
             "use_quality_weights": USE_QUALITY_WEIGHTS,
+            "use_quality_aggregation_weights": USE_QUALITY_AGGREGATION_WEIGHTS,
             "dq_mode": DQ_MODE,
             "quality_needed": QUALITY_NEEDED,
             "requested_static_feature_groups": _parse_optional_csv(STATIC_FEATURE_GROUPS_RAW),
@@ -493,8 +661,10 @@ def health():
             "model_input_size": MODEL_INPUT_SIZE,
             "quality_input_enabled": USE_QUALITY_AS_INPUT,
             "quality_weights_enabled": USE_QUALITY_WEIGHTS,
+            "quality_aggregation_weights_enabled": USE_QUALITY_AGGREGATION_WEIGHTS,
             "quality_score_path": quality_score_summary.get("path"),
             "cluster_data_dirs": MODE_CLUSTER_DIRS,
+            "target_cluster_data_dirs": MODE_TARGET_CLUSTER_DIRS,
             "quality_scores": quality_score_summary,
         }
     )
@@ -540,6 +710,11 @@ def stream_norm_stats():
         "quality_weights_enabled": USE_QUALITY_WEIGHTS,
         "quality_score_path": quality_score_summary.get("path"),
         "quality_score_granularity": QUALITY_SCORE_GRANULARITY,
+        "quality_input_columns": QUALITY_INPUT_COLUMNS if USE_QUALITY_AS_INPUT else [],
+        "quality_input_dim": len(QUALITY_INPUT_COLUMNS) if USE_QUALITY_AS_INPUT else 0,
+        "quality_weight_column": QUALITY_WEIGHT_COLUMN,
+        "cluster_data_dirs": MODE_CLUSTER_DIRS,
+        "target_cluster_data_dirs": MODE_TARGET_CLUSTER_DIRS,
     }
     if COMM_LOG_STREAM:
         _append_stream_comm(
@@ -652,6 +827,12 @@ def stream_next():
 
     values = client_series[series_key]
     timestamps = client_timestamps.get(series_key, [])
+    frequency_delta = client_frequency_deltas.get(series_key)
+    target_lookup = client_target_lookup.get(series_key)
+    if frequency_delta is None:
+        return jsonify({"error": f"Missing inferred frequency for cluster/client/mode: {cluster_id}/{client_id}/{mode}"}), 500
+    if target_lookup is None:
+        return jsonify({"error": f"Missing target series for cluster/client/mode: {cluster_id}/{client_id}/{mode}"}), 500
     split_start, split_end = client_split_bounds[series_key].get(mode, (0, 0))
     if split_end <= split_start:
         return jsonify({"error": f"No windows for mode={mode}"}), 400
@@ -668,9 +849,20 @@ def stream_next():
 
     start_indices = list(range(start_idx, end_idx))
     window_end_indices = [idx + WINDOW_SIZE - 1 for idx in start_indices]
-    target_indices = [idx + WINDOW_SIZE + FORECAST_HORIZON - 1 for idx in start_indices]
     windows = [values[idx : idx + WINDOW_SIZE] for idx in start_indices]
-    targets = [values[target_idx] for target_idx in target_indices]
+    target_timestamps = [
+        _target_timestamp_for_window(timestamps, window_end_idx, frequency_delta)
+        for window_end_idx in window_end_indices
+    ]
+    missing_target_timestamps = [ts for ts in target_timestamps if ts not in target_lookup]
+    if missing_target_timestamps:
+        return jsonify({
+            "error": (
+                f"Missing clean target timestamp(s) for cluster={cluster_id} client={client_id} mode={mode}; "
+                f"first_missing={missing_target_timestamps[0]} count={len(missing_target_timestamps)}"
+            )
+        }), 400
+    targets = [target_lookup[ts] for ts in target_timestamps]
 
     X_batch = torch.stack(windows).unsqueeze(-1).float()
     static_features = client_static_features.get(series_key, torch.empty(0, dtype=torch.float32))
@@ -680,8 +872,14 @@ def stream_next():
     y_batch = torch.stack(targets).float()
 
     quality_records = [_quality_record_for_window(client_id, mode, idx) for idx in start_indices]
-    quality_scores = torch.tensor(
-        [float(record.get("quality_score", QUALITY_SCORE_FALLBACK)) for record in quality_records],
+    quality_input_scores = torch.tensor(
+        [record.get("quality_input_values", [float(record.get("quality_score", QUALITY_SCORE_FALLBACK))]) for record in quality_records],
+        dtype=torch.float32,
+    )
+    if quality_input_scores.dim() == 2 and quality_input_scores.size(1) == 1:
+        quality_input_scores = quality_input_scores.squeeze(1)
+    quality_weight_scores = torch.tensor(
+        [float(record.get("quality_weight_score", record.get("quality_score", QUALITY_SCORE_FALLBACK))) for record in quality_records],
         dtype=torch.float32,
     )
 
@@ -709,18 +907,17 @@ def stream_next():
             else pd.Timestamp(timestamps[idx]).isoformat()
             for idx in window_end_indices
         ],
-        "target_timestamps": [
-            None
-            if idx >= len(timestamps) or pd.isna(timestamps[idx])
-            else pd.Timestamp(timestamps[idx]).isoformat()
-            for idx in target_indices
-        ],
-        "quality_scores": quality_scores,
+        "target_timestamps": [ts.isoformat() for ts in target_timestamps],
+        "quality_scores": quality_input_scores,
+        "quality_weight_scores": quality_weight_scores,
         "quality_score_metadata": {
             "granularity": QUALITY_SCORE_GRANULARITY,
             "match_key": "client_id+mode+window_start_index",
             "match_statuses": [record.get("match_status") for record in quality_records],
             "score_path": quality_score_summary.get("path"),
+            "quality_input_columns": QUALITY_INPUT_COLUMNS if USE_QUALITY_AS_INPUT else [],
+            "quality_input_dim": len(QUALITY_INPUT_COLUMNS) if USE_QUALITY_AS_INPUT else 0,
+            "quality_weight_column": QUALITY_WEIGHT_COLUMN,
             "dimension_completeness": [record.get("dimension_completeness") for record in quality_records],
             "dimension_validity": [record.get("dimension_validity") for record in quality_records],
             "dimension_consistency": [record.get("dimension_consistency") for record in quality_records],
@@ -753,9 +950,9 @@ def stream_next():
                 "x_shape": tensor_shape(X_batch),
                 "y_shape": tensor_shape(y_batch),
                 "payload_shape": f"X={tensor_shape(X_batch)};y={tensor_shape(y_batch)}",
-                "quality_score_mean": float(quality_scores.mean().item()) if quality_scores.numel() else None,
-                "quality_score_min": float(quality_scores.min().item()) if quality_scores.numel() else None,
-                "quality_score_max": float(quality_scores.max().item()) if quality_scores.numel() else None,
+                "quality_score_mean": float(quality_weight_scores.mean().item()) if quality_weight_scores.numel() else None,
+                "quality_score_min": float(quality_weight_scores.min().item()) if quality_weight_scores.numel() else None,
+                "quality_score_max": float(quality_weight_scores.max().item()) if quality_weight_scores.numel() else None,
                 "quality_score_matches": matched_count,
                 "quality_score_fallbacks": fallback_count,
             },

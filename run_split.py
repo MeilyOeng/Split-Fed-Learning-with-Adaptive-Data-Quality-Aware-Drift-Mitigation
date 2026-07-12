@@ -49,6 +49,9 @@ CLUSTER_DATA_DIR = Path("dataset") / "output"
 TRAIN_CLUSTER_DATA_DIR = CLUSTER_DATA_DIR
 VAL_CLUSTER_DATA_DIR = CLUSTER_DATA_DIR
 TEST_CLUSTER_DATA_DIR = CLUSTER_DATA_DIR
+TRAIN_TARGET_CLUSTER_DATA_DIR = TRAIN_CLUSTER_DATA_DIR
+VAL_TARGET_CLUSTER_DATA_DIR = VAL_CLUSTER_DATA_DIR
+TEST_TARGET_CLUSTER_DATA_DIR = TEST_CLUSTER_DATA_DIR
 STREAM_BASE_PORT = 5101
 SERVER_BASE_PORT = 5002
 CLIENT_WORKER_BASE_PORT = 6101
@@ -71,6 +74,7 @@ def configure_output_dirs() -> None:
 def refresh_runtime_settings_from_env() -> None:
     global STREAM_BASE_PORT, SERVER_BASE_PORT, CLIENT_WORKER_BASE_PORT
     global CLUSTER_DATA_DIR, TRAIN_CLUSTER_DATA_DIR, VAL_CLUSTER_DATA_DIR, TEST_CLUSTER_DATA_DIR
+    global TRAIN_TARGET_CLUSTER_DATA_DIR, VAL_TARGET_CLUSTER_DATA_DIR, TEST_TARGET_CLUSTER_DATA_DIR
     STREAM_BASE_PORT = int(os.environ.get("STREAM_BASE_PORT", str(STREAM_BASE_PORT)))
     SERVER_BASE_PORT = int(os.environ.get("SERVER_BASE_PORT", str(SERVER_BASE_PORT)))
     CLIENT_WORKER_BASE_PORT = int(os.environ.get("CLIENT_WORKER_BASE_PORT", str(CLIENT_WORKER_BASE_PORT)))
@@ -78,6 +82,9 @@ def refresh_runtime_settings_from_env() -> None:
     TRAIN_CLUSTER_DATA_DIR = Path(os.environ.get("TRAIN_CLUSTER_DATA_DIR", str(CLUSTER_DATA_DIR)))
     VAL_CLUSTER_DATA_DIR = Path(os.environ.get("VAL_CLUSTER_DATA_DIR", str(CLUSTER_DATA_DIR)))
     TEST_CLUSTER_DATA_DIR = Path(os.environ.get("TEST_CLUSTER_DATA_DIR", str(CLUSTER_DATA_DIR)))
+    TRAIN_TARGET_CLUSTER_DATA_DIR = Path(os.environ.get("TRAIN_TARGET_CLUSTER_DATA_DIR", str(TRAIN_CLUSTER_DATA_DIR)))
+    VAL_TARGET_CLUSTER_DATA_DIR = Path(os.environ.get("VAL_TARGET_CLUSTER_DATA_DIR", str(VAL_CLUSTER_DATA_DIR)))
+    TEST_TARGET_CLUSTER_DATA_DIR = Path(os.environ.get("TEST_TARGET_CLUSTER_DATA_DIR", str(TEST_CLUSTER_DATA_DIR)))
 
 
 def _safe_int(raw: Any) -> Optional[int]:
@@ -150,7 +157,10 @@ def configure_model_input_size(env: dict) -> dict[str, Any]:
     use_static_features = parse_bool(env.get("USE_STATIC_FEATURES", "false"), default=False)
     use_quality_weights = parse_bool(env.get("USE_QUALITY_WEIGHTS", "false"), default=False)
     use_quality_as_input = parse_bool(env.get("USE_QUALITY_AS_INPUT", "false"), default=False)
-    dq_mode = derive_dq_mode(use_quality_weights, use_quality_as_input)
+    use_quality_aggregation_weights = parse_bool(env.get("USE_QUALITY_AGGREGATION_WEIGHTS", "false"), default=False)
+    quality_input_columns = _parse_optional_csv(env.get("QUALITY_INPUT_COLUMNS", "quality_score")) or ["quality_score"]
+    quality_input_dim = len(quality_input_columns)
+    dq_mode = derive_dq_mode(use_quality_weights, use_quality_as_input, use_quality_aggregation_weights)
     requested_static_columns = _parse_optional_csv(env.get("STATIC_FEATURE_COLUMNS"))
     requested_static_groups = _parse_optional_csv(env.get("STATIC_FEATURE_GROUPS"))
 
@@ -162,17 +172,19 @@ def configure_model_input_size(env: dict) -> dict[str, Any]:
         env["BASE_INPUT_SIZE"] = str(base_input_size)
     env["DQ_MODE"] = dq_mode
     env["QUALITY_FEATURE_APPENDED"] = "true" if use_quality_as_input else "false"
+    env["QUALITY_INPUT_DIM"] = str(quality_input_dim if use_quality_as_input else 0)
 
     if auto_model_input_size:
         if base_input_size is None:
             raise ValueError("Unable to determine base input size while AUTO_MODEL_INPUT_SIZE=true")
-        model_input_size = compute_model_input_size(base_input_size, use_quality_as_input)
+        model_input_size = compute_model_input_size(base_input_size, use_quality_as_input, quality_input_dim)
         previous = str(env.get("MODEL_INPUT_SIZE", "1"))
         env["MODEL_INPUT_SIZE"] = str(model_input_size)
         if previous != str(model_input_size):
             log(
                 f"MODEL_INPUT_SIZE overridden from {previous} to {model_input_size} "
-                f"(base_input_size={base_input_size}, use_quality_as_input={use_quality_as_input})"
+                f"(base_input_size={base_input_size}, use_quality_as_input={use_quality_as_input}, "
+                f"quality_input_dim={quality_input_dim})"
             )
     else:
         model_input_size = _safe_int(env.get("MODEL_INPUT_SIZE"))
@@ -182,8 +194,14 @@ def configure_model_input_size(env: dict) -> dict[str, Any]:
             "use_static_features": use_static_features,
             "use_quality_weights": use_quality_weights,
             "use_quality_as_input": use_quality_as_input,
+            "use_quality_aggregation_weights": use_quality_aggregation_weights,
+            "quality_aggregation_mode": str(env.get("QUALITY_AGGREGATION_MODE", "soft_client_gradient")),
+            "quality_aggregation_q_min": float(env.get("QUALITY_AGGREGATION_Q_MIN", "0.5")),
+            "quality_aggregation_eps": float(env.get("QUALITY_AGGREGATION_EPS", "1e-8")),
             "dq_mode": dq_mode,
             "quality_feature_appended": use_quality_as_input,
+            "quality_input_columns": quality_input_columns if use_quality_as_input else [],
+            "quality_input_dim": quality_input_dim if use_quality_as_input else 0,
             "base_input_size": base_input_size,
             "model_input_size": model_input_size,
             "quality_score_path": str(env.get("QUALITY_SCORE_PATH", "")).strip() or None,
@@ -194,8 +212,14 @@ def configure_model_input_size(env: dict) -> dict[str, Any]:
             "use_static_features": use_static_features,
             "use_quality_weights": use_quality_weights,
             "use_quality_as_input": use_quality_as_input,
+            "use_quality_aggregation_weights": use_quality_aggregation_weights,
+            "quality_aggregation_mode": str(env.get("QUALITY_AGGREGATION_MODE", "soft_client_gradient")),
+            "quality_aggregation_q_min": float(env.get("QUALITY_AGGREGATION_Q_MIN", "0.5")),
+            "quality_aggregation_eps": float(env.get("QUALITY_AGGREGATION_EPS", "1e-8")),
             "dq_mode": dq_mode,
             "quality_feature_appended": use_quality_as_input,
+            "quality_input_columns": quality_input_columns if use_quality_as_input else [],
+            "quality_input_dim": quality_input_dim if use_quality_as_input else 0,
             "base_input_size": base_input_size,
             "model_input_size": model_input_size,
             "quality_score_path": str(env.get("QUALITY_SCORE_PATH", "")).strip() or None,
@@ -212,8 +236,14 @@ def configure_model_input_size(env: dict) -> dict[str, Any]:
         "use_static_features": use_static_features,
         "use_quality_weights": use_quality_weights,
         "use_quality_as_input": use_quality_as_input,
+        "use_quality_aggregation_weights": use_quality_aggregation_weights,
+        "quality_aggregation_mode": str(env.get("QUALITY_AGGREGATION_MODE", "soft_client_gradient")),
+        "quality_aggregation_q_min": float(env.get("QUALITY_AGGREGATION_Q_MIN", "0.5")),
+        "quality_aggregation_eps": float(env.get("QUALITY_AGGREGATION_EPS", "1e-8")),
         "dq_mode": dq_mode,
         "quality_feature_appended": use_quality_as_input,
+        "quality_input_columns": quality_input_columns if use_quality_as_input else [],
+        "quality_input_dim": quality_input_dim if use_quality_as_input else 0,
         "base_input_size": base_input_size,
         "model_input_size": model_input_size,
         "quality_score_path": str(env.get("QUALITY_SCORE_PATH", "")).strip() or None,
@@ -314,6 +344,9 @@ def start_stream_service(cluster_id: str, env: dict, cluster_idx: int):
             "TRAIN_CLUSTER_DATA_DIR": str(TRAIN_CLUSTER_DATA_DIR),
             "VAL_CLUSTER_DATA_DIR": str(VAL_CLUSTER_DATA_DIR),
             "TEST_CLUSTER_DATA_DIR": str(TEST_CLUSTER_DATA_DIR),
+            "TRAIN_TARGET_CLUSTER_DATA_DIR": str(TRAIN_TARGET_CLUSTER_DATA_DIR),
+            "VAL_TARGET_CLUSTER_DATA_DIR": str(VAL_TARGET_CLUSTER_DATA_DIR),
+            "TEST_TARGET_CLUSTER_DATA_DIR": str(TEST_TARGET_CLUSTER_DATA_DIR),
             "PROCESS_ROLE": f"stream_cluster_{cluster_idx}",
             "GPU_ENABLED": "false",
         }
@@ -1268,6 +1301,7 @@ def main() -> int:
             "COMM_LOG_EVERY_N_BATCHES": os.environ.get("COMM_LOG_EVERY_N_BATCHES", "1"),
             "SAVE_PROGRESS_EVERY_N_BATCHES": os.environ.get("SAVE_PROGRESS_EVERY_N_BATCHES", "1"),
             "WRITE_COMMUNICATION_LOG": os.environ.get("WRITE_COMMUNICATION_LOG", "true"),
+            "SKIP_TRAINING": os.environ.get("SKIP_TRAINING", "false"),
             "USE_STATIC_FEATURES": os.environ.get("USE_STATIC_FEATURES", "false"),
             "STATIC_FEATURE_COLUMNS": os.environ.get("STATIC_FEATURE_COLUMNS", ""),
             "STATIC_FEATURE_GROUPS": os.environ.get("STATIC_FEATURE_GROUPS", ""),
@@ -1276,9 +1310,18 @@ def main() -> int:
             "TRAIN_CLUSTER_DATA_DIR": os.environ.get("TRAIN_CLUSTER_DATA_DIR", str(TRAIN_CLUSTER_DATA_DIR)),
             "VAL_CLUSTER_DATA_DIR": os.environ.get("VAL_CLUSTER_DATA_DIR", str(VAL_CLUSTER_DATA_DIR)),
             "TEST_CLUSTER_DATA_DIR": os.environ.get("TEST_CLUSTER_DATA_DIR", str(TEST_CLUSTER_DATA_DIR)),
+            "TRAIN_TARGET_CLUSTER_DATA_DIR": os.environ.get("TRAIN_TARGET_CLUSTER_DATA_DIR", str(TRAIN_TARGET_CLUSTER_DATA_DIR)),
+            "VAL_TARGET_CLUSTER_DATA_DIR": os.environ.get("VAL_TARGET_CLUSTER_DATA_DIR", str(VAL_TARGET_CLUSTER_DATA_DIR)),
+            "TEST_TARGET_CLUSTER_DATA_DIR": os.environ.get("TEST_TARGET_CLUSTER_DATA_DIR", str(TEST_TARGET_CLUSTER_DATA_DIR)),
             "USE_QUALITY_WEIGHTS": os.environ.get("USE_QUALITY_WEIGHTS", "false"),
             "USE_QUALITY_AS_INPUT": os.environ.get("USE_QUALITY_AS_INPUT", "false"),
+            "USE_QUALITY_AGGREGATION_WEIGHTS": os.environ.get("USE_QUALITY_AGGREGATION_WEIGHTS", "false"),
+            "QUALITY_AGGREGATION_MODE": os.environ.get("QUALITY_AGGREGATION_MODE", "soft_client_gradient"),
+            "QUALITY_AGGREGATION_Q_MIN": os.environ.get("QUALITY_AGGREGATION_Q_MIN", "0.5"),
+            "QUALITY_AGGREGATION_EPS": os.environ.get("QUALITY_AGGREGATION_EPS", "1e-8"),
             "QUALITY_SCORE_PATH": os.environ.get("QUALITY_SCORE_PATH", ""),
+            "QUALITY_INPUT_COLUMNS": os.environ.get("QUALITY_INPUT_COLUMNS", "quality_score"),
+            "QUALITY_WEIGHT_COLUMN": os.environ.get("QUALITY_WEIGHT_COLUMN", "quality_score"),
             "QUALITY_SCORE_GRANULARITY": os.environ.get("QUALITY_SCORE_GRANULARITY", "window"),
             "STRICT_QUALITY_SCORE_MATCHING": os.environ.get("STRICT_QUALITY_SCORE_MATCHING", "true"),
             "QUALITY_SCORE_FALLBACK": os.environ.get("QUALITY_SCORE_FALLBACK", "1.0"),
@@ -1309,6 +1352,9 @@ def main() -> int:
     log(f"Train cluster data directory: {TRAIN_CLUSTER_DATA_DIR}")
     log(f"Val cluster data directory: {VAL_CLUSTER_DATA_DIR}")
     log(f"Test cluster data directory: {TEST_CLUSTER_DATA_DIR}")
+    log(f"Train target cluster data directory: {TRAIN_TARGET_CLUSTER_DATA_DIR}")
+    log(f"Val target cluster data directory: {VAL_TARGET_CLUSTER_DATA_DIR}")
+    log(f"Test target cluster data directory: {TEST_TARGET_CLUSTER_DATA_DIR}")
     log(f"Model layers: {env['MODEL_NUM_LAYERS']}, split at: {env['MODEL_SPLIT_LAYER']}")
     log(f"Window size: {env['WINDOW_SIZE']} horizon: {env['FORECAST_HORIZON']} batch_size: {env['BATCH_SIZE']}")
     log(f"Train/Val/Test ratios: {env['TRAIN_RATIO']}/{env['VAL_RATIO']}/{env['TEST_RATIO']}")
@@ -1320,7 +1366,14 @@ def main() -> int:
     log(f"DQ mode: {quality_runtime['dq_mode']}")
     log(f"Quality weights enabled: {quality_runtime['use_quality_weights']}")
     log(f"Quality-as-input enabled: {quality_runtime['use_quality_as_input']}")
+    log(f"Quality aggregation weights enabled: {quality_runtime['use_quality_aggregation_weights']}")
+    log(f"Quality aggregation mode: {quality_runtime['quality_aggregation_mode']}")
+    log(f"Quality aggregation q_min: {quality_runtime['quality_aggregation_q_min']}")
+    log(f"Quality aggregation eps: {quality_runtime['quality_aggregation_eps']}")
     log(f"Quality score path: {quality_runtime['quality_score_path'] or '<disabled>'}")
+    log(f"Quality input columns: {quality_runtime.get('quality_input_columns', [])}")
+    log(f"Quality input dim: {quality_runtime.get('quality_input_dim', 0)}")
+    log(f"Quality weight column: {env['QUALITY_WEIGHT_COLUMN']}")
     log(f"Quality score granularity: {env['QUALITY_SCORE_GRANULARITY']}")
     log(f"Strict quality score matching: {env['STRICT_QUALITY_SCORE_MATCHING']}")
     if quality_runtime.get("base_input_size") is not None:
@@ -1333,6 +1386,7 @@ def main() -> int:
     )
     log(f"Progress persistence every_n_batches={env['SAVE_PROGRESS_EVERY_N_BATCHES']}")
     log(f"Write aggregated communication_log.csv={env['WRITE_COMMUNICATION_LOG']}")
+    log(f"Skip training: {env['SKIP_TRAINING']}")
     log(f"Cluster parallel local epochs: {parse_bool(env.get('RUN_CLUSTERS_IN_PARALLEL'), default=True) and len(cluster_ids) > 1}")
     log(
         f"Local epochs per global FedAvg round: {max(1, int(env['LOCAL_EPOCHS_PER_GLOBAL_ROUND']))} "
@@ -1363,11 +1417,15 @@ def main() -> int:
                 status = get_json(f"http://localhost:{worker_port}/status", timeout=20)
                 log(f"[worker_ready] cluster={cluster_id} client={client_id} port={worker_port} status={status}")
 
-        train_durations = run_training_schedule_with_fedavg(cluster_ids, cluster_clients, env)
+        train_durations = defaultdict(float)
+        if parse_bool(env.get("SKIP_TRAINING"), default=False):
+            log("[TRAIN] skipped; using existing checkpoints for test evaluation")
+        else:
+            train_durations = run_training_schedule_with_fedavg(cluster_ids, cluster_clients, env)
 
-        for cluster_idx, cluster_id in enumerate(cluster_ids):
-            post_json(f"http://localhost:{SERVER_BASE_PORT + cluster_idx}/save_final_checkpoint", {}, timeout=30)
-        ensure_final_client_checkpoints(cluster_ids, cluster_clients)
+            for cluster_idx, cluster_id in enumerate(cluster_ids):
+                post_json(f"http://localhost:{SERVER_BASE_PORT + cluster_idx}/save_final_checkpoint", {}, timeout=30)
+            ensure_final_client_checkpoints(cluster_ids, cluster_clients)
 
         test_durations = defaultdict(float)
         for cluster_idx, cluster_id in enumerate(cluster_ids):

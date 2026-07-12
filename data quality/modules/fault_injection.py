@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Sequence
@@ -56,6 +57,13 @@ class FaultEvent:
     cluster_id: str | None = None
     scope: str = "client"
     shared_timestamp_event: bool = False
+    window_start: Any = None
+    window_end: Any = None
+    window_start_index: int | None = None
+    window_end_index: int | None = None
+    affected_positions: str | None = None
+    affected_timestamps: str | None = None
+    seed: int | None = None
 
 
 def _sample_positions(
@@ -193,6 +201,7 @@ class WideDemandFaultInjector:
 
     def __init__(self, config: Optional[dict] = None):
         self.config = config or {}
+        self.last_controlled_window_summary_df = pd.DataFrame()
 
     def inject(
         self,
@@ -206,12 +215,26 @@ class WideDemandFaultInjector:
         frame[_ORIG_ROW_ID_COL] = np.arange(len(frame), dtype=int)
         frame[_IS_DUPLICATE_COL] = False
         ts_col = dataset.timestamp_col
-        client_cols = self._select_clients(dataset.client_cols, rng)
+        all_dataset_clients = list(map(str, dataset.client_cols))
+        client_cols = all_dataset_clients if self.config.get("fault_mode") == "controlled_window" else self._select_clients(dataset.client_cols, rng)
         for client_id in dataset.client_cols:
             frame[client_id] = pd.to_numeric(frame[client_id], errors="coerce").astype(float)
         original_frame = frame.copy(deep=True)
         n_rows = len(frame)
         timestamps = frame[ts_col].reset_index(drop=True)
+
+        if self.config.get("fault_mode") == "controlled_window":
+            return self._inject_controlled_window_mode(
+                frame=frame,
+                original_frame=original_frame,
+                client_cols=client_cols,
+                all_client_cols=all_dataset_clients,
+                ts_col=ts_col,
+                timestamps=timestamps,
+                seed=seed,
+                rng=rng,
+                cluster_assignment_path=cluster_assignment_path,
+            )
 
         if self.config.get("fault_fraction") is not None:
             return self._inject_simple_fraction_mode(
@@ -431,6 +454,699 @@ class WideDemandFaultInjector:
             ts_col=ts_col,
             events=events,
         )
+
+
+    def _inject_controlled_window_mode(
+        self,
+        frame: pd.DataFrame,
+        original_frame: pd.DataFrame,
+        client_cols: Sequence[str],
+        all_client_cols: Sequence[str],
+        ts_col: str,
+        timestamps: pd.Series,
+        seed: int,
+        rng: np.random.Generator,
+        cluster_assignment_path: Optional[Path | str] = None,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        _ = rng
+        cfg = self._validate_controlled_window_config()
+        self.last_controlled_window_summary_df = pd.DataFrame()
+        self.last_controlled_selected_clients_df = pd.DataFrame()
+        self._controlled_window_warnings: list[str] = []
+
+        cluster_assignment_cfg = dict(self.config.get("cluster_assignment", {}) or {})
+        cluster_assignment_map: dict[str, str] = {}
+        resolved_assignment_path = cluster_assignment_path or cluster_assignment_cfg.get("path")
+        if resolved_assignment_path is not None:
+            if Path(resolved_assignment_path).exists():
+                cluster_assignment_map = _load_cluster_assignment_map(
+                    resolved_assignment_path,
+                    client_id_column=str(cluster_assignment_cfg.get("client_id_column", "ID")),
+                    cluster_id_column=str(cluster_assignment_cfg.get("cluster_id_column", "Cluster")),
+                )
+            else:
+                warnings.warn(
+                    "Controlled-window mode did not find a cluster assignment CSV at "
+                    f"{resolved_assignment_path}; continuing without cluster_id metadata.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+        client_selection_cfg = dict(self.config.get("clients", {}) or {})
+        require_assignment = str(client_selection_cfg.get("selection_mode", "explicit" if client_selection_cfg.get("selected") else "all")).strip().lower() == "per_cluster_random"
+        client_cols, selected_clients_df, selection_metadata = self._build_controlled_client_selection(
+            all_client_cols,
+            cluster_assignment_map,
+            seed,
+            require_cluster_assignment=require_assignment,
+        )
+        self.last_controlled_selected_clients_df = selected_clients_df
+
+        events: list[FaultEvent] = []
+        summary_rows: list[dict[str, Any]] = []
+        n_rows = len(frame)
+        dimensions = list(cfg["dimension_window_fractions"].keys())
+
+        for client_id in client_cols:
+            cluster_id = cluster_assignment_map.get(str(client_id))
+            windows = self._build_controlled_windows(n_rows, cfg["window_size"], cfg["stride"])
+            allocations = self._allocate_controlled_windows(
+                n_windows=len(windows),
+                dimension_fractions=cfg["dimension_window_fractions"],
+                total_fraction=cfg["total_faulty_window_fraction"],
+                client_id=str(client_id),
+                cluster_id=cluster_id,
+            )
+            client_rng = np.random.default_rng(self._controlled_client_seed(seed, cluster_id, str(client_id)))
+            window_order = client_rng.permutation(len(windows)) if windows else np.array([], dtype=int)
+            initial_values = pd.to_numeric(frame[str(client_id)], errors="coerce").to_numpy(dtype=float, copy=True)
+            finite_values = initial_values[np.isfinite(initial_values)]
+            client_scale = _series_scale(initial_values)
+            client_abs_q99 = float(np.nanquantile(np.abs(finite_values), 0.99)) if finite_values.size else 1.0
+            client_stats = {
+                "scale": float(client_scale),
+                "upper_anchor": float(max(client_abs_q99, client_scale, 1.0)),
+            }
+            cursor = 0
+            dimension_event_counts = {dimension: 0 for dimension in dimensions}
+            selected_window_count = 0
+
+            for dimension in dimensions:
+                count = int(allocations.get(dimension, 0))
+                if count <= 0:
+                    continue
+                chosen_window_ids = window_order[cursor: cursor + count]
+                cursor += count
+                for window_id in chosen_window_ids:
+                    start_idx, end_idx = windows[int(window_id)]
+                    applied = self._apply_controlled_window_dimension(
+                        frame=frame,
+                        client_id=str(client_id),
+                        dimension=dimension,
+                        window_start_idx=start_idx,
+                        window_end_idx=end_idx,
+                        timestamps=timestamps,
+                        seed=seed,
+                        rng=client_rng,
+                        cluster_id=cluster_id,
+                        cfg=cfg,
+                        client_stats=client_stats,
+                        events=events,
+                    )
+                    if applied <= 0:
+                        raise RuntimeError(
+                            "Controlled-window injection selected a window but did not inject any fault: "
+                            f"client={client_id}, cluster={cluster_id}, dimension={dimension}, "
+                            f"window=({start_idx}, {end_idx})."
+                        )
+                    selected_window_count += 1
+                    dimension_event_counts[dimension] += applied
+
+            row = {
+                **selection_metadata,
+                "client_id": str(client_id),
+                "cluster_id": cluster_id,
+                "number_of_windows": int(len(windows)),
+                "selected_faulty_windows": int(selected_window_count),
+                "achieved_faulty_fraction": float(selected_window_count / max(1, len(windows))),
+            }
+            for dimension in dimensions:
+                row[f"windows_allocated_{dimension}"] = int(allocations.get(dimension, 0))
+                row[f"fault_count_{dimension}"] = int(dimension_event_counts.get(dimension, 0))
+            summary_rows.append(row)
+
+        summary_df = pd.DataFrame(summary_rows)
+        if not summary_df.empty:
+            if summary_df["cluster_id"].notna().any():
+                cluster_counts = (
+                    summary_df.groupby("cluster_id", dropna=False)["selected_faulty_windows"]
+                    .sum()
+                    .rename("fault_count_cluster")
+                    .reset_index()
+                )
+                summary_df = summary_df.merge(cluster_counts, on="cluster_id", how="left")
+                selected_counts = (
+                    summary_df.groupby("cluster_id", dropna=False)["client_id"]
+                    .nunique()
+                    .rename("cluster_selected_client_count")
+                    .reset_index()
+                )
+                summary_df = summary_df.merge(selected_counts, on="cluster_id", how="left")
+            else:
+                summary_df["fault_count_cluster"] = int(summary_df["selected_faulty_windows"].sum())
+                summary_df["cluster_selected_client_count"] = int(summary_df["client_id"].nunique())
+        if self._controlled_window_warnings:
+            warning_text = "\n".join(self._controlled_window_warnings)
+            warnings.warn(warning_text, RuntimeWarning, stacklevel=2)
+            if not summary_df.empty:
+                summary_df["warnings"] = " | ".join(self._controlled_window_warnings)
+        self.last_controlled_window_summary_df = summary_df
+
+        return self._finalize_output(
+            frame=frame,
+            original_frame=original_frame,
+            client_cols=all_client_cols,
+            ts_col=ts_col,
+            events=events,
+        )
+
+    def _validate_controlled_window_config(self) -> dict[str, Any]:
+        window_cfg = dict(self.config.get("window_faulting", {}) or {})
+        window_size = int(window_cfg.get("window_size", 24))
+        stride = int(window_cfg.get("stride", 1))
+        total_fraction = float(window_cfg.get("total_faulty_window_fraction", 0.0))
+        dimension_fractions = dict(window_cfg.get("dimension_window_fractions", {}) or {})
+        if window_size <= 0:
+            raise ValueError("window_faulting.window_size must be a positive integer.")
+        if stride <= 0:
+            raise ValueError("window_faulting.stride must be a positive integer.")
+        if not (0.0 <= total_fraction <= 1.0):
+            raise ValueError("window_faulting.total_faulty_window_fraction must be between 0 and 1.")
+        if not dimension_fractions:
+            raise ValueError("window_faulting.dimension_window_fractions must configure at least one dimension.")
+
+        allowed_dimensions = {"completeness", "consistency", "accuracy", "validity", "mixed"}
+        cleaned: dict[str, float] = {}
+        for dimension, raw_fraction in dimension_fractions.items():
+            dimension = str(dimension)
+            if dimension not in allowed_dimensions:
+                raise ValueError(
+                    "window_faulting.dimension_window_fractions contains an unsupported dimension: "
+                    f"{dimension}. Supported dimensions are {sorted(allowed_dimensions)}."
+                )
+            fraction = float(raw_fraction)
+            if fraction < 0:
+                raise ValueError("window_faulting.dimension_window_fractions must be non-negative.")
+            if fraction > 0:
+                cleaned[dimension] = fraction
+        fraction_sum = float(sum(cleaned.values()))
+        if abs(fraction_sum - total_fraction) > 1e-9:
+            raise ValueError(
+                "Sum of window_faulting.dimension_window_fractions must equal "
+                "window_faulting.total_faulty_window_fraction. "
+                f"Got sum={fraction_sum:.12g}, total={total_fraction:.12g}."
+            )
+
+        min_faults = int(window_cfg.get("min_faults_per_faulty_window", 1))
+        max_faults = int(window_cfg.get("max_faults_per_faulty_window", 2))
+        multi_fault_probability = float(window_cfg.get("multi_fault_probability", 0.15))
+        if min_faults <= 0:
+            raise ValueError("window_faulting.min_faults_per_faulty_window must be positive.")
+        if max_faults < min_faults:
+            raise ValueError("window_faulting.max_faults_per_faulty_window must be >= min_faults_per_faulty_window.")
+        if not (0.0 <= multi_fault_probability <= 1.0):
+            raise ValueError("window_faulting.multi_fault_probability must be between 0 and 1.")
+        sampling_scope = str(window_cfg.get("sampling_scope", "per_cluster_per_client"))
+        if sampling_scope != "per_cluster_per_client":
+            raise ValueError("controlled_window currently supports sampling_scope=per_cluster_per_client only.")
+
+        return {
+            "window_size": window_size,
+            "stride": stride,
+            "total_faulty_window_fraction": total_fraction,
+            "dimension_window_fractions": cleaned,
+            "min_faults_per_faulty_window": min_faults,
+            "max_faults_per_faulty_window": max_faults,
+            "multi_fault_probability": multi_fault_probability,
+        }
+
+    def _build_controlled_windows(self, n_rows: int, window_size: int, stride: int) -> list[tuple[int, int]]:
+        if n_rows < window_size:
+            return []
+        return [
+            (int(start), int(start + window_size - 1))
+            for start in range(0, n_rows - window_size + 1, stride)
+        ]
+
+    def _allocate_controlled_windows(
+        self,
+        n_windows: int,
+        dimension_fractions: dict[str, float],
+        total_fraction: float,
+        client_id: str,
+        cluster_id: Optional[str],
+    ) -> dict[str, int]:
+        dimensions = list(dimension_fractions.keys())
+        allocations = {dimension: 0 for dimension in dimensions}
+        if n_windows <= 0 or total_fraction <= 0:
+            if n_windows <= 0:
+                self._controlled_window_warnings.append(
+                    f"client={client_id}, cluster={cluster_id}: no windows available for controlled injection."
+                )
+            return allocations
+
+        target_total = int(round(n_windows * total_fraction))
+        target_total = max(1, min(n_windows, target_total))
+        exact = {dimension: n_windows * fraction for dimension, fraction in dimension_fractions.items()}
+        floors = {dimension: int(np.floor(value)) for dimension, value in exact.items()}
+        allocations.update(floors)
+        allocated = int(sum(allocations.values()))
+
+        remainders = sorted(
+            dimensions,
+            key=lambda dim: (-(exact[dim] - floors[dim]), dim),
+        )
+        while allocated < target_total:
+            for dimension in remainders:
+                if allocated >= target_total:
+                    break
+                allocations[dimension] += 1
+                allocated += 1
+        while allocated > target_total:
+            removable = sorted(
+                [dim for dim in dimensions if allocations[dim] > 0],
+                key=lambda dim: (exact[dim] - allocations[dim], dim),
+            )
+            if not removable:
+                break
+            allocations[removable[0]] -= 1
+            allocated -= 1
+
+        positive_dimensions = [dim for dim, fraction in dimension_fractions.items() if fraction > 0]
+        if target_total >= len(positive_dimensions):
+            missing = [dim for dim in positive_dimensions if allocations[dim] == 0]
+            for dimension in missing:
+                donor_candidates = sorted(
+                    [dim for dim in positive_dimensions if allocations[dim] > 1],
+                    key=lambda dim: (-allocations[dim], dim),
+                )
+                if not donor_candidates:
+                    break
+                donor = donor_candidates[0]
+                allocations[donor] -= 1
+                allocations[dimension] += 1
+        elif positive_dimensions:
+            self._controlled_window_warnings.append(
+                f"client={client_id}, cluster={cluster_id}: only {target_total} faulty windows can be allocated "
+                f"across {len(positive_dimensions)} configured dimensions; exact per-dimension coverage is impossible."
+            )
+
+        achieved = int(sum(allocations.values()))
+        if achieved != target_total:
+            self._controlled_window_warnings.append(
+                f"client={client_id}, cluster={cluster_id}: requested {target_total} faulty windows, "
+                f"allocated {achieved} after deterministic rounding."
+            )
+        return allocations
+
+    def _controlled_client_seed(self, seed: int, cluster_id: Optional[str], client_id: str) -> int:
+        text = f"{seed}|{cluster_id or ''}|{client_id}"
+        value = 2166136261
+        for byte in text.encode("utf-8"):
+            value ^= byte
+            value = (value * 16777619) % (2 ** 32)
+        return int(value)
+
+    def _apply_controlled_window_dimension(
+        self,
+        frame: pd.DataFrame,
+        client_id: str,
+        dimension: str,
+        window_start_idx: int,
+        window_end_idx: int,
+        timestamps: pd.Series,
+        seed: int,
+        rng: np.random.Generator,
+        cluster_id: Optional[str],
+        cfg: dict[str, Any],
+        client_stats: dict[str, float],
+        events: list[FaultEvent],
+    ) -> int:
+        if dimension == "mixed":
+            dimensions = ["completeness", "consistency", "accuracy", "validity"]
+            chosen = list(rng.choice(np.asarray(dimensions, dtype=object), size=2, replace=False))
+            applied = 0
+            for sub_dimension in chosen:
+                applied += self._apply_controlled_window_dimension(
+                    frame=frame,
+                    client_id=client_id,
+                    dimension=str(sub_dimension),
+                    window_start_idx=window_start_idx,
+                    window_end_idx=window_end_idx,
+                    timestamps=timestamps,
+                    seed=seed,
+                    rng=rng,
+                    cluster_id=cluster_id,
+                    cfg=cfg,
+                    client_stats=client_stats,
+                    events=events,
+                )
+            return applied
+
+        extra_faults = 0
+        if cfg["max_faults_per_faulty_window"] > 1 and rng.random() < cfg["multi_fault_probability"]:
+            extra_faults = min(1, cfg["max_faults_per_faulty_window"] - 1)
+        attempts = max(cfg["min_faults_per_faulty_window"], 1) + extra_faults
+        applied = 0
+        for _ in range(attempts):
+            event = self._apply_single_controlled_fault(
+                frame=frame,
+                client_id=client_id,
+                dimension=dimension,
+                window_start_idx=window_start_idx,
+                window_end_idx=window_end_idx,
+                timestamps=timestamps,
+                seed=seed,
+                rng=rng,
+                cluster_id=cluster_id,
+                client_stats=client_stats,
+            )
+            if event is not None:
+                events.append(event)
+                applied += 1
+        return applied
+
+    def _window_valid_positions(
+        self,
+        frame: pd.DataFrame,
+        client_id: str,
+        start_idx: int,
+        end_idx: int,
+    ) -> np.ndarray:
+        idxs = np.arange(start_idx, end_idx + 1, dtype=int)
+        values = pd.to_numeric(frame.loc[idxs, client_id], errors="coerce").to_numpy(dtype=float)
+        return idxs[np.isfinite(values)]
+
+    def _choose_window_positions(
+        self,
+        valid_positions: np.ndarray,
+        rng: np.random.Generator,
+        min_count: int = 1,
+        max_count: int = 1,
+    ) -> np.ndarray:
+        if valid_positions.size == 0:
+            return np.array([], dtype=int)
+        max_count = max(min_count, max_count)
+        count = int(rng.integers(min_count, max_count + 1))
+        count = min(count, valid_positions.size)
+        return np.sort(rng.choice(valid_positions, size=count, replace=False))
+
+    def _apply_single_controlled_fault(
+        self,
+        frame: pd.DataFrame,
+        client_id: str,
+        dimension: str,
+        window_start_idx: int,
+        window_end_idx: int,
+        timestamps: pd.Series,
+        seed: int,
+        rng: np.random.Generator,
+        cluster_id: Optional[str],
+        client_stats: dict[str, float],
+    ) -> Optional[FaultEvent]:
+        n_rows = len(frame)
+        valid_positions = self._window_valid_positions(frame, client_id, window_start_idx, window_end_idx)
+        window_positions = np.arange(window_start_idx, window_end_idx + 1, dtype=int)
+        candidate_positions = valid_positions if valid_positions.size else window_positions
+        if candidate_positions.size == 0:
+            return None
+        scale = float(client_stats.get("scale", 1.0))
+        upper_anchor = float(client_stats.get("upper_anchor", max(scale, 1.0)))
+        max_cells = min(3, max(1, window_end_idx - window_start_idx + 1))
+        idxs = self._choose_window_positions(candidate_positions, rng, 1, max_cells)
+        if idxs.size == 0:
+            return None
+
+        if dimension == "completeness":
+            completeness_cfg = _resolve_fault_config(self.config, "completeness")
+            fault_type = "controlled_random_missing"
+            subcheck = "C1"
+            frame.loc[idxs, client_id] = np.nan
+            parameters = {
+                "mode": "controlled_window",
+                "source_dimension": dimension,
+                "severity_config": {
+                    "random_missing_rate": completeness_cfg.get("random_missing_rate"),
+                    "block_missing": completeness_cfg.get("block_missing"),
+                },
+            }
+        elif dimension == "validity":
+            validity_cfg = _resolve_fault_config(self.config, "validity")
+            fault_type = str(rng.choice(np.asarray(["controlled_negative_values", "controlled_impossible_high"], dtype=object)))
+            subcheck = "V3"
+            if fault_type == "controlled_negative_values":
+                current = pd.to_numeric(frame.loc[idxs, client_id], errors="coerce").to_numpy(dtype=float)
+                current = np.nan_to_num(current, nan=0.0)
+                base = np.maximum(np.abs(current), 1.0)
+                frame.loc[idxs, client_id] = -base
+            else:
+                high_multiplier = float(validity_cfg.get("high_multiplier", 3.0))
+                frame.loc[idxs, client_id] = upper_anchor * high_multiplier
+            parameters = {
+                "mode": "controlled_window",
+                "source_dimension": dimension,
+                "high_multiplier": float(validity_cfg.get("high_multiplier", 3.0)),
+            }
+        elif dimension == "consistency":
+            consistency_cfg = _resolve_fault_config(self.config, "consistency")
+            fault_type = str(rng.choice(np.asarray(["controlled_stale_values", "controlled_rate_jumps", "controlled_stuck_constant"], dtype=object)))
+            if fault_type == "controlled_stale_values":
+                subcheck = "CS4"
+                lag_choices = np.asarray(consistency_cfg.get("lag_choices", [1]), dtype=int)
+                lag_choices = lag_choices[lag_choices != 0]
+                if lag_choices.size == 0:
+                    lag_choices = np.array([1], dtype=int)
+                lag = int(rng.choice(lag_choices))
+                source_positions = np.clip(idxs - lag, 0, n_rows - 1)
+                source_values = pd.to_numeric(frame.loc[source_positions, client_id], errors="coerce").to_numpy(dtype=float)
+                frame.loc[idxs, client_id] = np.nan_to_num(source_values, nan=0.0)
+                parameters = {"mode": "controlled_window", "source_dimension": dimension, "lag": lag}
+            elif fault_type == "controlled_rate_jumps":
+                subcheck = "CS5"
+                jump_multiplier = float(consistency_cfg.get("jump_multiplier", 6.0))
+                previous = pd.to_numeric(frame.loc[np.maximum(idxs - 1, 0), client_id], errors="coerce").to_numpy(dtype=float)
+                previous = np.nan_to_num(previous, nan=0.0)
+                signs = rng.choice(np.asarray([-1.0, 1.0]), size=idxs.size)
+                frame.loc[idxs, client_id] = np.maximum(0.0, previous + signs * jump_multiplier * scale)
+                parameters = {"mode": "controlled_window", "source_dimension": dimension, "jump_multiplier": jump_multiplier}
+            else:
+                subcheck = "CS4"
+                constant = float(pd.to_numeric(frame.loc[[int(idxs[0])], client_id], errors="coerce").iloc[0])
+                if not np.isfinite(constant):
+                    constant = 0.0
+                frame.loc[idxs, client_id] = constant
+                parameters = {"mode": "controlled_window", "source_dimension": dimension}
+        elif dimension == "accuracy":
+            accuracy_cfg = _resolve_fault_config(self.config, "accuracy")
+            fault_type = str(rng.choice(np.asarray(["controlled_spikes", "controlled_noisy_values"], dtype=object)))
+            current = pd.to_numeric(frame.loc[idxs, client_id], errors="coerce").to_numpy(dtype=float)
+            current = np.nan_to_num(current, nan=0.0)
+            if fault_type == "controlled_spikes":
+                subcheck = "A1"
+                spike_multiplier = float(accuracy_cfg.get("spike_multiplier", 4.0))
+                frame.loc[idxs, client_id] = current + spike_multiplier * scale
+                parameters = {"mode": "controlled_window", "source_dimension": dimension, "spike_multiplier": spike_multiplier}
+            else:
+                subcheck = "A3"
+                noise_std_fraction = float(accuracy_cfg.get("noise_std_fraction", 0.05))
+                noise = rng.normal(loc=0.0, scale=max(scale * noise_std_fraction, 1e-6), size=idxs.size)
+                frame.loc[idxs, client_id] = current + noise
+                parameters = {"mode": "controlled_window", "source_dimension": dimension, "noise_std_fraction": noise_std_fraction}
+        else:
+            raise ValueError(f"Unsupported controlled-window dimension: {dimension}")
+
+        return self._make_event(
+            client_id=client_id,
+            fault_type=fault_type,
+            dimension=dimension,
+            subcheck=subcheck,
+            idxs=idxs,
+            timestamps=timestamps,
+            n_rows=n_rows,
+            parameters=parameters,
+            cluster_id=cluster_id,
+            scope="controlled_window",
+            window_start_index=window_start_idx,
+            window_end_index=window_end_idx,
+            seed=seed,
+        )
+
+
+    def _controlled_selection_seed(self, seed: int, *parts: Any) -> int:
+        text = "|".join([str(seed), *[str(part) for part in parts]])
+        value = 2166136261
+        for byte in text.encode("utf-8"):
+            value ^= byte
+            value = (value * 16777619) % (2 ** 32)
+        return int(value)
+
+    def _controlled_client_order(self, clients: Sequence[str], seed: int, *parts: Any) -> list[str]:
+        ordered = sorted(map(str, clients))
+        if not ordered:
+            return []
+        rng = np.random.default_rng(self._controlled_selection_seed(seed, *parts))
+        order = rng.permutation(len(ordered))
+        return [ordered[int(idx)] for idx in order]
+
+    def _controlled_selection_count(
+        self,
+        *,
+        available_count: int,
+        client_cfg: dict,
+        per_cluster: bool,
+    ) -> int:
+        if available_count <= 0:
+            return 0
+        random_count = client_cfg.get("random_count")
+        random_fraction = client_cfg.get("random_fraction")
+        min_key = "min_count_per_cluster" if per_cluster else "min_count"
+        min_count = max(0, int(client_cfg.get(min_key, client_cfg.get("min_count_per_cluster", 0 if random_fraction in (None, 0, 0.0) else 1))))
+        if random_count is not None:
+            count = int(random_count)
+        elif random_fraction is not None:
+            fraction = float(random_fraction)
+            if not (0.0 <= fraction <= 1.0):
+                raise ValueError("clients.random_fraction must be within [0, 1].")
+            rounding = str(client_cfg.get("rounding", "round")).strip().lower()
+            exact = available_count * fraction
+            if rounding == "floor":
+                count = int(np.floor(exact))
+            elif rounding == "ceil":
+                count = int(np.ceil(exact))
+            elif rounding == "round":
+                count = int(round(exact))
+            else:
+                raise ValueError("clients.rounding must be one of: round, floor, ceil.")
+            if fraction > 0:
+                count = max(min_count, count)
+        else:
+            count = available_count
+        return max(0, min(available_count, count))
+
+    def _build_controlled_client_selection(
+        self,
+        all_clients: Sequence[str],
+        cluster_assignment_map: dict[str, str],
+        seed: int,
+        *,
+        require_cluster_assignment: bool,
+    ) -> tuple[list[str], pd.DataFrame, dict[str, Any]]:
+        client_cfg = dict(self.config.get("clients", {}) or {})
+        selection_mode = str(client_cfg.get("selection_mode", "explicit" if client_cfg.get("selected") else "all")).strip().lower()
+        include_unassigned = bool(client_cfg.get("include_unassigned", False))
+        all_client_set = {str(client) for client in all_clients}
+        selected_raw = _normalize_identifier_list(client_cfg.get("selected", self.config.get("selected_clients")))
+
+        assigned_clients = sorted(client for client in all_client_set if client in cluster_assignment_map)
+        unassigned_clients = sorted(all_client_set - set(assigned_clients))
+        if require_cluster_assignment and selection_mode == "per_cluster_random" and not cluster_assignment_map:
+            raise ValueError("clients.selection_mode=per_cluster_random requires a cluster assignment CSV.")
+
+        eligible_clients = sorted(all_client_set if include_unassigned or not cluster_assignment_map else set(assigned_clients))
+        if selection_mode == "all":
+            selected_clients = eligible_clients
+            selection_rows = []
+            for rank, client_id in enumerate(selected_clients, start=1):
+                selection_rows.append({
+                    "cluster_id": cluster_assignment_map.get(client_id),
+                    "client_id": client_id,
+                    "selection_mode": selection_mode,
+                    "selection_rank": rank,
+                    "selected": True,
+                    "selected_for_1_client": True,
+                    "selected_for_20": True,
+                    "selected_for_40": True,
+                    "selected_for_100": True,
+                    "seed": int(seed),
+                })
+        elif selection_mode == "explicit":
+            selected_clients = [client for client in selected_raw if client in all_client_set]
+            missing = sorted(set(selected_raw) - all_client_set)
+            if missing:
+                self._controlled_window_warnings.append(
+                    "Explicit controlled clients missing from dataset columns: " + ",".join(missing[:20])
+                )
+            selection_rows = []
+            for rank, client_id in enumerate(selected_clients, start=1):
+                selection_rows.append({
+                    "cluster_id": cluster_assignment_map.get(client_id),
+                    "client_id": client_id,
+                    "selection_mode": selection_mode,
+                    "selection_rank": rank,
+                    "selected": True,
+                    "selected_for_1_client": rank <= 1,
+                    "selected_for_20": True,
+                    "selected_for_40": True,
+                    "selected_for_100": True,
+                    "seed": int(seed),
+                })
+        elif selection_mode == "global_random":
+            ordered = self._controlled_client_order(eligible_clients, seed, "global")
+            count = self._controlled_selection_count(available_count=len(ordered), client_cfg=client_cfg, per_cluster=False)
+            selected_set = set(ordered[:count])
+            selected_clients = sorted(selected_set)
+            selection_rows = []
+            for rank, client_id in enumerate(ordered, start=1):
+                selection_rows.append({
+                    "cluster_id": cluster_assignment_map.get(client_id),
+                    "client_id": client_id,
+                    "selection_mode": selection_mode,
+                    "selection_rank": rank,
+                    "selected": client_id in selected_set,
+                    "selected_for_1_client": rank <= 1,
+                    "selected_for_20": rank <= self._controlled_selection_count(available_count=len(ordered), client_cfg={**client_cfg, "random_fraction": 0.20, "random_count": None}, per_cluster=False),
+                    "selected_for_40": rank <= self._controlled_selection_count(available_count=len(ordered), client_cfg={**client_cfg, "random_fraction": 0.40, "random_count": None}, per_cluster=False),
+                    "selected_for_100": True,
+                    "seed": int(seed),
+                })
+        elif selection_mode == "per_cluster_random":
+            cluster_members: dict[str, list[str]] = {}
+            for client_id in assigned_clients:
+                cluster_members.setdefault(str(cluster_assignment_map[client_id]), []).append(client_id)
+            if not cluster_members:
+                raise ValueError("No assigned clients matched dataset columns for per_cluster_random selection.")
+            selected_set: set[str] = set()
+            selection_rows = []
+            for cluster_id in sorted(cluster_members, key=lambda value: (int(value) if str(value).isdigit() else str(value))):
+                ordered = self._controlled_client_order(cluster_members[cluster_id], seed, "cluster", cluster_id)
+                count = self._controlled_selection_count(available_count=len(ordered), client_cfg=client_cfg, per_cluster=True)
+                selected_set.update(ordered[:count])
+                count_20 = self._controlled_selection_count(available_count=len(ordered), client_cfg={**client_cfg, "random_fraction": 0.20, "random_count": None}, per_cluster=True)
+                count_40 = self._controlled_selection_count(available_count=len(ordered), client_cfg={**client_cfg, "random_fraction": 0.40, "random_count": None}, per_cluster=True)
+                for rank, client_id in enumerate(ordered, start=1):
+                    selection_rows.append({
+                        "cluster_id": cluster_id,
+                        "client_id": client_id,
+                        "selection_mode": selection_mode,
+                        "selection_rank": rank,
+                        "selected": client_id in selected_set,
+                        "selected_for_1_client": rank <= 1,
+                        "selected_for_20": rank <= count_20,
+                        "selected_for_40": rank <= count_40,
+                        "selected_for_100": True,
+                        "seed": int(seed),
+                    })
+            if include_unassigned and unassigned_clients:
+                ordered_unassigned = self._controlled_client_order(unassigned_clients, seed, "cluster", "__unassigned__")
+                for rank, client_id in enumerate(ordered_unassigned, start=1):
+                    selection_rows.append({
+                        "cluster_id": None,
+                        "client_id": client_id,
+                        "selection_mode": selection_mode,
+                        "selection_rank": rank,
+                        "selected": False,
+                        "selected_for_1_client": False,
+                        "selected_for_20": False,
+                        "selected_for_40": False,
+                        "selected_for_100": True,
+                        "seed": int(seed),
+                    })
+            selected_clients = sorted(selected_set)
+        else:
+            raise ValueError("clients.selection_mode must be one of: all, explicit, global_random, per_cluster_random.")
+
+        if not selected_clients:
+            raise ValueError("Controlled-window client selection produced no selected clients.")
+        selected_df = pd.DataFrame(selection_rows)
+        metadata = {
+            "client_selection_mode": selection_mode,
+            "client_selection_seed": int(seed),
+            "selected_client_count": int(len(selected_clients)),
+            "eligible_client_count": int(len(eligible_clients)),
+            "assigned_client_count": int(len(assigned_clients)),
+            "unassigned_client_count": int(len(unassigned_clients)),
+        }
+        return selected_clients, selected_df, metadata
 
     def _select_clients(
         self,
@@ -665,19 +1381,17 @@ class WideDemandFaultInjector:
             .to_dict()
         )
 
-        restored = pd.DataFrame(
-            {
-                ts_col: pd.to_datetime(original_frame[ts_col], errors="coerce").reset_index(drop=True),
-            }
-        )
+        restored_columns = {
+            ts_col: pd.to_datetime(original_frame[ts_col], errors="coerce").reset_index(drop=True),
+        }
         for client_id in client_cols:
-            restored[client_id] = pd.to_numeric(nonduplicate[client_id], errors="coerce").to_numpy(dtype=float)
-        restored[_MISSING_TIMESTAMP_COL] = nonduplicate[_ORIG_ROW_ID_COL].isna().astype(int).to_numpy()
-        restored[_DUPLICATE_TIMESTAMP_COUNT_COL] = np.asarray(
+            restored_columns[client_id] = pd.to_numeric(nonduplicate[client_id], errors="coerce").to_numpy(dtype=float)
+        restored_columns[_MISSING_TIMESTAMP_COL] = nonduplicate[_ORIG_ROW_ID_COL].isna().astype(int).to_numpy()
+        restored_columns[_DUPLICATE_TIMESTAMP_COUNT_COL] = np.asarray(
             [int(duplicate_counts.get(int(row_id), 0)) for row_id in row_ids],
             dtype=int,
         )
-        return restored
+        return pd.DataFrame(restored_columns)
 
     def _build_final_corruption_summary(
         self,
@@ -1421,6 +2135,9 @@ class WideDemandFaultInjector:
         shared: bool = False,
         cluster_id: Optional[str] = None,
         scope: str = "client",
+        window_start_index: Optional[int] = None,
+        window_end_index: Optional[int] = None,
+        seed: Optional[int] = None,
     ) -> FaultEvent:
         if idxs.size == 0:
             start_time = None
@@ -1429,6 +2146,16 @@ class WideDemandFaultInjector:
             ts_values = pd.Series(timestamps.iloc[idxs]).dropna()
             start_time = ts_values.min() if not ts_values.empty else None
             end_time = ts_values.max() if not ts_values.empty else None
+        if window_start_index is None or window_end_index is None:
+            window_start = None
+            window_end = None
+        else:
+            window_ts = pd.Series(timestamps.iloc[[window_start_index, window_end_index]]).reset_index(drop=True)
+            window_start = window_ts.iloc[0] if not window_ts.empty else None
+            window_end = window_ts.iloc[-1] if not window_ts.empty else None
+        affected_timestamps = []
+        if idxs.size:
+            affected_timestamps = [str(value) for value in pd.Series(timestamps.iloc[idxs]).tolist()]
         return FaultEvent(
             client_id=str(client_id),
             fault_type=fault_type,
@@ -1442,6 +2169,13 @@ class WideDemandFaultInjector:
             cluster_id=str(cluster_id) if cluster_id is not None else None,
             scope=str(scope),
             shared_timestamp_event=shared,
+            window_start=window_start,
+            window_end=window_end,
+            window_start_index=int(window_start_index) if window_start_index is not None else None,
+            window_end_index=int(window_end_index) if window_end_index is not None else None,
+            affected_positions=_json_params([int(idx) for idx in idxs.tolist()]),
+            affected_timestamps=_json_params(affected_timestamps),
+            seed=int(seed) if seed is not None else None,
         )
 
 
@@ -1464,4 +2198,18 @@ def inject_faults_to_csv(
     )
     save_csv(faulty_df, output_path)
     save_csv(report_df, report_path)
+    if config and config.get("fault_mode") == "controlled_window":
+        summary_df = getattr(injector, "last_controlled_window_summary_df", pd.DataFrame())
+        report_path_obj = Path(report_path)
+        if summary_df is not None and not summary_df.empty:
+            summary_path = config.get("controlled_window_summary_path")
+            if summary_path is None:
+                summary_path = report_path_obj.with_name(f"{report_path_obj.stem}_summary{report_path_obj.suffix}")
+            save_csv(summary_df, summary_path)
+        selected_clients_df = getattr(injector, "last_controlled_selected_clients_df", pd.DataFrame())
+        if selected_clients_df is not None and not selected_clients_df.empty:
+            selected_path = config.get("controlled_selected_clients_path")
+            if selected_path is None:
+                selected_path = report_path_obj.with_name("selected_clients.csv")
+            save_csv(selected_clients_df, selected_path)
     return faulty_df, report_df
