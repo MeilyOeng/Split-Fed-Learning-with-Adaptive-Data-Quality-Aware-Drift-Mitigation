@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from fed_server.fed_server import run_fedavg_round
+from drift.frozen_validation import snapshot_checkpoint_hashes, write_frozen_validation_report
+from drift.evaluator import evaluate_run_artifacts
 from utils.comm_logging import COMM_LOG_FIELDNAMES
 from utils.runtime_utils import (
     client_progress_path,
@@ -24,6 +26,7 @@ from utils.runtime_utils import (
     client_train_metrics_path,
     cluster_dir,
     compute_model_input_size,
+    build_quality_anchor_config,
     derive_dq_mode,
     ensure_dir,
     get_json,
@@ -158,9 +161,17 @@ def configure_model_input_size(env: dict) -> dict[str, Any]:
     use_quality_weights = parse_bool(env.get("USE_QUALITY_WEIGHTS", "false"), default=False)
     use_quality_as_input = parse_bool(env.get("USE_QUALITY_AS_INPUT", "false"), default=False)
     use_quality_aggregation_weights = parse_bool(env.get("USE_QUALITY_AGGREGATION_WEIGHTS", "false"), default=False)
+    quality_anchor_config = build_quality_anchor_config(env)
     quality_input_columns = _parse_optional_csv(env.get("QUALITY_INPUT_COLUMNS", "quality_score")) or ["quality_score"]
     quality_input_dim = len(quality_input_columns)
-    dq_mode = derive_dq_mode(use_quality_weights, use_quality_as_input, use_quality_aggregation_weights)
+    dq_mode = derive_dq_mode(
+        use_quality_weights,
+        use_quality_as_input,
+        use_quality_aggregation_weights,
+        quality_anchor_config.use_quality_anchor_aggregation,
+        quality_anchor_config.use_gradient_alignment_filter,
+        quality_anchor_config.use_high_quality_validation_guardrail,
+    )
     requested_static_columns = _parse_optional_csv(env.get("STATIC_FEATURE_COLUMNS"))
     requested_static_groups = _parse_optional_csv(env.get("STATIC_FEATURE_GROUPS"))
 
@@ -195,6 +206,16 @@ def configure_model_input_size(env: dict) -> dict[str, Any]:
             "use_quality_weights": use_quality_weights,
             "use_quality_as_input": use_quality_as_input,
             "use_quality_aggregation_weights": use_quality_aggregation_weights,
+            "use_quality_anchor_aggregation": quality_anchor_config.use_quality_anchor_aggregation,
+            "use_gradient_alignment_filter": quality_anchor_config.use_gradient_alignment_filter,
+            "use_high_quality_validation_guardrail": quality_anchor_config.use_high_quality_validation_guardrail,
+            "quality_anchor_top_fraction": quality_anchor_config.top_fraction,
+            "quality_anchor_min_clients": quality_anchor_config.min_clients,
+            "quality_anchor_update_share": quality_anchor_config.anchor_update_share,
+            "quality_alignment_power": quality_anchor_config.alignment_power,
+            "quality_negative_alignment_weight": quality_anchor_config.negative_alignment_weight,
+            "quality_low_client_norm_cap": quality_anchor_config.low_client_norm_cap,
+            "quality_anchor_eps": quality_anchor_config.eps,
             "quality_aggregation_mode": str(env.get("QUALITY_AGGREGATION_MODE", "soft_client_gradient")),
             "quality_aggregation_q_min": float(env.get("QUALITY_AGGREGATION_Q_MIN", "0.5")),
             "quality_aggregation_eps": float(env.get("QUALITY_AGGREGATION_EPS", "1e-8")),
@@ -213,6 +234,16 @@ def configure_model_input_size(env: dict) -> dict[str, Any]:
             "use_quality_weights": use_quality_weights,
             "use_quality_as_input": use_quality_as_input,
             "use_quality_aggregation_weights": use_quality_aggregation_weights,
+            "use_quality_anchor_aggregation": quality_anchor_config.use_quality_anchor_aggregation,
+            "use_gradient_alignment_filter": quality_anchor_config.use_gradient_alignment_filter,
+            "use_high_quality_validation_guardrail": quality_anchor_config.use_high_quality_validation_guardrail,
+            "quality_anchor_top_fraction": quality_anchor_config.top_fraction,
+            "quality_anchor_min_clients": quality_anchor_config.min_clients,
+            "quality_anchor_update_share": quality_anchor_config.anchor_update_share,
+            "quality_alignment_power": quality_anchor_config.alignment_power,
+            "quality_negative_alignment_weight": quality_anchor_config.negative_alignment_weight,
+            "quality_low_client_norm_cap": quality_anchor_config.low_client_norm_cap,
+            "quality_anchor_eps": quality_anchor_config.eps,
             "quality_aggregation_mode": str(env.get("QUALITY_AGGREGATION_MODE", "soft_client_gradient")),
             "quality_aggregation_q_min": float(env.get("QUALITY_AGGREGATION_Q_MIN", "0.5")),
             "quality_aggregation_eps": float(env.get("QUALITY_AGGREGATION_EPS", "1e-8")),
@@ -237,6 +268,16 @@ def configure_model_input_size(env: dict) -> dict[str, Any]:
         "use_quality_weights": use_quality_weights,
         "use_quality_as_input": use_quality_as_input,
         "use_quality_aggregation_weights": use_quality_aggregation_weights,
+        "use_quality_anchor_aggregation": quality_anchor_config.use_quality_anchor_aggregation,
+        "use_gradient_alignment_filter": quality_anchor_config.use_gradient_alignment_filter,
+        "use_high_quality_validation_guardrail": quality_anchor_config.use_high_quality_validation_guardrail,
+        "quality_anchor_top_fraction": quality_anchor_config.top_fraction,
+        "quality_anchor_min_clients": quality_anchor_config.min_clients,
+        "quality_anchor_update_share": quality_anchor_config.anchor_update_share,
+        "quality_alignment_power": quality_anchor_config.alignment_power,
+        "quality_negative_alignment_weight": quality_anchor_config.negative_alignment_weight,
+        "quality_low_client_norm_cap": quality_anchor_config.low_client_norm_cap,
+        "quality_anchor_eps": quality_anchor_config.eps,
         "quality_aggregation_mode": str(env.get("QUALITY_AGGREGATION_MODE", "soft_client_gradient")),
         "quality_aggregation_q_min": float(env.get("QUALITY_AGGREGATION_Q_MIN", "0.5")),
         "quality_aggregation_eps": float(env.get("QUALITY_AGGREGATION_EPS", "1e-8")),
@@ -340,6 +381,7 @@ def start_stream_service(cluster_id: str, env: dict, cluster_idx: int):
             "STREAM_CLUSTER_ID": str(cluster_id),
             "CLUSTER_ID": str(cluster_id),
             "STREAM_PORT": str(port),
+            "OUTPUT_DIR": str(cdir),
             "CLUSTER_DIR": str(CLUSTER_DATA_DIR),
             "TRAIN_CLUSTER_DATA_DIR": str(TRAIN_CLUSTER_DATA_DIR),
             "VAL_CLUSTER_DATA_DIR": str(VAL_CLUSTER_DATA_DIR),
@@ -888,7 +930,7 @@ def finalize_epoch_boundaries(cluster_id: str, client_ports: Dict[str, int], exh
     return results
 
 
-def run_round(server_port: int, cluster_id: str, client_ports: Dict[str, int], round_clients: List[str], scheduler_epoch: int, round_idx: int, round_chunk_idx: int, train_durations):
+def run_round(server_port: int, cluster_id: str, client_ports: Dict[str, int], round_clients: List[str], scheduler_epoch: int, global_round: int, round_idx: int, round_chunk_idx: int, train_durations):
     numeric_round_id = int(round_idx * 1000 + round_chunk_idx)
     round_label = f"epoch{scheduler_epoch}_round{round_idx}_chunk{round_chunk_idx}"
     log(f"[ROUND][start] cluster={cluster_id} scheduler_epoch={scheduler_epoch} round={round_idx} chunk={round_chunk_idx} round_id={round_label} active_clients={round_clients}")
@@ -896,6 +938,9 @@ def run_round(server_port: int, cluster_id: str, client_ports: Dict[str, int], r
         f"http://localhost:{server_port}/round/start",
         {
             "round_id": numeric_round_id,
+            "global_round": global_round,
+            "logical_round": round_idx,
+            "scheduler_epoch": scheduler_epoch,
             "expected_clients": round_clients,
             "effective_accum_steps_target": len(round_clients),
         },
@@ -948,6 +993,8 @@ def run_single_scheduler_epoch_for_cluster(cluster_id: str, client_ids: List[str
 
     _ensure_not_cancelled()
     total_epochs = int(env.get("NUM_EPOCHS", "100"))
+    local_epochs_per_global_round = max(1, int(env.get("LOCAL_EPOCHS_PER_GLOBAL_ROUND", "1")))
+    global_round = ((scheduler_epoch - 1) // local_epochs_per_global_round) + 1
     log(f"\n=== Scheduler epoch {scheduler_epoch}/{total_epochs} cluster={cluster_id} ===")
     round_idx = 0
     while True:
@@ -981,6 +1028,7 @@ def run_single_scheduler_epoch_for_cluster(cluster_id: str, client_ids: List[str
                 client_ports,
                 ordered_ready,
                 scheduler_epoch,
+                global_round,
                 round_idx,
                 1,
                 train_durations,
@@ -1302,6 +1350,7 @@ def main() -> int:
             "SAVE_PROGRESS_EVERY_N_BATCHES": os.environ.get("SAVE_PROGRESS_EVERY_N_BATCHES", "1"),
             "WRITE_COMMUNICATION_LOG": os.environ.get("WRITE_COMMUNICATION_LOG", "true"),
             "SKIP_TRAINING": os.environ.get("SKIP_TRAINING", "false"),
+            "FROZEN_VALIDATION_MODE": os.environ.get("FROZEN_VALIDATION_MODE", "false"),
             "USE_STATIC_FEATURES": os.environ.get("USE_STATIC_FEATURES", "false"),
             "STATIC_FEATURE_COLUMNS": os.environ.get("STATIC_FEATURE_COLUMNS", ""),
             "STATIC_FEATURE_GROUPS": os.environ.get("STATIC_FEATURE_GROUPS", ""),
@@ -1316,6 +1365,17 @@ def main() -> int:
             "USE_QUALITY_WEIGHTS": os.environ.get("USE_QUALITY_WEIGHTS", "false"),
             "USE_QUALITY_AS_INPUT": os.environ.get("USE_QUALITY_AS_INPUT", "false"),
             "USE_QUALITY_AGGREGATION_WEIGHTS": os.environ.get("USE_QUALITY_AGGREGATION_WEIGHTS", "false"),
+            "USE_QUALITY_ANCHOR_AGGREGATION": os.environ.get("USE_QUALITY_ANCHOR_AGGREGATION", "false"),
+            "USE_GRADIENT_ALIGNMENT_FILTER": os.environ.get("USE_GRADIENT_ALIGNMENT_FILTER", "false"),
+            "USE_HIGH_QUALITY_VALIDATION_GUARDRAIL": os.environ.get("USE_HIGH_QUALITY_VALIDATION_GUARDRAIL", "false"),
+            "QUALITY_ANCHOR_TOP_FRACTION": os.environ.get("QUALITY_ANCHOR_TOP_FRACTION", "0.40"),
+            "QUALITY_ANCHOR_MIN_CLIENTS": os.environ.get("QUALITY_ANCHOR_MIN_CLIENTS", "3"),
+            "QUALITY_ANCHOR_UPDATE_SHARE": os.environ.get("QUALITY_ANCHOR_UPDATE_SHARE", "0.80"),
+            "QUALITY_ALIGNMENT_POWER": os.environ.get("QUALITY_ALIGNMENT_POWER", "1.0"),
+            "QUALITY_NEGATIVE_ALIGNMENT_WEIGHT": os.environ.get("QUALITY_NEGATIVE_ALIGNMENT_WEIGHT", "0.0"),
+            "QUALITY_LOW_CLIENT_NORM_CAP": os.environ.get("QUALITY_LOW_CLIENT_NORM_CAP", "2.0"),
+            "QUALITY_ANCHOR_EPS": os.environ.get("QUALITY_ANCHOR_EPS", "1e-8"),
+            "QUALITY_AGGREGATION_DEBUG_LOG": os.environ.get("QUALITY_AGGREGATION_DEBUG_LOG", "false"),
             "QUALITY_AGGREGATION_MODE": os.environ.get("QUALITY_AGGREGATION_MODE", "soft_client_gradient"),
             "QUALITY_AGGREGATION_Q_MIN": os.environ.get("QUALITY_AGGREGATION_Q_MIN", "0.5"),
             "QUALITY_AGGREGATION_EPS": os.environ.get("QUALITY_AGGREGATION_EPS", "1e-8"),
@@ -1339,6 +1399,10 @@ def main() -> int:
         return 1
 
     cluster_ids, cluster_clients = resolve_cluster_clients(detected_clusters)
+    frozen_validation_mode = parse_bool(env.get("FROZEN_VALIDATION_MODE"), default=False)
+    if frozen_validation_mode and not parse_bool(env.get("SKIP_TRAINING"), default=False):
+        raise ValueError("FROZEN_VALIDATION_MODE=true requires SKIP_TRAINING=true")
+    frozen_hashes_before = snapshot_checkpoint_hashes(OUTPUT_DIR) if frozen_validation_mode else {}
 
     log("Starting split-learning run")
     log(f".env loaded: {dotenv_path if dotenv_path is not None else '<not found>'} (system env overrides .env)")
@@ -1367,6 +1431,15 @@ def main() -> int:
     log(f"Quality weights enabled: {quality_runtime['use_quality_weights']}")
     log(f"Quality-as-input enabled: {quality_runtime['use_quality_as_input']}")
     log(f"Quality aggregation weights enabled: {quality_runtime['use_quality_aggregation_weights']}")
+    log(f"Quality anchor aggregation enabled: {quality_runtime['use_quality_anchor_aggregation']}")
+    log(f"Gradient alignment filter enabled: {quality_runtime['use_gradient_alignment_filter']}")
+    log(f"Validation guardrail enabled: {quality_runtime['use_high_quality_validation_guardrail']}")
+    log(f"Quality anchor top fraction: {quality_runtime['quality_anchor_top_fraction']}")
+    log(f"Quality anchor minimum clients: {quality_runtime['quality_anchor_min_clients']}")
+    log(f"Quality anchor update share: {quality_runtime['quality_anchor_update_share']}")
+    log(f"Quality alignment power: {quality_runtime['quality_alignment_power']}")
+    log(f"Quality negative alignment weight: {quality_runtime['quality_negative_alignment_weight']}")
+    log(f"Quality non-anchor norm cap: {quality_runtime['quality_low_client_norm_cap']}")
     log(f"Quality aggregation mode: {quality_runtime['quality_aggregation_mode']}")
     log(f"Quality aggregation q_min: {quality_runtime['quality_aggregation_q_min']}")
     log(f"Quality aggregation eps: {quality_runtime['quality_aggregation_eps']}")
@@ -1432,6 +1505,10 @@ def main() -> int:
             cluster_test = run_test_phase_for_cluster(cluster_id, cluster_clients[cluster_id], cluster_idx, stop_event)
             for key, value in cluster_test.items():
                 test_durations[key] += value
+        if parse_bool(env.get("DRIFT_DETECTION_ENABLED"), default=False):
+            drift_summary = evaluate_run_artifacts(OUTPUT_DIR, RESULTS_DIR / "drift")
+            log(f"[DRIFT] artifact evaluation summary: {drift_summary}")
+
         # train_durations = run_training_schedule(cluster_ids, cluster_clients, env)
 
         # for cluster_idx, cluster_id in enumerate(cluster_ids):
@@ -1445,6 +1522,13 @@ def main() -> int:
         for cid in cluster_ids:
             for client_id in cluster_clients[cid]:
                 model_configs["clients"].append(collect_client_config(cid, client_id))
+        if frozen_validation_mode:
+            frozen_hashes_after = snapshot_checkpoint_hashes(OUTPUT_DIR)
+            runtime_hashes = {str(item["cluster_id"]): str(item.get("parameter_hash")) for item in model_configs["servers"]}
+            write_frozen_validation_report(
+                RESULTS_DIR / "frozen_validation_report.json", before=frozen_hashes_before, after=frozen_hashes_after,
+                server_runtime_hashes=runtime_hashes, round_start_events=0, fedavg_events=0,
+            )
 
         train_client_rows = aggregate_train_rows(
             cluster_ids,

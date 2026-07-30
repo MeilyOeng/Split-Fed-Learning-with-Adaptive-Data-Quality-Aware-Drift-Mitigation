@@ -625,7 +625,7 @@ class WideDemandFaultInjector:
         if not dimension_fractions:
             raise ValueError("window_faulting.dimension_window_fractions must configure at least one dimension.")
 
-        allowed_dimensions = {"completeness", "consistency", "accuracy", "validity", "mixed"}
+        allowed_dimensions = {"completeness", "consistency", "accuracy", "validity", "freshness", "mixed"}
         cleaned: dict[str, float] = {}
         for dimension, raw_fraction in dimension_fractions.items():
             dimension = str(dimension)
@@ -773,7 +773,7 @@ class WideDemandFaultInjector:
         events: list[FaultEvent],
     ) -> int:
         if dimension == "mixed":
-            dimensions = ["completeness", "consistency", "accuracy", "validity"]
+            dimensions = ["completeness", "consistency", "accuracy", "validity", "freshness"]
             chosen = list(rng.choice(np.asarray(dimensions, dtype=object), size=2, replace=False))
             applied = 0
             for sub_dimension in chosen:
@@ -942,6 +942,21 @@ class WideDemandFaultInjector:
                 noise = rng.normal(loc=0.0, scale=max(scale * noise_std_fraction, 1e-6), size=idxs.size)
                 frame.loc[idxs, client_id] = current + noise
                 parameters = {"mode": "controlled_window", "source_dimension": dimension, "noise_std_fraction": noise_std_fraction}
+        elif dimension == "freshness":
+            freshness_cfg = _resolve_fault_config(self.config, "freshness")
+            window_length = window_end_idx - window_start_idx + 1
+            delay_steps = int(freshness_cfg.get("delay_steps", 5))
+            delay_steps = max(1, min(delay_steps, window_length))
+            idxs = np.arange(window_end_idx - delay_steps + 1, window_end_idx + 1, dtype=int)
+            fault_type = "controlled_delayed_tail"
+            subcheck = "F1"
+            frame.loc[idxs, client_id] = np.nan
+            parameters = {
+                "mode": "controlled_window",
+                "source_dimension": dimension,
+                "delay_steps": delay_steps,
+                "delay_start_offset": window_length - delay_steps,
+            }
         else:
             raise ValueError(f"Unsupported controlled-window dimension: {dimension}")
 

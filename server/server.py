@@ -4,6 +4,7 @@ import pickle
 import sys
 import time
 import json
+import hashlib
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -17,13 +18,20 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from models.split_lstm import build_split_lstm
-from utils.comm_logging import append_comm_row, calc_bandwidth, should_log_index, tensor_nbytes, tensor_shape
+from utils.quality_aggregation import (
+    ClientGradientContribution,
+    aggregate_anchor_gradients,
+    gradient_norm,
+)
+from utils.comm_logging import append_comm_row, calc_bandwidth, iso_utc_now, should_log_index, tensor_nbytes, tensor_shape
 from utils.runtime_utils import (
     _get_env,
     build_lstm_config_from_env,
+    build_quality_anchor_config,
     derive_dq_mode,
     get_device_info,
     parse_bool,
+    QualityAnchorConfig,
     resolve_device,
     save_torch_checkpoint,
     try_load_torch_checkpoint,
@@ -31,6 +39,7 @@ from utils.runtime_utils import (
 
 
 app = Flask(__name__)
+FROZEN_VALIDATION_MODE = parse_bool(_get_env("FROZEN_VALIDATION_MODE", "false"))
 
 
 def server_output_dir(cluster_id: str) -> str:
@@ -65,6 +74,7 @@ class ServerRuntimeConfig:
     quality_score_min: float
     quality_score_max: float
     quality_score_eps: float
+    quality_anchor: QualityAnchorConfig
 
 
 class SplitLearningServerState:
@@ -72,6 +82,7 @@ class SplitLearningServerState:
         use_quality_weights = parse_bool(_get_env("USE_QUALITY_WEIGHTS", "false"))
         use_quality_as_input = parse_bool(_get_env("USE_QUALITY_AS_INPUT", "false"))
         use_quality_aggregation_weights = parse_bool(_get_env("USE_QUALITY_AGGREGATION_WEIGHTS", "false"))
+        quality_anchor_config = build_quality_anchor_config(os.environ)
         quality_aggregation_mode = str(_get_env("QUALITY_AGGREGATION_MODE", "soft_client_gradient") or "soft_client_gradient").strip()
         quality_aggregation_q_min = float(_get_env("QUALITY_AGGREGATION_Q_MIN", "0.5"))
         quality_aggregation_eps = float(_get_env("QUALITY_AGGREGATION_EPS", "1e-8"))
@@ -93,17 +104,28 @@ class SplitLearningServerState:
             quality_aggregation_mode=quality_aggregation_mode,
             quality_aggregation_q_min=quality_aggregation_q_min,
             quality_aggregation_eps=quality_aggregation_eps,
-            dq_mode=derive_dq_mode(use_quality_weights, use_quality_as_input, use_quality_aggregation_weights),
+            dq_mode=derive_dq_mode(
+                use_quality_weights,
+                use_quality_as_input,
+                use_quality_aggregation_weights,
+                quality_anchor_config.use_quality_anchor_aggregation,
+                quality_anchor_config.use_gradient_alignment_filter,
+                quality_anchor_config.use_high_quality_validation_guardrail,
+            ),
             quality_score_path=str(_get_env("QUALITY_SCORE_PATH", "") or "").strip(),
             quality_score_min=float(_get_env("QUALITY_SCORE_MIN", "0.05")),
             quality_score_max=float(_get_env("QUALITY_SCORE_MAX", "1.0")),
             quality_score_eps=float(_get_env("QUALITY_SCORE_EPS", "1e-8")),
+            quality_anchor=quality_anchor_config,
         )
         self.device = resolve_device()
         self.device_info = get_device_info(self.device, process_role_default="server")
         cfg, split_layer = build_lstm_config_from_env()
         _, server_model = build_split_lstm(cfg, split_layer)
         self.model = server_model.to(self.device)
+        self.trainable_server_parameters = tuple(
+            parameter for parameter in self.model.parameters() if parameter.requires_grad
+        )
         self.optimizer = self._build_optimizer()
         self.criterion = nn.MSELoss()
         self.criterion_per_sample = nn.MSELoss(reduction="none")
@@ -117,6 +139,9 @@ class SplitLearningServerState:
         self.optimizer_step_count = 0
         self.pending_accum_steps = 0
         self.round_id = 0
+        self.global_round = 0
+        self.logical_round = 0
+        self.scheduler_epoch = 0
         self.active_accum_steps_target = self.runtime_cfg.accum_steps_target
         self.expected_clients: List[str] = []
         self.expected_clients_set: Set[str] = set()
@@ -125,6 +150,7 @@ class SplitLearningServerState:
         self.round_total_contrib_count = 0
         self.window_contrib_count = 0
         self.accum_quality_weight_sum = 0.0
+        self.quality_anchor_contributions: List[ClientGradientContribution] = []
         # try loading latest checkpoint on startup
         latest_path = server_checkpoint_path(self.runtime_cfg.cluster_id, "latest.pt") 
         extra, ok = try_load_torch_checkpoint(
@@ -153,6 +179,8 @@ class SplitLearningServerState:
             f"use_quality_weights={self.runtime_cfg.use_quality_weights} "
             f"use_quality_as_input={self.runtime_cfg.use_quality_as_input} "
             f"use_quality_aggregation_weights={self.runtime_cfg.use_quality_aggregation_weights} "
+            f"use_quality_anchor_aggregation={self.runtime_cfg.quality_anchor.use_quality_anchor_aggregation} "
+            f"use_gradient_alignment_filter={self.runtime_cfg.quality_anchor.use_gradient_alignment_filter} "
             f"quality_aggregation_mode={self.runtime_cfg.quality_aggregation_mode} "
             f"quality_aggregation_q_min={self.runtime_cfg.quality_aggregation_q_min} "
             f"dq_mode={self.runtime_cfg.dq_mode} "
@@ -163,6 +191,16 @@ class SplitLearningServerState:
 
     def _append_comm_row(self, row: Dict[str, Any]) -> None:
         append_comm_row(self.comm_log_path, row)
+
+    def _append_quality_anchor_log(self, payload: Dict[str, Any]) -> None:
+        record = {"timestamp": iso_utc_now(), **payload}
+        with open(
+            os.path.join(self.runtime_cfg.output_dir, "quality_anchor_aggregation.jsonl"),
+            "a",
+            encoding="utf-8",
+        ) as log_file:
+            log_file.write(json.dumps(record, sort_keys=True) + "\n")
+            log_file.flush()
 
     def _should_log_batch(self, batch_id: Any) -> bool:
         try:
@@ -222,6 +260,7 @@ class SplitLearningServerState:
         self.accum_quality_weight_sum = 0.0
         self.seen_clients_window.clear()
         self.window_contrib_count = 0
+        self.quality_anchor_contributions.clear()
 
     # just to reset the tracking of each round's progress after a completed logical round
     def _reset_round_tracking(self, increment_round: bool) -> None:
@@ -242,12 +281,14 @@ class SplitLearningServerState:
         quality_required = (
             self.runtime_cfg.use_quality_weights
             or self.runtime_cfg.use_quality_aggregation_weights
+            or self.runtime_cfg.quality_anchor.use_quality_anchor_aggregation
         )
         if quality_scores_cpu is None:
             if quality_required:
                 raise ValueError(
                     "quality_scores missing while server-side quality mode is enabled "
-                    "(USE_QUALITY_WEIGHTS=true or USE_QUALITY_AGGREGATION_WEIGHTS=true)"
+                    "(USE_QUALITY_WEIGHTS=true, USE_QUALITY_AGGREGATION_WEIGHTS=true, "
+                    "or USE_QUALITY_ANCHOR_AGGREGATION=true)"
                 )
             return torch.ones(batch_size, dtype=torch.float32, device=self.device)
 
@@ -262,15 +303,19 @@ class SplitLearningServerState:
             raise ValueError(
                 f"quality_scores size mismatch: expected batch_size={batch_size}, got {quality_scores.numel()}"
             )
-        if self.runtime_cfg.use_quality_aggregation_weights:
+        strict_quality = (
+            self.runtime_cfg.use_quality_aggregation_weights
+            or self.runtime_cfg.quality_anchor.use_quality_anchor_aggregation
+        )
+        if strict_quality:
             if not torch.isfinite(quality_scores).all():
-                raise ValueError("quality_scores contain non-finite values while USE_QUALITY_AGGREGATION_WEIGHTS=true")
+                raise ValueError("quality_scores contain non-finite values while server quality aggregation is enabled")
             if torch.any((quality_scores < 0.0) | (quality_scores > 1.0)):
                 raise ValueError(
-                    "quality_scores must be within [0, 1] while USE_QUALITY_AGGREGATION_WEIGHTS=true; "
+                    "quality_scores must be within [0, 1] while server quality aggregation is enabled; "
                     f"min={float(quality_scores.min().item()):.6f} max={float(quality_scores.max().item()):.6f}"
                 )
-        if self.runtime_cfg.use_quality_aggregation_weights:
+        if strict_quality:
             return quality_scores
         return quality_scores.clamp(
             min=self.runtime_cfg.quality_score_min,
@@ -283,6 +328,9 @@ class SplitLearningServerState:
         expected_clients: List[str],
         round_id: Optional[int] = None,
         effective_accum_steps_target: Optional[int] = None,
+        global_round: Optional[int] = None,
+        logical_round: Optional[int] = None,
+        scheduler_epoch: Optional[int] = None,
     ) -> Dict[str, Any]:
         unique_clients = [str(c) for c in expected_clients]
         if len(unique_clients) != len(set(unique_clients)):
@@ -291,6 +339,20 @@ class SplitLearningServerState:
             raise RuntimeError("cannot start a new round while gradients are pending")
         if self.expected_clients_set or self.seen_clients_total or self.round_total_contrib_count > 0:
             raise RuntimeError("cannot start a new round while previous logical round is still active")
+        requested_accum_steps_target = max(
+            1,
+            int(effective_accum_steps_target or self.runtime_cfg.accum_steps_target),
+        )
+        if (
+            self.runtime_cfg.quality_anchor.use_quality_anchor_aggregation
+            and unique_clients
+            and requested_accum_steps_target != len(unique_clients)
+        ):
+            raise ValueError(
+                "Quality-anchor aggregation requires one complete logical-round buffer: "
+                f"effective_accum_steps_target={requested_accum_steps_target}, "
+                f"expected_client_count={len(unique_clients)}."
+            )
         self.expected_clients = unique_clients
         self.expected_clients_set = set(unique_clients)
         self.seen_clients_total.clear()
@@ -298,12 +360,15 @@ class SplitLearningServerState:
         self.round_total_contrib_count = 0
         self.window_contrib_count = 0
         self.pending_accum_steps = 0
-        self.active_accum_steps_target = max(
-            1,
-            int(effective_accum_steps_target or self.runtime_cfg.accum_steps_target),
-        )
+        self.active_accum_steps_target = requested_accum_steps_target
         if round_id is not None:
             self.round_id = int(round_id)
+        if global_round is not None:
+            self.global_round = int(global_round)
+        if logical_round is not None:
+            self.logical_round = int(logical_round)
+        if scheduler_epoch is not None:
+            self.scheduler_epoch = int(scheduler_epoch)
         print(
             f"[Server] round_start cluster={self.runtime_cfg.cluster_id} round_id={self.round_id} "
             f"expected_clients={self.expected_clients} effective_accum_steps_target={self.active_accum_steps_target}",
@@ -315,6 +380,9 @@ class SplitLearningServerState:
         return {
             "cluster_id": self.runtime_cfg.cluster_id,
             "round_id": self.round_id,
+            "global_round": self.global_round,
+            "logical_round": self.logical_round,
+            "scheduler_epoch": self.scheduler_epoch,
             "expected_clients": list(self.expected_clients),
             "seen_clients_total": sorted(self.seen_clients_total),
             "seen_clients_window": sorted(self.seen_clients_window),
@@ -327,6 +395,10 @@ class SplitLearningServerState:
             "use_quality_weights": self.runtime_cfg.use_quality_weights,
             "use_quality_as_input": self.runtime_cfg.use_quality_as_input,
             "use_quality_aggregation_weights": self.runtime_cfg.use_quality_aggregation_weights,
+            "use_quality_anchor_aggregation": self.runtime_cfg.quality_anchor.use_quality_anchor_aggregation,
+            "use_gradient_alignment_filter": self.runtime_cfg.quality_anchor.use_gradient_alignment_filter,
+            "use_high_quality_validation_guardrail": self.runtime_cfg.quality_anchor.use_high_quality_validation_guardrail,
+            "quality_anchor_contribution_count": len(self.quality_anchor_contributions),
             "quality_aggregation_mode": self.runtime_cfg.quality_aggregation_mode,
             "quality_aggregation_q_min": self.runtime_cfg.quality_aggregation_q_min,
             "quality_aggregation_eps": self.runtime_cfg.quality_aggregation_eps,
@@ -336,7 +408,190 @@ class SplitLearningServerState:
             "global_step": self.global_step,
         }
 
+    @staticmethod
+    def _quality_stats(values: Tuple[float, ...]) -> Dict[str, Optional[float]]:
+        if not values:
+            return {"mean": None, "min": None, "max": None}
+        return {
+            "mean": float(sum(values) / len(values)),
+            "min": float(min(values)),
+            "max": float(max(values)),
+        }
+
+    def abort_quality_anchor_round(self, reason: str) -> None:
+        if not self.runtime_cfg.quality_anchor.use_quality_anchor_aggregation:
+            return
+        contribution_count = len(self.quality_anchor_contributions)
+        self.optimizer.zero_grad(set_to_none=True)
+        self._reset_round_tracking(increment_round=False)
+        print(
+            f"[Server] quality_anchor_round_aborted cluster={self.runtime_cfg.cluster_id} "
+            f"reason={reason} cleared_contributions={contribution_count}",
+            flush=True,
+        )
+
+    def _flush_quality_anchor_gradients(
+        self,
+        reason: str,
+        *,
+        increment_round: bool,
+    ) -> Dict[str, Any]:
+        if self.pending_accum_steps <= 0:
+            return {"flushed": False, **self.round_state(), "reason": reason}
+        if self.seen_clients_total != self.expected_clients_set:
+            seen_clients = sorted(self.seen_clients_total)
+            expected_clients = sorted(self.expected_clients_set)
+            self.abort_quality_anchor_round(reason="incomplete_logical_round_flush")
+            raise RuntimeError(
+                "Cannot aggregate an incomplete quality-anchor logical round: "
+                f"seen_clients={seen_clients}, expected_clients={expected_clients}."
+            )
+        if len(self.quality_anchor_contributions) != self.pending_accum_steps:
+            self.abort_quality_anchor_round(reason="inconsistent_contribution_buffer")
+            raise RuntimeError(
+                "Quality-anchor contribution buffer is inconsistent with pending accumulation steps."
+            )
+
+        effective_accum_steps = self.pending_accum_steps
+        round_id_snapshot = self.round_id
+        global_round_snapshot = self.global_round
+        logical_round_snapshot = self.logical_round
+        scheduler_epoch_snapshot = self.scheduler_epoch
+        window_clients = sorted(self.seen_clients_window)
+
+        try:
+            aggregation = aggregate_anchor_gradients(
+                tuple(self.quality_anchor_contributions),
+                self.runtime_cfg.quality_anchor,
+            )
+            if len(aggregation.final_gradients) != len(self.trainable_server_parameters):
+                raise RuntimeError("Final server-gradient tuple length does not match trainable parameters.")
+
+            self.optimizer.zero_grad(set_to_none=True)
+            for parameter, gradient in zip(
+                self.trainable_server_parameters,
+                aggregation.final_gradients,
+            ):
+                if parameter.shape != gradient.shape:
+                    raise RuntimeError("Final server-gradient tensor shape mismatch.")
+                parameter.grad = gradient.to(
+                    device=parameter.device,
+                    dtype=parameter.dtype,
+                ).clone()
+
+            self.optimizer.step()
+            self.optimizer_step_count += 1
+            self._log_optimizer_event(
+                "step_during_quality_anchor_training",
+                reason=reason,
+                effective_accum_steps=effective_accum_steps,
+                increment_round=increment_round,
+                round_id_snapshot=round_id_snapshot,
+            )
+            self.optimizer.zero_grad(set_to_none=True)
+            self._log_optimizer_event(
+                "zero_grad_after_quality_anchor_update",
+                reason=reason,
+                effective_accum_steps=effective_accum_steps,
+                increment_round=increment_round,
+                round_id_snapshot=round_id_snapshot,
+            )
+
+            anchor_stats = self._quality_stats(aggregation.anchor_qualities)
+            non_anchor_stats = self._quality_stats(aggregation.non_anchor_qualities)
+            summary = {
+                "event": "quality_anchor_round",
+                "aggregation_mode": (
+                    "anchor_plus_alignment"
+                    if self.runtime_cfg.quality_anchor.use_gradient_alignment_filter
+                    else "anchor_only"
+                ),
+                "global_round": global_round_snapshot,
+                "logical_round": logical_round_snapshot,
+                "scheduler_epoch": scheduler_epoch_snapshot,
+                "round_id": round_id_snapshot,
+                "cluster_id": self.runtime_cfg.cluster_id,
+                "split_server_id": self.runtime_cfg.cluster_id,
+                "number_of_client_contributions": effective_accum_steps,
+                "anchor_client_count": len(aggregation.anchor_client_ids),
+                "anchor_client_ids": list(aggregation.anchor_client_ids),
+                "anchor_quality_mean": anchor_stats["mean"],
+                "anchor_quality_min": anchor_stats["min"],
+                "anchor_quality_max": anchor_stats["max"],
+                "non_anchor_quality_mean": non_anchor_stats["mean"],
+                "non_anchor_quality_min": non_anchor_stats["min"],
+                "non_anchor_quality_max": non_anchor_stats["max"],
+                "anchor_gradient_norm": aggregation.anchor_gradient_norm,
+                "non_anchor_aggregate_norm": aggregation.non_anchor_gradient_norm,
+                "candidate_gradient_norm": aggregation.final_gradient_norm,
+                "final_gradient_norm": aggregation.final_gradient_norm,
+                "anchor_update_share": self.runtime_cfg.quality_anchor.anchor_update_share,
+                "accepted_non_anchor_count": aggregation.accepted_non_anchor_count,
+                "rejected_non_anchor_count": aggregation.rejected_non_anchor_count,
+            }
+            self._append_quality_anchor_log(summary)
+            if self.runtime_cfg.quality_anchor.debug_logging:
+                for record in aggregation.non_anchor_records:
+                    self._append_quality_anchor_log(
+                        {
+                            "event": "quality_anchor_client_alignment",
+                            "global_round": global_round_snapshot,
+                            "logical_round": logical_round_snapshot,
+                            "scheduler_epoch": scheduler_epoch_snapshot,
+                            "round_id": round_id_snapshot,
+                            "cluster_id": self.runtime_cfg.cluster_id,
+                            "client_id": record.client_id,
+                            "mean_quality": record.mean_quality,
+                            "gradient_norm": record.gradient_norm,
+                            "cosine_with_anchor": record.cosine_with_anchor,
+                            "alignment_weight": record.alignment_weight,
+                            "norm_clip_scale": record.norm_clip_scale,
+                            "accepted_or_rejected": "accepted" if record.accepted else "rejected",
+                            "reason": record.reason,
+                        }
+                    )
+        except Exception:
+            self.optimizer.zero_grad(set_to_none=True)
+            self._reset_round_tracking(increment_round=False)
+            raise
+
+        finished_round_id = self.round_id
+        if increment_round:
+            self._reset_round_tracking(increment_round=True)
+        else:
+            self._reset_window_tracking()
+        print(
+            f"[Server] quality_anchor_flush reason={reason} cluster={self.runtime_cfg.cluster_id} "
+            f"round_id={finished_round_id} effective_accum_steps={effective_accum_steps} "
+            f"anchor_clients={list(aggregation.anchor_client_ids)} "
+            f"accepted_non_anchor={aggregation.accepted_non_anchor_count} "
+            f"optimizer_steps={self.optimizer_step_count}",
+            flush=True,
+        )
+        if (
+            increment_round
+            and self.runtime_cfg.save_every_rounds > 0
+            and finished_round_id % self.runtime_cfg.save_every_rounds == 0
+        ):
+            self._save_latest(flush=False)
+        state_after_flush = self.round_state()
+        return {
+            **state_after_flush,
+            "flushed": True,
+            "reason": reason,
+            "finished_round_id": finished_round_id,
+            "effective_accum_steps": effective_accum_steps,
+            "effective_accumulation_normalizer": None,
+            "flushed_accum_quality_weight_sum": 0.0,
+            "window_clients": window_clients,
+            "anchor_client_ids": list(aggregation.anchor_client_ids),
+            "accepted_non_anchor_count": aggregation.accepted_non_anchor_count,
+            "rejected_non_anchor_count": aggregation.rejected_non_anchor_count,
+        }
+
     def flush_accumulated_gradients(self, reason: str, *, increment_round: bool) -> Dict[str, Any]:
+        if self.runtime_cfg.quality_anchor.use_quality_anchor_aggregation:
+            return self._flush_quality_anchor_gradients(reason, increment_round=increment_round)
         if self.pending_accum_steps <= 0:
             return {"flushed": False, **self.round_state(), "reason": reason}
         effective_accum_steps = self.pending_accum_steps
@@ -402,6 +657,138 @@ class SplitLearningServerState:
             return self.flush_accumulated_gradients(reason=reason, increment_round=False)
         return None
 
+    def _train_step_quality_anchor(
+        self,
+        client_id: str,
+        activations_cpu: torch.Tensor,
+        targets_cpu: torch.Tensor,
+        quality_scores_cpu: Optional[torch.Tensor],
+    ) -> Dict[str, Any]:
+        client_id = str(client_id)
+        try:
+            if not self.expected_clients_set:
+                raise RuntimeError("No active round configured. Call /round/start first.")
+            if client_id not in self.expected_clients_set:
+                raise RuntimeError(f"Client {client_id} is not part of active round {self.round_id}")
+            if client_id in self.seen_clients_total:
+                raise RuntimeError(f"Duplicate contribution from client {client_id} in round {self.round_id}")
+
+            self.global_step += 1
+            input_was_2d = activations_cpu.dim() == 2
+            activations = self._ensure_lstm_input_3d(activations_cpu.to(self.device))
+            targets = targets_cpu.to(self.device)
+            if targets.dim() == 1:
+                targets = targets.unsqueeze(1)
+
+            activations.requires_grad_(True)
+            predictions = self.model(activations)
+            per_sample_loss = self.criterion_per_sample(predictions, targets)
+            if per_sample_loss.dim() > 1:
+                per_sample_loss = per_sample_loss.view(per_sample_loss.size(0), -1).mean(dim=1)
+            else:
+                per_sample_loss = per_sample_loss.reshape(-1)
+            ordinary_loss = per_sample_loss.mean()
+            ordinary_loss_value = float(ordinary_loss.item())
+            quality_scores = self._prepare_quality_scores(
+                quality_scores_cpu,
+                int(per_sample_loss.numel()),
+            )
+            client_mean_quality = float(quality_scores.mean().item())
+
+            extracted_gradients = torch.autograd.grad(
+                ordinary_loss,
+                (activations, *self.trainable_server_parameters),
+                retain_graph=False,
+                create_graph=False,
+            )
+            grad_activations = extracted_gradients[0].detach().cpu()
+            if input_was_2d and grad_activations.dim() == 3 and grad_activations.size(1) == 1:
+                grad_activations = grad_activations.squeeze(1)
+
+            stored_server_gradients = tuple(
+                gradient.detach().to(device="cpu").clone()
+                for gradient in extracted_gradients[1:]
+            )
+            server_gradient_norm = gradient_norm(stored_server_gradients)
+            contribution = ClientGradientContribution(
+                client_id=client_id,
+                cluster_id=self.runtime_cfg.cluster_id,
+                global_round=self.global_round,
+                logical_round=self.logical_round,
+                mean_quality=client_mean_quality,
+                sample_count=int(per_sample_loss.numel()),
+                server_gradients=stored_server_gradients,
+                server_gradient_norm=server_gradient_norm,
+            )
+            self.quality_anchor_contributions.append(contribution)
+
+            self.pending_accum_steps += 1
+            self.seen_clients_total.add(client_id)
+            self.seen_clients_window.add(client_id)
+            self.round_total_contrib_count = len(self.seen_clients_total)
+            self.window_contrib_count = len(self.seen_clients_window)
+
+            active_target = self.active_accum_steps_target
+            seen_total = sorted(self.seen_clients_total)
+            seen_window = sorted(self.seen_clients_window)
+            window_complete = self.pending_accum_steps >= active_target
+            round_complete = self.seen_clients_total == self.expected_clients_set
+            flush_info: Optional[Dict[str, Any]] = None
+            finished_round_id: Optional[int] = None
+
+            if window_complete:
+                flush_info = self.flush_accumulated_gradients(
+                    reason="window_complete",
+                    increment_round=False,
+                )
+
+            if round_complete:
+                finished_round_id = self.round_id
+                if self.pending_accum_steps > 0:
+                    flush_info = self.flush_accumulated_gradients(
+                        reason="round_complete_tail",
+                        increment_round=False,
+                    )
+                if (
+                    self.runtime_cfg.save_every_rounds > 0
+                    and finished_round_id % self.runtime_cfg.save_every_rounds == 0
+                ):
+                    self._save_latest(flush=False)
+                self._reset_round_tracking(increment_round=True)
+
+            print(
+                f"[Server] quality_anchor_train_step cluster={self.runtime_cfg.cluster_id} "
+                f"round_id={finished_round_id if finished_round_id is not None else self.round_id} "
+                f"client={client_id} loss={ordinary_loss_value:.6f} "
+                f"quality_mean={client_mean_quality:.6f} server_gradient_norm={server_gradient_norm:.6f} "
+                f"seen_total={seen_total} seen_window={seen_window} "
+                f"target_accum={active_target} window_complete={window_complete} "
+                f"round_complete={round_complete}",
+                flush=True,
+            )
+            return {
+                "grad_activations": grad_activations,
+                "loss": ordinary_loss_value,
+                "weighted_loss": ordinary_loss_value,
+                "effective_loss": ordinary_loss_value,
+                "client_mean_quality": client_mean_quality,
+                "client_soft_quality": 1.0,
+                "accum_quality_weight_sum": 0.0,
+                "quality_score_min": float(quality_scores.min().item()),
+                "quality_score_max": float(quality_scores.max().item()),
+                "quality_score_mean": client_mean_quality,
+                "server_gradient_norm": server_gradient_norm,
+                "window_complete": window_complete,
+                "round_complete": round_complete,
+                "flush_info": flush_info,
+                "finished_round_id": finished_round_id,
+                **self.round_state(),
+                "active_accum_steps_target": active_target,
+            }
+        except Exception as error:
+            self.abort_quality_anchor_round(reason=f"{type(error).__name__}:{error}")
+            raise
+
     def train_step(
         self,
         client_id: str,
@@ -409,6 +796,13 @@ class SplitLearningServerState:
         targets_cpu: torch.Tensor,
         quality_scores_cpu: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
+        if self.runtime_cfg.quality_anchor.use_quality_anchor_aggregation:
+            return self._train_step_quality_anchor(
+                client_id,
+                activations_cpu,
+                targets_cpu,
+                quality_scores_cpu,
+            )
         client_id = str(client_id)
         if not self.expected_clients_set:
             raise RuntimeError("No active round configured. Call /round/start first.")
@@ -528,11 +922,27 @@ class SplitLearningServerState:
             return {"predictions": preds.detach().cpu().numpy(), "loss": float(loss.item())}
 
     def inference_step(self, client_id: str, activations_cpu: torch.Tensor) -> Dict[str, Any]:
-        self._flush_before_eval_if_needed(reason=f"before_inference:{client_id}") # apply any pending gradients first
+        if FROZEN_VALIDATION_MODE:
+            self.model.eval()
+        else:
+            self._flush_before_eval_if_needed(reason=f"before_inference:{client_id}")
         with torch.no_grad():
             activations = self._ensure_lstm_input_3d(activations_cpu.to(self.device))
-            preds = self.model(activations).detach().cpu()
-            return {"predictions": preds.numpy()}
+            preds_device = self.model(activations)
+            if FROZEN_VALIDATION_MODE and (torch.is_grad_enabled() or preds_device.requires_grad):
+                raise RuntimeError("frozen inference unexpectedly enabled gradients")
+            preds = preds_device.detach().cpu()
+            return {"predictions": preds.numpy(), "gradients_enabled": False}
+
+    def parameter_hash(self) -> str:
+        digest = hashlib.sha256()
+        for name, tensor in sorted(self.model.state_dict().items()):
+            value = tensor.detach().cpu().contiguous()
+            digest.update(name.encode("utf-8"))
+            digest.update(str(value.dtype).encode("ascii"))
+            digest.update(str(tuple(value.shape)).encode("ascii"))
+            digest.update(value.numpy().tobytes())
+        return digest.hexdigest()
 
     def _save_latest(self, flush: bool = True) -> str:
         if flush:
@@ -663,7 +1073,7 @@ def _pickle_response(obj: Dict[str, Any]) -> Response:
 @app.route("/healthz", methods=["GET"])
 def healthz():
     with state.lock:
-        return jsonify({"status": "ok", **state.round_state(), "device": state.device_info})
+        return jsonify({"status": "ok", **state.round_state(), "device": state.device_info, "frozen_validation_mode": FROZEN_VALIDATION_MODE, "parameter_hash": state.parameter_hash()})
 
 
 @app.route("/config", methods=["GET"])
@@ -671,11 +1081,23 @@ def config():
     with state.lock:
         return jsonify({
             "cluster_id": state.runtime_cfg.cluster_id,
+            "frozen_validation_mode": FROZEN_VALIDATION_MODE,
+            "parameter_hash": state.parameter_hash(),
             "server_lr": state.runtime_cfg.learning_rate,
             "save_every_rounds": state.runtime_cfg.save_every_rounds,
             "use_quality_weights": state.runtime_cfg.use_quality_weights,
             "use_quality_as_input": state.runtime_cfg.use_quality_as_input,
             "use_quality_aggregation_weights": state.runtime_cfg.use_quality_aggregation_weights,
+            "use_quality_anchor_aggregation": state.runtime_cfg.quality_anchor.use_quality_anchor_aggregation,
+            "use_gradient_alignment_filter": state.runtime_cfg.quality_anchor.use_gradient_alignment_filter,
+            "use_high_quality_validation_guardrail": state.runtime_cfg.quality_anchor.use_high_quality_validation_guardrail,
+            "quality_anchor_top_fraction": state.runtime_cfg.quality_anchor.top_fraction,
+            "quality_anchor_min_clients": state.runtime_cfg.quality_anchor.min_clients,
+            "quality_anchor_update_share": state.runtime_cfg.quality_anchor.anchor_update_share,
+            "quality_alignment_power": state.runtime_cfg.quality_anchor.alignment_power,
+            "quality_negative_alignment_weight": state.runtime_cfg.quality_anchor.negative_alignment_weight,
+            "quality_low_client_norm_cap": state.runtime_cfg.quality_anchor.low_client_norm_cap,
+            "quality_anchor_eps": state.runtime_cfg.quality_anchor.eps,
             "quality_aggregation_mode": state.runtime_cfg.quality_aggregation_mode,
             "quality_aggregation_q_min": state.runtime_cfg.quality_aggregation_q_min,
             "quality_aggregation_eps": state.runtime_cfg.quality_aggregation_eps,
@@ -690,6 +1112,8 @@ def config():
 
 @app.route("/round/start", methods=["POST"])
 def round_start():
+    if FROZEN_VALIDATION_MODE:
+        return jsonify({"error": "round start is disabled in frozen validation mode"}), 409
     data = request.get_json() or {}
     expected_clients = [str(x) for x in data.get("expected_clients", [])]
     round_id = data.get("round_id")
@@ -701,6 +1125,9 @@ def round_start():
                     expected_clients,
                     round_id=round_id,
                     effective_accum_steps_target=effective_accum_steps_target,
+                    global_round=data.get("global_round"),
+                    logical_round=data.get("logical_round"),
+                    scheduler_epoch=data.get("scheduler_epoch"),
                 )
             )
         except Exception as e:
@@ -715,6 +1142,8 @@ def round_state():
 
 @app.route("/train_step", methods=["POST"])
 def train_step():
+    if FROZEN_VALIDATION_MODE:
+        return jsonify({"error": "training is disabled in frozen validation mode"}), 409
     request_bytes = len(request.get_data(cache=True) or b"")
     t0 = time.perf_counter()
     with state.lock:
@@ -886,6 +1315,8 @@ def inference_step():
 
 @app.route("/flush_gradients", methods=["POST"])
 def flush_gradients():
+    if FROZEN_VALIDATION_MODE:
+        return jsonify({"error": "gradient flushing is disabled in frozen validation mode"}), 409
     with state.lock:
         result = state.flush_accumulated_gradients(reason="manual_flush", increment_round=False)
         return jsonify(result)
@@ -893,6 +1324,8 @@ def flush_gradients():
 
 @app.route("/save_best_checkpoint", methods=["POST"])
 def save_best_checkpoint():
+    if FROZEN_VALIDATION_MODE:
+        return jsonify({"error": "checkpoint saving is disabled in frozen validation mode"}), 409
     with state.lock:
         path = state._save_best(flush=True)
         return jsonify({"path": path})
@@ -900,6 +1333,8 @@ def save_best_checkpoint():
 
 @app.route("/save_final_checkpoint", methods=["POST"])
 def save_final_checkpoint():
+    if FROZEN_VALIDATION_MODE:
+        return jsonify({"error": "checkpoint saving is disabled in frozen validation mode"}), 409
     with state.lock:
         path = state._save_final(flush=True)
         return jsonify({"path": path})
@@ -907,6 +1342,8 @@ def save_final_checkpoint():
 
 @app.route("/save_latest_checkpoint", methods=["POST"])
 def save_latest_checkpoint():
+    if FROZEN_VALIDATION_MODE:
+        return jsonify({"error": "checkpoint saving is disabled in frozen validation mode"}), 409
     with state.lock:
         path = state._save_latest(flush=True)
         return jsonify({"path": path})
@@ -935,6 +1372,8 @@ def load_final_checkpoint():
 
 @app.route("/load_weights", methods=["POST"])
 def load_weights():
+    if FROZEN_VALIDATION_MODE:
+        return jsonify({"error": "FedAvg weight loading is disabled in frozen validation mode"}), 409
     request_bytes = len(request.get_data(cache=True) or b"")
     t0 = time.perf_counter()
     with state.lock:

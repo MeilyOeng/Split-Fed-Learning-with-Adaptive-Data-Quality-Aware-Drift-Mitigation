@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import math
 import pickle
 import sys
 import time
@@ -15,7 +16,11 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from utils.comm_logging import append_comm_row, tensor_shape
-from utils.runtime_utils import derive_dq_mode, quality_scores_needed
+from utils.runtime_utils import build_quality_anchor_config, derive_dq_mode, quality_scores_needed
+from drift.artifacts import CsvArtifactWriter, write_csv, write_json
+from drift.contracts import DetectorEvent, DetectorKey, DetectorName, DetectorParameters, DriftConfig, DriftSource, DriftType, InjectionRecord, TransitionFunction
+from drift.detectors import DetectorRegistry
+from drift.injector import derive_client_seed, inject_series
 
 app = Flask(__name__)
 
@@ -55,6 +60,10 @@ STATIC_FEATURE_GROUPS_RAW = os.environ.get("STATIC_FEATURE_GROUPS", "")
 USE_QUALITY_WEIGHTS = os.environ.get("USE_QUALITY_WEIGHTS", "false").lower() in ("1", "true", "yes", "y")
 USE_QUALITY_AS_INPUT = os.environ.get("USE_QUALITY_AS_INPUT", "false").lower() in ("1", "true", "yes", "y")
 USE_QUALITY_AGGREGATION_WEIGHTS = os.environ.get("USE_QUALITY_AGGREGATION_WEIGHTS", "false").lower() in ("1", "true", "yes", "y")
+QUALITY_ANCHOR_CONFIG = build_quality_anchor_config(os.environ)
+USE_QUALITY_ANCHOR_AGGREGATION = QUALITY_ANCHOR_CONFIG.use_quality_anchor_aggregation
+USE_GRADIENT_ALIGNMENT_FILTER = QUALITY_ANCHOR_CONFIG.use_gradient_alignment_filter
+USE_HIGH_QUALITY_VALIDATION_GUARDRAIL = QUALITY_ANCHOR_CONFIG.use_high_quality_validation_guardrail
 QUALITY_SCORE_PATH = str(os.environ.get("QUALITY_SCORE_PATH", "")).strip()
 QUALITY_INPUT_COLUMNS_RAW = str(os.environ.get("QUALITY_INPUT_COLUMNS", "quality_score")).strip()
 QUALITY_INPUT_COLUMNS = [col.strip() for col in QUALITY_INPUT_COLUMNS_RAW.split(",") if col.strip()] or ["quality_score"]
@@ -62,9 +71,43 @@ QUALITY_WEIGHT_COLUMN = str(os.environ.get("QUALITY_WEIGHT_COLUMN", "quality_sco
 QUALITY_SCORE_GRANULARITY = str(os.environ.get("QUALITY_SCORE_GRANULARITY", "window")).strip().lower()
 STRICT_QUALITY_SCORE_MATCHING = os.environ.get("STRICT_QUALITY_SCORE_MATCHING", "true").lower() in ("1", "true", "yes", "y")
 QUALITY_SCORE_FALLBACK = float(os.environ.get("QUALITY_SCORE_FALLBACK", "1.0"))
-DQ_MODE = derive_dq_mode(USE_QUALITY_WEIGHTS, USE_QUALITY_AS_INPUT, USE_QUALITY_AGGREGATION_WEIGHTS)
-QUALITY_NEEDED = quality_scores_needed(USE_QUALITY_WEIGHTS, USE_QUALITY_AS_INPUT, USE_QUALITY_AGGREGATION_WEIGHTS)
+DQ_MODE = derive_dq_mode(
+    USE_QUALITY_WEIGHTS,
+    USE_QUALITY_AS_INPUT,
+    USE_QUALITY_AGGREGATION_WEIGHTS,
+    USE_QUALITY_ANCHOR_AGGREGATION,
+    USE_GRADIENT_ALIGNMENT_FILTER,
+    USE_HIGH_QUALITY_VALIDATION_GUARDRAIL,
+)
+QUALITY_NEEDED = quality_scores_needed(
+    USE_QUALITY_WEIGHTS,
+    USE_QUALITY_AS_INPUT,
+    USE_QUALITY_AGGREGATION_WEIGHTS,
+    USE_QUALITY_ANCHOR_AGGREGATION,
+)
 MODEL_INPUT_SIZE_RAW = str(os.environ.get("MODEL_INPUT_SIZE", "")).strip()
+DRIFT_INJECTION_ENABLED = os.environ.get("DRIFT_INJECTION_ENABLED", "false").lower() in ("1", "true", "yes", "y")
+DRIFT_DETECTION_ENABLED = os.environ.get("DRIFT_DETECTION_ENABLED", "false").lower() in ("1", "true", "yes", "y")
+DRIFT_SOURCE_RAW = os.environ.get("DRIFT_SOURCE", "input").strip().lower()
+DRIFT_SCOPE = os.environ.get("DRIFT_SCOPE", "test").strip().lower()
+DRIFT_RUN_ID = os.environ.get("DRIFT_RUN_ID", "drift-validation").strip()
+DRIFT_CONFIGURATION_ID = os.environ.get("DRIFT_CONFIGURATION_ID", "default").strip()
+DRIFT_TYPE_RAW = os.environ.get("DRIFT_TYPE", "sudden").strip().lower()
+DRIFT_TRANSITION_RAW = os.environ.get("DRIFT_TRANSITION", "linear").strip().lower()
+DRIFT_MAGNITUDE = float(os.environ.get("DRIFT_MAGNITUDE", "0.5"))
+DRIFT_OFFSET_DELTA = float(os.environ.get("DRIFT_OFFSET_DELTA", "0.0"))
+DRIFT_NOISE_SIGMA = float(os.environ.get("DRIFT_NOISE_SIGMA", "0.0"))
+DRIFT_START_RATIO = float(os.environ.get("DRIFT_START_RATIO", "0.5"))
+DRIFT_END_RATIO_RAW = os.environ.get("DRIFT_END_RATIO", "").strip()
+DRIFT_END_RATIO = float(DRIFT_END_RATIO_RAW) if DRIFT_END_RATIO_RAW else None
+DRIFT_PERIOD = int(os.environ.get("DRIFT_PERIOD", "168"))
+DRIFT_RANDOM_SEED = int(os.environ.get("DRIFT_RANDOM_SEED", "42"))
+DRIFT_CLIENT_IDS = set(value.strip() for value in os.environ.get("DRIFT_CLIENT_IDS", "").split(",") if value.strip())
+DRIFT_CLIENT_FRACTION = float(os.environ.get("DRIFT_CLIENT_FRACTION", "0.5"))
+DRIFT_DETECTORS_RAW = os.environ.get("DRIFT_DETECTORS", "page_hinkley,adwin")
+DRIFT_STREAM_NAME = "standardized_window_endpoint"
+DRIFT_EVENT_BUFFER_SIZE = int(os.environ.get("DRIFT_EVENT_BUFFER_SIZE", "4096"))
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(BASE_DIR, "output"))
 try:
     MODEL_INPUT_SIZE = int(MODEL_INPUT_SIZE_RAW) if MODEL_INPUT_SIZE_RAW else None
 except ValueError:
@@ -87,6 +130,12 @@ client_split_bounds: Dict[Tuple[str, str, int], Dict[str, Tuple[int, int]]] = {}
 client_window_counts: Dict[Tuple[str, str, int], Dict[str, int]] = {}
 client_input_sizes: Dict[Tuple[str, int], int] = {}
 client_offsets: Dict[Tuple[str, int, str], int] = {}
+client_runtime_series: Dict[Tuple[str, str, int], torch.Tensor] = {}
+drift_injection_records: Dict[Tuple[str, str, int], Dict[int, InjectionRecord]] = {}
+drift_selected_clients: set[Tuple[str, int]] = set()
+drift_detector_registry: Optional[DetectorRegistry] = None
+drift_event_writer: Optional[CsvArtifactWriter] = None
+drift_event_counts: Dict[Tuple[str, str], int] = {}
 quality_score_index: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
 quality_score_summary: Dict[str, Any] = {
     "enabled": QUALITY_NEEDED,
@@ -96,6 +145,9 @@ quality_score_summary: Dict[str, Any] = {
     "use_quality_weights": USE_QUALITY_WEIGHTS,
     "use_quality_as_input": USE_QUALITY_AS_INPUT,
     "use_quality_aggregation_weights": USE_QUALITY_AGGREGATION_WEIGHTS,
+    "use_quality_anchor_aggregation": USE_QUALITY_ANCHOR_AGGREGATION,
+    "use_gradient_alignment_filter": USE_GRADIENT_ALIGNMENT_FILTER,
+    "use_high_quality_validation_guardrail": USE_HIGH_QUALITY_VALIDATION_GUARDRAIL,
     "quality_needed": QUALITY_NEEDED,
     "dq_mode": DQ_MODE,
     "granularity": QUALITY_SCORE_GRANULARITY,
@@ -516,6 +568,9 @@ def _load_quality_score_index() -> None:
             "use_quality_weights": USE_QUALITY_WEIGHTS,
             "use_quality_as_input": USE_QUALITY_AS_INPUT,
             "use_quality_aggregation_weights": USE_QUALITY_AGGREGATION_WEIGHTS,
+            "use_quality_anchor_aggregation": USE_QUALITY_ANCHOR_AGGREGATION,
+            "use_gradient_alignment_filter": USE_GRADIENT_ALIGNMENT_FILTER,
+            "use_high_quality_validation_guardrail": USE_HIGH_QUALITY_VALIDATION_GUARDRAIL,
             "quality_needed": False,
             "dq_mode": DQ_MODE,
             "quality_input_columns": QUALITY_INPUT_COLUMNS if USE_QUALITY_AS_INPUT else [],
@@ -526,7 +581,8 @@ def _load_quality_score_index() -> None:
     if not QUALITY_SCORE_PATH:
         raise ValueError(
             "USE_QUALITY_WEIGHTS=true, USE_QUALITY_AS_INPUT=true, or "
-            "USE_QUALITY_AGGREGATION_WEIGHTS=true requires QUALITY_SCORE_PATH to be set."
+            "USE_QUALITY_AGGREGATION_WEIGHTS=true, or USE_QUALITY_ANCHOR_AGGREGATION=true "
+            "requires QUALITY_SCORE_PATH to be set."
         )
 
     quality_path = os.path.join(BASE_DIR, QUALITY_SCORE_PATH) if not os.path.isabs(QUALITY_SCORE_PATH) else QUALITY_SCORE_PATH
@@ -588,6 +644,9 @@ def _load_quality_score_index() -> None:
         "use_quality_weights": USE_QUALITY_WEIGHTS,
         "use_quality_as_input": USE_QUALITY_AS_INPUT,
         "use_quality_aggregation_weights": USE_QUALITY_AGGREGATION_WEIGHTS,
+        "use_quality_anchor_aggregation": USE_QUALITY_ANCHOR_AGGREGATION,
+        "use_gradient_alignment_filter": USE_GRADIENT_ALIGNMENT_FILTER,
+        "use_high_quality_validation_guardrail": USE_HIGH_QUALITY_VALIDATION_GUARDRAIL,
         "quality_needed": True,
         "dq_mode": DQ_MODE,
         "row_count": int(len(df)),
@@ -627,8 +686,115 @@ def _quality_record_for_window(client_id: int, mode: str, window_start_index: in
     }
 
 
+def _drift_visible_bounds(series_key: Tuple[str, str, int]) -> Tuple[int, int]:
+    split_start, split_end = client_split_bounds[series_key]["test"]
+    return split_start + WINDOW_SIZE - 1, split_end + WINDOW_SIZE - 1
+
+
+def _resolve_ratio_index(start: int, end_exclusive: int, ratio: float, *, allow_endpoint: bool = False) -> int:
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError("drift ratios must be in [0, 1]")
+    resolved = start + int(math.floor(ratio * (end_exclusive - start)))
+    return min(resolved, end_exclusive if allow_endpoint else end_exclusive - 1)
+
+
+def _drift_event_sink(event: DetectorEvent) -> None:
+    if drift_event_writer is not None:
+        drift_event_writer.append(event)
+    key = (event.client_id, event.detector_name)
+    drift_event_counts[key] = drift_event_counts.get(key, 0) + 1
+
+
+def _initialize_drift_runtime() -> None:
+    global drift_detector_registry, drift_event_writer
+    if not (DRIFT_INJECTION_ENABLED or DRIFT_DETECTION_ENABLED):
+        return
+    if DRIFT_SOURCE_RAW != "input" or DRIFT_SCOPE != "test":
+        raise ValueError("this milestone supports only DRIFT_SOURCE=input and DRIFT_SCOPE=test")
+    if DRIFT_DETECTION_ENABLED and not NORMALIZE:
+        raise ValueError("DRIFT_DETECTION_ENABLED requires NORMALIZE=true for standardized endpoint detection")
+    if not DRIFT_RUN_ID or not DRIFT_CONFIGURATION_ID:
+        raise ValueError("DRIFT_RUN_ID and DRIFT_CONFIGURATION_ID must be non-empty")
+    if not 0.0 <= DRIFT_CLIENT_FRACTION <= 1.0:
+        raise ValueError("DRIFT_CLIENT_FRACTION must be in [0, 1]")
+    drift_type = DriftType.parse(DRIFT_TYPE_RAW)
+    transition = TransitionFunction.parse(DRIFT_TRANSITION_RAW)
+    candidates = sorted({(cluster_id, client_id) for mode, cluster_id, client_id in client_series if mode == "test"})
+    requested = set(DRIFT_CLIENT_IDS)
+    if not DRIFT_INJECTION_ENABLED:
+        selected = set()
+    elif requested:
+        selected = {(cluster_id, client_id) for cluster_id, client_id in candidates if str(client_id) in requested or f"{cluster_id}:{client_id}" in requested}
+    else:
+        local_rng = __import__("numpy").random.default_rng(derive_client_seed(DRIFT_RANDOM_SEED, run_id=DRIFT_RUN_ID, cluster_id=str(STREAM_CLUSTER_ID or "all"), client_id="selection"))
+        count = int(round(len(candidates) * DRIFT_CLIENT_FRACTION))
+        chosen = local_rng.choice(len(candidates), size=count, replace=False).tolist() if count else []
+        selected = {candidates[index] for index in chosen}
+    drift_selected_clients.update(selected)
+
+    drift_dir = os.path.join(OUTPUT_DIR, "drift")
+    os.makedirs(drift_dir, exist_ok=True)
+    manifest_rows = []
+    if DRIFT_INJECTION_ENABLED and drift_type is not DriftType.NONE:
+        for cluster_id, client_id in sorted(selected):
+            key = _series_key("test", cluster_id, client_id)
+            base = client_series[key]
+            visible_start, visible_end = _drift_visible_bounds(key)
+            start_index = _resolve_ratio_index(visible_start, visible_end, DRIFT_START_RATIO)
+            end_index = None
+            if drift_type in (DriftType.GRADUAL, DriftType.INCREMENTAL):
+                if DRIFT_END_RATIO is None:
+                    raise ValueError(f"{drift_type.value} drift requires DRIFT_END_RATIO")
+                end_index = _resolve_ratio_index(visible_start, visible_end, DRIFT_END_RATIO, allow_endpoint=True)
+            seed = derive_client_seed(DRIFT_RANDOM_SEED, run_id=DRIFT_RUN_ID, cluster_id=cluster_id, client_id=str(client_id))
+            cfg = DriftConfig(
+                run_id=DRIFT_RUN_ID, configuration_id=DRIFT_CONFIGURATION_ID, cluster_id=cluster_id, client_id=str(client_id),
+                mode="test", scope="test", drift_type=drift_type, drift_source=DriftSource.INPUT,
+                start_index=start_index, end_index=end_index, magnitude=DRIFT_MAGNITUDE, offset_delta=DRIFT_OFFSET_DELTA,
+                noise_sigma=DRIFT_NOISE_SIGMA, period=DRIFT_PERIOD if drift_type is DriftType.RECURRING else None,
+                transition=transition, random_seed=seed, requested_start_ratio=DRIFT_START_RATIO,
+                requested_end_ratio=DRIFT_END_RATIO, segment_start_index=visible_start, segment_end_index_exclusive=visible_end,
+            )
+            injected = inject_series(base.cpu().numpy(), cfg, timestamps=client_timestamps[key])
+            runtime = base.clone()
+            runtime[visible_start:visible_end] = torch.as_tensor(injected.runtime_values[visible_start:visible_end], dtype=runtime.dtype)
+            if not torch.equal(runtime[:visible_start], base[:visible_start]) or not torch.equal(runtime[visible_end:], base[visible_end:]):
+                raise AssertionError("drift injection changed observations outside the detector-visible test segment")
+            client_runtime_series[key] = runtime.contiguous()
+            visible_records = tuple(injected.records[visible_start:visible_end])
+            drift_injection_records[key] = {record.observation_index: record for record in visible_records}
+            manifest_rows.extend(visible_records)
+        write_csv(os.path.join(drift_dir, "injection_manifest.csv"), manifest_rows, InjectionRecord)
+
+    if DRIFT_DETECTION_ENABLED:
+        params = DetectorParameters(
+            ph_min_instances=int(os.environ.get("PH_MIN_INSTANCES", "300")),
+            ph_delta=float(os.environ.get("PH_DELTA", "0.005")), ph_threshold=float(os.environ.get("PH_THRESHOLD", "50.0")),
+            ph_alpha=float(os.environ.get("PH_ALPHA", "0.9999")), adwin_delta=float(os.environ.get("ADWIN_DELTA", "0.002")),
+            adwin_clock=int(os.environ.get("ADWIN_CLOCK", "32")), adwin_max_buckets=int(os.environ.get("ADWIN_MAX_BUCKETS", "5")),
+            adwin_min_window_length=int(os.environ.get("ADWIN_MIN_WINDOW_LENGTH", "5")), adwin_grace_period=int(os.environ.get("ADWIN_GRACE_PERIOD", "10")),
+        )
+        names = tuple(DetectorName.parse(value) for value in DRIFT_DETECTORS_RAW.split(",") if value.strip())
+        if not names:
+            raise ValueError("DRIFT_DETECTORS must contain at least one detector")
+        drift_event_writer = CsvArtifactWriter.for_dataclass(os.path.join(drift_dir, "detector_events.csv"), DetectorEvent)
+        drift_event_writer.reset()
+        drift_detector_registry = DetectorRegistry(params, max_buffered_events=DRIFT_EVENT_BUFFER_SIZE, event_sink=_drift_event_sink)
+        app.config["DRIFT_DETECTOR_NAMES"] = names
+    write_json(os.path.join(drift_dir, "resolved_config.json"), {
+        "run_id": DRIFT_RUN_ID, "configuration_id": DRIFT_CONFIGURATION_ID, "source": DRIFT_SOURCE_RAW, "scope": DRIFT_SCOPE,
+        "injection_enabled": DRIFT_INJECTION_ENABLED, "detection_enabled": DRIFT_DETECTION_ENABLED,
+        "drift_type": drift_type.value, "transition": transition.value, "start_ratio": DRIFT_START_RATIO,
+        "end_ratio": DRIFT_END_RATIO, "period": DRIFT_PERIOD, "random_seed": DRIFT_RANDOM_SEED,
+        "selected_clients": [{"cluster_id": cluster, "client_id": client} for cluster, client in sorted(selected)],
+        "clean_clients": [{"cluster_id": cluster, "client_id": client} for cluster, client in candidates if (cluster, client) not in selected],
+        "coordinate_system": "absolute observation index; detector-visible test endpoints",
+    })
+
+
 load_cluster_data()
 _load_quality_score_index()
+_initialize_drift_runtime()
 
 
 @app.route("/health", methods=["GET"])
@@ -651,6 +817,9 @@ def health():
             "use_quality_as_input": USE_QUALITY_AS_INPUT,
             "use_quality_weights": USE_QUALITY_WEIGHTS,
             "use_quality_aggregation_weights": USE_QUALITY_AGGREGATION_WEIGHTS,
+            "use_quality_anchor_aggregation": USE_QUALITY_ANCHOR_AGGREGATION,
+            "use_gradient_alignment_filter": USE_GRADIENT_ALIGNMENT_FILTER,
+            "use_high_quality_validation_guardrail": USE_HIGH_QUALITY_VALIDATION_GUARDRAIL,
             "dq_mode": DQ_MODE,
             "quality_needed": QUALITY_NEEDED,
             "requested_static_feature_groups": _parse_optional_csv(STATIC_FEATURE_GROUPS_RAW),
@@ -694,6 +863,9 @@ def stream_norm_stats():
         "use_static_features": USE_STATIC_FEATURES,
         "use_quality_as_input": USE_QUALITY_AS_INPUT,
         "use_quality_weights": USE_QUALITY_WEIGHTS,
+        "use_quality_anchor_aggregation": USE_QUALITY_ANCHOR_AGGREGATION,
+        "use_gradient_alignment_filter": USE_GRADIENT_ALIGNMENT_FILTER,
+        "use_high_quality_validation_guardrail": USE_HIGH_QUALITY_VALIDATION_GUARDRAIL,
         "dq_mode": DQ_MODE,
         "quality_needed": QUALITY_NEEDED,
         "requested_static_feature_groups": _parse_optional_csv(STATIC_FEATURE_GROUPS_RAW),
@@ -825,7 +997,7 @@ def stream_next():
     if series_key not in client_series:
         return jsonify({"error": f"Unknown cluster/client/mode: {cluster_id}/{client_id}/{mode}"}), 404
 
-    values = client_series[series_key]
+    values = client_runtime_series.get(series_key, client_series[series_key])
     timestamps = client_timestamps.get(series_key, [])
     frequency_delta = client_frequency_deltas.get(series_key)
     target_lookup = client_target_lookup.get(series_key)
@@ -882,12 +1054,33 @@ def stream_next():
         [float(record.get("quality_weight_score", record.get("quality_score", QUALITY_SCORE_FALLBACK))) for record in quality_records],
         dtype=torch.float32,
     )
+    quality_anchor_scores = None
+    if USE_QUALITY_ANCHOR_AGGREGATION:
+        quality_anchor_scores = torch.tensor(
+            [float(record.get("quality_score", QUALITY_SCORE_FALLBACK)) for record in quality_records],
+            dtype=torch.float32,
+        )
 
     if NORMALIZE:
         mean, scale = client_norm_stats[_client_key(cluster_id, client_id)]
         X_batch = X_batch.clone()
         X_batch[:, :, 0] = _normalize_tensor(X_batch[:, :, 0], mean, scale)
         y_batch = _normalize_tensor(y_batch, mean, scale)
+
+    drift_batch_metadata = []
+    if DRIFT_DETECTION_ENABLED and mode == "test" and drift_detector_registry is not None:
+        names = app.config.get("DRIFT_DETECTOR_NAMES", ())
+        record_lookup = drift_injection_records.get(series_key, {})
+        for i, observation_index in enumerate(window_end_indices):
+            timestamp = None if observation_index >= len(timestamps) or pd.isna(timestamps[observation_index]) else pd.Timestamp(timestamps[observation_index]).isoformat()
+            record = record_lookup.get(observation_index)
+            for detector_name in names:
+                drift_detector_registry.update(
+                    DetectorKey(DRIFT_RUN_ID, cluster_id, str(client_id), mode, DRIFT_STREAM_NAME, detector_name),
+                    observation_index=observation_index, value=float(X_batch[i, -1, 0].item()), timestamp=timestamp,
+                    regime_active=record.regime_active if record else False, transform_applied=record.transform_applied if record else False,
+                )
+            drift_batch_metadata.append({"observation_index": observation_index, "timestamp": timestamp, "drifted_client": _client_key(cluster_id, client_id) in drift_selected_clients})
 
     payload = {
         "X": X_batch,
@@ -925,6 +1118,10 @@ def stream_next():
             "dimension_freshness": [record.get("dimension_freshness") for record in quality_records],
         },
     }
+    if DRIFT_INJECTION_ENABLED or DRIFT_DETECTION_ENABLED:
+        payload["drift_metadata"] = drift_batch_metadata
+    if USE_QUALITY_ANCHOR_AGGREGATION:
+        payload["quality_anchor_scores"] = quality_anchor_scores
     payload_blob = pickle.dumps(payload)
 
     if COMM_LOG_STREAM:

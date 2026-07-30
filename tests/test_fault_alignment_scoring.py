@@ -73,7 +73,12 @@ class FaultAlignmentScoringTests(unittest.TestCase):
 
             clean_dataset = load_wide_demand_csv(clean_path, timestamp_col="Fecha_Hora")
             current_dataset = load_wide_demand_csv(current_path, timestamp_col="Fecha_Hora")
-            scorer = WideDemandQualityScorer(config={})
+            scorer = WideDemandQualityScorer(
+                config={
+                    "validity": {"upper_bound": 100.0},
+                    "consistency": {"rate_of_change_threshold": 100.0},
+                }
+            )
             scores = scorer.score(current_dataset, clean_dataset)
             row = scores.loc[scores["client_id"] == "9901"].iloc[0]
 

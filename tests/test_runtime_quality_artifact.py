@@ -37,7 +37,10 @@ class RuntimeQualityArtifactTests(unittest.TestCase):
                 clean_path=clean_path,
                 current_path=current_path,
                 output_path=output_path,
-                score_config={},
+                score_config={
+                    "validity": {"upper_bound": 100.0},
+                    "consistency": {"rate_of_change_threshold": 100.0},
+                },
                 window_size_steps=3,
                 stride_steps=1,
                 forecast_horizon=1,
@@ -45,6 +48,7 @@ class RuntimeQualityArtifactTests(unittest.TestCase):
                 val_ratio=0.25,
                 test_ratio=0.25,
                 pca_mode="fit",
+                artifact_mode="runtime_scores",
             )
 
             self.assertTrue(
@@ -70,6 +74,7 @@ class RuntimeQualityArtifactTests(unittest.TestCase):
             actual_modes = dict(zip(dataset["window_start_index"].astype(int), dataset["mode"]))
             self.assertEqual(actual_modes, expected_modes)
             self.assertTrue(dataset["quality_score"].between(0.0, 1.0).all())
+            self.assertFalse(any(col.startswith("y_") for col in dataset.columns))
 
 
     def test_client_average_final_score_is_dimension_mean(self) -> None:
@@ -115,7 +120,11 @@ class RuntimeQualityArtifactTests(unittest.TestCase):
                 clean_path=clean_path,
                 current_path=current_path,
                 output_path=output_path,
-                score_config={"final_score": {"method": "average"}},
+                score_config={
+                    "final_score": {"method": "average"},
+                    "validity": {"upper_bound": 100.0},
+                    "consistency": {"rate_of_change_threshold": 100.0},
+                },
                 window_size_steps=3,
                 stride_steps=1,
                 forecast_horizon=1,
@@ -123,6 +132,7 @@ class RuntimeQualityArtifactTests(unittest.TestCase):
                 val_ratio=0.25,
                 test_ratio=0.25,
                 pca_mode="fit",
+                artifact_mode="runtime_scores",
             )
 
             dims = dataset[
@@ -137,6 +147,7 @@ class RuntimeQualityArtifactTests(unittest.TestCase):
             expected = dims.mean(axis=1)
             self.assertEqual(set(dataset["score_method"]), {"average"})
             self.assertTrue((dataset["quality_score"].round(12) == expected.round(12)).all())
+            self.assertFalse(any(col.startswith("y_") for col in dataset.columns))
 
 
 if __name__ == "__main__":

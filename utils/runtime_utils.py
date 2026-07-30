@@ -4,8 +4,9 @@ import csv
 import json
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import requests
 import torch
@@ -25,6 +26,9 @@ def derive_dq_mode(
     use_quality_weights: bool,
     use_quality_as_input: bool,
     use_quality_aggregation_weights: bool = False,
+    use_quality_anchor_aggregation: bool = False,
+    use_gradient_alignment_filter: bool = False,
+    use_high_quality_validation_guardrail: bool = False,
 ) -> str:
     active = []
     if use_quality_as_input:
@@ -33,6 +37,12 @@ def derive_dq_mode(
         active.append("window_loss_weight")
     if use_quality_aggregation_weights:
         active.append("soft_client_gradient_weight")
+    if use_quality_anchor_aggregation:
+        active.append("quality_anchor_aggregation")
+    if use_gradient_alignment_filter:
+        active.append("gradient_alignment_filter")
+    if use_high_quality_validation_guardrail:
+        active.append("high_quality_validation_guardrail")
     return "none" if not active else "_and_".join(active)
 
 
@@ -40,8 +50,86 @@ def quality_scores_needed(
     use_quality_weights: bool,
     use_quality_as_input: bool,
     use_quality_aggregation_weights: bool = False,
+    use_quality_anchor_aggregation: bool = False,
 ) -> bool:
-    return bool(use_quality_weights or use_quality_as_input or use_quality_aggregation_weights)
+    return bool(
+        use_quality_weights
+        or use_quality_as_input
+        or use_quality_aggregation_weights
+        or use_quality_anchor_aggregation
+    )
+
+
+@dataclass(frozen=True)
+class QualityAnchorConfig:
+    use_quality_anchor_aggregation: bool
+    use_gradient_alignment_filter: bool
+    use_high_quality_validation_guardrail: bool
+    top_fraction: float
+    min_clients: int
+    anchor_update_share: float
+    alignment_power: float
+    negative_alignment_weight: float
+    low_client_norm_cap: float
+    eps: float
+    debug_logging: bool
+
+
+def build_quality_anchor_config(env: Mapping[str, Any]) -> QualityAnchorConfig:
+    config = QualityAnchorConfig(
+        use_quality_anchor_aggregation=parse_bool(env.get("USE_QUALITY_ANCHOR_AGGREGATION", "false")),
+        use_gradient_alignment_filter=parse_bool(env.get("USE_GRADIENT_ALIGNMENT_FILTER", "false")),
+        use_high_quality_validation_guardrail=parse_bool(
+            env.get("USE_HIGH_QUALITY_VALIDATION_GUARDRAIL", "false")
+        ),
+        top_fraction=float(env.get("QUALITY_ANCHOR_TOP_FRACTION", "0.40")),
+        min_clients=int(env.get("QUALITY_ANCHOR_MIN_CLIENTS", "3")),
+        anchor_update_share=float(env.get("QUALITY_ANCHOR_UPDATE_SHARE", "0.80")),
+        alignment_power=float(env.get("QUALITY_ALIGNMENT_POWER", "1.0")),
+        negative_alignment_weight=float(env.get("QUALITY_NEGATIVE_ALIGNMENT_WEIGHT", "0.0")),
+        low_client_norm_cap=float(env.get("QUALITY_LOW_CLIENT_NORM_CAP", "2.0")),
+        eps=float(env.get("QUALITY_ANCHOR_EPS", "1e-8")),
+        debug_logging=parse_bool(env.get("QUALITY_AGGREGATION_DEBUG_LOG", "false")),
+    )
+
+    if config.use_high_quality_validation_guardrail:
+        raise ValueError(
+            "USE_HIGH_QUALITY_VALIDATION_GUARDRAIL is reserved for the next implementation stage."
+        )
+    if config.use_gradient_alignment_filter and not config.use_quality_anchor_aggregation:
+        raise ValueError(
+            "USE_GRADIENT_ALIGNMENT_FILTER=true requires USE_QUALITY_ANCHOR_AGGREGATION=true."
+        )
+
+    legacy_flags = {
+        "USE_QUALITY_AS_INPUT": parse_bool(env.get("USE_QUALITY_AS_INPUT", "false")),
+        "USE_QUALITY_WEIGHTS": parse_bool(env.get("USE_QUALITY_WEIGHTS", "false")),
+        "USE_QUALITY_AGGREGATION_WEIGHTS": parse_bool(
+            env.get("USE_QUALITY_AGGREGATION_WEIGHTS", "false")
+        ),
+    }
+    active_legacy = [name for name, enabled in legacy_flags.items() if enabled]
+    if config.use_quality_anchor_aggregation and active_legacy:
+        raise ValueError(
+            "USE_QUALITY_ANCHOR_AGGREGATION=true is mutually exclusive with legacy quality modes: "
+            + ", ".join(active_legacy)
+        )
+
+    if not (0.0 < config.top_fraction <= 1.0):
+        raise ValueError("QUALITY_ANCHOR_TOP_FRACTION must be within (0, 1].")
+    if config.min_clients < 1:
+        raise ValueError("QUALITY_ANCHOR_MIN_CLIENTS must be at least 1.")
+    if not (0.0 < config.anchor_update_share <= 1.0):
+        raise ValueError("QUALITY_ANCHOR_UPDATE_SHARE must be within (0, 1].")
+    if config.alignment_power <= 0.0:
+        raise ValueError("QUALITY_ALIGNMENT_POWER must be positive.")
+    if not (0.0 <= config.negative_alignment_weight <= 1.0):
+        raise ValueError("QUALITY_NEGATIVE_ALIGNMENT_WEIGHT must be within [0, 1].")
+    if config.low_client_norm_cap <= 0.0:
+        raise ValueError("QUALITY_LOW_CLIENT_NORM_CAP must be positive.")
+    if config.eps <= 0.0:
+        raise ValueError("QUALITY_ANCHOR_EPS must be positive.")
+    return config
 
 
 def compute_model_input_size(

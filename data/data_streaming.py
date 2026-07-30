@@ -94,6 +94,9 @@ class StreamingIterableDataset(IterableDataset):
             quality_weight_scores = payload.get("quality_weight_scores")
             if quality_weight_scores is not None and not torch.is_tensor(quality_weight_scores):
                 quality_weight_scores = torch.tensor(quality_weight_scores, dtype=torch.float32)
+            quality_anchor_scores = payload.get("quality_anchor_scores")
+            if quality_anchor_scores is not None and not torch.is_tensor(quality_anchor_scores):
+                quality_anchor_scores = torch.tensor(quality_anchor_scores, dtype=torch.float32)
 
             meta: Dict[str, Any] = {
                 "cluster_id": payload.get("cluster_id"),
@@ -106,6 +109,7 @@ class StreamingIterableDataset(IterableDataset):
                 "target_timestamps": payload.get("target_timestamps", []),
                 "quality_scores": quality_scores,
                 "quality_weight_scores": quality_weight_scores,
+                "quality_anchor_scores": quality_anchor_scores,
                 "quality_score_metadata": payload.get("quality_score_metadata", {}),
             }
 

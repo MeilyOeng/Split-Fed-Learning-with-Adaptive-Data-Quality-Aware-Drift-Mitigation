@@ -168,6 +168,73 @@ def _offline_freshness_scores(window, config: Optional[dict]) -> dict[str, float
     }
 
 
+def _weighted_average(values: dict[str, float], weights: dict[str, float]) -> float:
+    total_weight = 0.0
+    total = 0.0
+    for key, value in values.items():
+        weight = float(weights.get(key, 1.0))
+        total_weight += weight
+        total += weight * float(value)
+    if total_weight <= 0:
+        return float(np.mean(list(values.values()))) if values else 0.0
+    return float(total / total_weight)
+
+
+def _historical_noise_instability_score(window, config: Optional[dict]) -> float:
+    """Score current-window volatility against previous timestamps from the same client."""
+    config = config or {}
+    accuracy_cfg = dict((config.get("accuracy", {}) or {}))
+    timestamp_col = window.timestamp_col
+    client_id = window.client_id
+
+    current_values = pd.to_numeric(window.current_raw_window.get(client_id), errors="coerce")
+    current_diffs = current_values.diff().abs().dropna().to_numpy(dtype=float)
+    current_diffs = current_diffs[np.isfinite(current_diffs)]
+    if current_diffs.size == 0:
+        return 0.0 if current_values.notna().sum() == 0 else 1.0
+
+    history = window.current_raw_history
+    history_ts = pd.to_datetime(history[timestamp_col], errors="coerce")
+    history_values = pd.to_numeric(history.get(client_id), errors="coerce")
+    prior_mask = history_ts.notna() & (history_ts < pd.Timestamp(window.window_start))
+    history_values = history_values.loc[prior_mask]
+
+    lookback_steps = accuracy_cfg.get("historical_lookback_steps")
+    if lookback_steps is not None:
+        history_values = history_values.tail(max(1, int(lookback_steps)))
+
+    history_diffs = history_values.diff().abs().dropna().to_numpy(dtype=float)
+    history_diffs = history_diffs[np.isfinite(history_diffs)]
+    min_diffs = int(accuracy_cfg.get("historical_min_diffs", 24))
+    if history_diffs.size < min_diffs:
+        return 1.0
+
+    quantile = float(accuracy_cfg.get("historical_diff_quantile", 0.95))
+    quantile = min(1.0, max(0.0, quantile))
+    threshold = float(np.quantile(history_diffs, quantile))
+    epsilon = float(accuracy_cfg.get("epsilon", 1e-6))
+    if threshold <= epsilon:
+        threshold = max(float(np.mean(history_diffs)), epsilon)
+
+    anomaly_ratio = float((current_diffs > threshold).mean())
+    return float(max(0.0, min(1.0, 1.0 - anomaly_ratio)))
+
+
+def _replace_accuracy_noise_score_with_history(
+    acc: dict[str, float],
+    window,
+    score_config: dict,
+) -> dict[str, float]:
+    updated = dict(acc)
+    updated["A3"] = _historical_noise_instability_score(window, score_config)
+    weights = dict((score_config.get("subcheck_weights", {}) or {}).get("accuracy", {}) or {})
+    updated["accuracy"] = _weighted_average(
+        {"A1": updated["A1"], "A2": updated["A2"], "A3": updated["A3"]},
+        weights,
+    )
+    return updated
+
+
 def _build_window_row(
     window,
     *,
@@ -184,6 +251,7 @@ def _build_window_row(
     val = scorer.validity.score_client(current, clean, client_id)
     cons = scorer.consistency.score_client(current, clean, client_id)
     acc = scorer.accuracy.score_client(current, clean, client_id)
+    acc = _replace_accuracy_noise_score_with_history(acc, window, score_config)
     freshness = _offline_freshness_scores(window, score_config)
 
     row: dict[str, float | str] = {
@@ -285,6 +353,7 @@ def _finalize_csv_output(
     pca_model_output_path: Optional[Path | str],
     chunk_size: int,
     score_config: Optional[dict] = None,
+    include_target_columns: bool = True,
 ) -> None:
     score_config = score_config or {}
     method = final_score_method(score_config)
@@ -322,6 +391,8 @@ def _finalize_csv_output(
         chunk["dimension_consistency"] = chunk["y_consistency"].astype(float)
         chunk["dimension_accuracy"] = chunk["y_accuracy"].astype(float)
         chunk["dimension_freshness"] = chunk["y_freshness"].astype(float)
+        if not include_target_columns:
+            chunk = chunk.drop(columns=[col for col in TARGET_COLUMNS if col in chunk.columns])
         chunk = chunk.loc[:, _ordered_output_columns(chunk.columns.tolist())]
         chunk.to_csv(output_path, mode="w" if not wrote_header else "a", header=not wrote_header, index=False)
         wrote_header = True
@@ -419,6 +490,7 @@ def _build_csv_artifact(
             pca_model_output_path=pca_model_output_path,
             chunk_size=chunk_size,
             score_config=score_config,
+            include_target_columns=include_features,
         )
 
     if return_dataframe:
@@ -577,6 +649,8 @@ def build_demand_label_dataset(
     dataset["dimension_consistency"] = dataset["y_consistency"].astype(float)
     dataset["dimension_accuracy"] = dataset["y_accuracy"].astype(float)
     dataset["dimension_freshness"] = dataset["y_freshness"].astype(float)
+    if not include_features:
+        dataset = dataset.drop(columns=[col for col in TARGET_COLUMNS if col in dataset.columns])
     dataset = dataset.loc[:, _ordered_output_columns(dataset.columns.tolist())]
     _save_dataframe(dataset, output_path)
     return dataset

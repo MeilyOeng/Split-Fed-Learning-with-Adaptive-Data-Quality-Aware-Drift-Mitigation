@@ -11,11 +11,12 @@ window_faulting:
   total_faulty_window_fraction: 0.35
 
   dimension_window_fractions:
-    completeness: 0.10
-    consistency: 0.10
+    completeness: 0.05
+    consistency: 0.05
     accuracy: 0.05
     validity: 0.05
-    mixed: 0.05
+    freshness: 0.03
+    mixed: 0.12
 
   min_faults_per_faulty_window: 1
   max_faults_per_faulty_window: 2
@@ -32,7 +33,7 @@ clients:
   # so selected clients are nested by deterministic rank for the same seed.
   selection_mode: per_cluster_random
   selected: []
-  random_count: 8
+  random_count: 4
   # random_fraction: 0.40
   rounding: round
   min_count_per_cluster: 1
@@ -61,5 +62,8 @@ faults:
 
   validity:
     high_multiplier: 3.0
+
+  freshness:
+    delay_steps: 5
 
 restore_expected_timestamps_after_injection: true

@@ -26,6 +26,7 @@ from utils.runtime_utils import (
     _get_env,
     augment_sequence_inputs_with_quality,
     build_lstm_config_from_env,
+    build_quality_anchor_config,
     compute_model_input_size,
     derive_dq_mode,
     get_device_info,
@@ -139,6 +140,9 @@ class ClientRuntimeConfig:
     use_quality_as_input: bool
     use_quality_weights: bool
     use_quality_aggregation_weights: bool
+    use_quality_anchor_aggregation: bool
+    use_gradient_alignment_filter: bool
+    use_high_quality_validation_guardrail: bool
     dq_mode: str
     quality_score_path: str
     quality_input_dim: int
@@ -151,6 +155,7 @@ class ClusteredClientRunner:
         use_quality_as_input = parse_bool(_get_env("USE_QUALITY_AS_INPUT", "false"))
         use_quality_weights = parse_bool(_get_env("USE_QUALITY_WEIGHTS", "false"))
         use_quality_aggregation_weights = parse_bool(_get_env("USE_QUALITY_AGGREGATION_WEIGHTS", "false"))
+        quality_anchor_config = build_quality_anchor_config(os.environ)
         self.runtime_cfg = ClientRuntimeConfig(
             client_id=_get_env("CLIENT_ID", "9900002"),
             cluster_id=str(_get_env("CLUSTER_ID", "0")).replace("cluster_", ""),
@@ -170,7 +175,17 @@ class ClusteredClientRunner:
             use_quality_as_input=use_quality_as_input,
             use_quality_weights=use_quality_weights,
             use_quality_aggregation_weights=use_quality_aggregation_weights,
-            dq_mode=derive_dq_mode(use_quality_weights, use_quality_as_input, use_quality_aggregation_weights),
+            use_quality_anchor_aggregation=quality_anchor_config.use_quality_anchor_aggregation,
+            use_gradient_alignment_filter=quality_anchor_config.use_gradient_alignment_filter,
+            use_high_quality_validation_guardrail=quality_anchor_config.use_high_quality_validation_guardrail,
+            dq_mode=derive_dq_mode(
+                use_quality_weights,
+                use_quality_as_input,
+                use_quality_aggregation_weights,
+                quality_anchor_config.use_quality_anchor_aggregation,
+                quality_anchor_config.use_gradient_alignment_filter,
+                quality_anchor_config.use_high_quality_validation_guardrail,
+            ),
             quality_score_path=str(_get_env("QUALITY_SCORE_PATH", "") or "").strip(),
             quality_input_dim=int(_get_env("QUALITY_INPUT_DIM", "1")),
             base_input_size=None,
@@ -223,6 +238,8 @@ class ClusteredClientRunner:
             f"use_quality_as_input={self.runtime_cfg.use_quality_as_input} "
             f"use_quality_weights={self.runtime_cfg.use_quality_weights} "
             f"use_quality_aggregation_weights={self.runtime_cfg.use_quality_aggregation_weights} "
+            f"use_quality_anchor_aggregation={self.runtime_cfg.use_quality_anchor_aggregation} "
+            f"use_gradient_alignment_filter={self.runtime_cfg.use_gradient_alignment_filter} "
             f"base_input_size={self.runtime_cfg.base_input_size} "
             f"model_input_size={self.runtime_cfg.model_input_size}",
             flush=True,
@@ -272,6 +289,9 @@ class ClusteredClientRunner:
                     "use_quality_as_input": self.runtime_cfg.use_quality_as_input,
                     "use_quality_weights": self.runtime_cfg.use_quality_weights,
                     "use_quality_aggregation_weights": self.runtime_cfg.use_quality_aggregation_weights,
+                    "use_quality_anchor_aggregation": self.runtime_cfg.use_quality_anchor_aggregation,
+                    "use_gradient_alignment_filter": self.runtime_cfg.use_gradient_alignment_filter,
+                    "use_high_quality_validation_guardrail": self.runtime_cfg.use_high_quality_validation_guardrail,
                     "dq_mode": self.runtime_cfg.dq_mode,
                     "base_input_size": self.runtime_cfg.base_input_size,
                     "model_input_size": self.runtime_cfg.model_input_size,
@@ -810,6 +830,9 @@ class ClusteredClientRunner:
             "use_quality_as_input": self.runtime_cfg.use_quality_as_input,
             "use_quality_weights": self.runtime_cfg.use_quality_weights,
             "use_quality_aggregation_weights": self.runtime_cfg.use_quality_aggregation_weights,
+            "use_quality_anchor_aggregation": self.runtime_cfg.use_quality_anchor_aggregation,
+            "use_gradient_alignment_filter": self.runtime_cfg.use_gradient_alignment_filter,
+            "use_high_quality_validation_guardrail": self.runtime_cfg.use_high_quality_validation_guardrail,
             "base_input_size": self.runtime_cfg.base_input_size,
             "model_input_size": self.runtime_cfg.model_input_size,
             "num_batches": num_batches,
@@ -882,6 +905,9 @@ class ClusteredClientRunner:
             "use_quality_as_input": self.runtime_cfg.use_quality_as_input,
             "use_quality_weights": self.runtime_cfg.use_quality_weights,
             "use_quality_aggregation_weights": self.runtime_cfg.use_quality_aggregation_weights,
+            "use_quality_anchor_aggregation": self.runtime_cfg.use_quality_anchor_aggregation,
+            "use_gradient_alignment_filter": self.runtime_cfg.use_gradient_alignment_filter,
+            "use_high_quality_validation_guardrail": self.runtime_cfg.use_high_quality_validation_guardrail,
             "base_input_size": self.runtime_cfg.base_input_size,
             "model_input_size": self.runtime_cfg.model_input_size,
             "num_epochs": self.runtime_cfg.num_epochs,
@@ -906,19 +932,30 @@ class ClusteredClientRunner:
         self.optimizer.zero_grad(set_to_none=True)
         local_epoch = int(self.progress.get("completed_epochs", 0)) + 1
         batch_id = int(self.progress.get("current_epoch_batch_count", 0)) + 1
-        quality_weight_scores = batch_meta.get("quality_weight_scores")
-        if quality_weight_scores is None:
-            quality_weight_scores = batch_meta.get("quality_scores")
-        if quality_weight_scores is not None and not torch.is_tensor(quality_weight_scores):
-            quality_weight_scores = torch.tensor(quality_weight_scores, dtype=torch.float32)
-        server_needs_quality = (
-            self.runtime_cfg.use_quality_weights
-            or self.runtime_cfg.use_quality_aggregation_weights
-        )
-        send_quality_scores = quality_weight_scores if server_needs_quality else None
-        send_quality_score_metadata = (
-            batch_meta.get("quality_score_metadata", {}) if server_needs_quality else None
-        )
+        if self.runtime_cfg.use_quality_anchor_aggregation:
+            quality_anchor_scores = batch_meta.get("quality_anchor_scores")
+            if quality_anchor_scores is None:
+                raise ValueError(
+                    "quality_anchor_scores missing while USE_QUALITY_ANCHOR_AGGREGATION=true"
+                )
+            if not torch.is_tensor(quality_anchor_scores):
+                quality_anchor_scores = torch.tensor(quality_anchor_scores, dtype=torch.float32)
+            send_quality_scores = quality_anchor_scores
+            send_quality_score_metadata = batch_meta.get("quality_score_metadata", {})
+        else:
+            quality_weight_scores = batch_meta.get("quality_weight_scores")
+            if quality_weight_scores is None:
+                quality_weight_scores = batch_meta.get("quality_scores")
+            if quality_weight_scores is not None and not torch.is_tensor(quality_weight_scores):
+                quality_weight_scores = torch.tensor(quality_weight_scores, dtype=torch.float32)
+            server_needs_quality = (
+                self.runtime_cfg.use_quality_weights
+                or self.runtime_cfg.use_quality_aggregation_weights
+            )
+            send_quality_scores = quality_weight_scores if server_needs_quality else None
+            send_quality_score_metadata = (
+                batch_meta.get("quality_score_metadata", {}) if server_needs_quality else None
+            )
 
         use_cudnn = not (self.device.type == "cuda")
         with torch.backends.cudnn.flags(enabled=use_cudnn):
@@ -1024,6 +1061,9 @@ class ClusteredClientRunner:
             "use_quality_as_input": self.runtime_cfg.use_quality_as_input,
             "use_quality_weights": self.runtime_cfg.use_quality_weights,
             "use_quality_aggregation_weights": self.runtime_cfg.use_quality_aggregation_weights,
+            "use_quality_anchor_aggregation": self.runtime_cfg.use_quality_anchor_aggregation,
+            "use_gradient_alignment_filter": self.runtime_cfg.use_gradient_alignment_filter,
+            "use_high_quality_validation_guardrail": self.runtime_cfg.use_high_quality_validation_guardrail,
             "base_input_size": self.runtime_cfg.base_input_size,
             "model_input_size": self.runtime_cfg.model_input_size,
             "completed_epochs": int(self.progress.get("completed_epochs", 0)),

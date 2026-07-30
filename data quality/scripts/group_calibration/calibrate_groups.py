@@ -30,6 +30,8 @@ import matplotlib.pyplot as plt
 DEFAULT_DEMAND_PATH = PROJECT_ROOT / "dataset" / "dataset.csv"
 DEFAULT_METADATA_PATH = PROJECT_ROOT / "dataset" / "general_categories.csv"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "calibrations"
+DEFAULT_THRESHOLD_OUTPUT_DIR = QUALITY_ROOT / "configs" / "thresholds"
+DEFAULT_ACTIVE_SCORE_CONFIG = QUALITY_ROOT / "configs" / "data_quality_scoring.yaml"
 
 REQUIRED_METADATA_COLUMNS = {"ID", "Categoria", "Subcategoria"}
 SUMMARY_PERCENTILES = [1, 5, 10, 25, 50, 75, 90, 95, 99]
@@ -47,6 +49,47 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_OUTPUT_ROOT,
         help="Output folder for calibration plots and summaries.",
+    )
+    parser.add_argument(
+        "--threshold-output-dir",
+        type=Path,
+        default=DEFAULT_THRESHOLD_OUTPUT_DIR,
+        help="Reusable output folder for generated threshold CSV/YAML config artifacts.",
+    )
+    parser.add_argument(
+        "--active-score-config",
+        type=Path,
+        default=DEFAULT_ACTIVE_SCORE_CONFIG,
+        help="Active data_quality_scoring.yaml to update with calibrated metadata/threshold sections.",
+    )
+    parser.add_argument(
+        "--no-update-active-score-config",
+        action="store_true",
+        help="Only write threshold reference artifacts; do not update the active scoring config.",
+    )
+    parser.add_argument(
+        "--upper-bound-value-quantile",
+        type=float,
+        default=0.999,
+        help="Per-client demand quantile used to estimate validity upper-bound candidates.",
+    )
+    parser.add_argument(
+        "--roc-diff-quantile",
+        type=float,
+        default=0.99,
+        help="Per-client absolute-difference quantile used to estimate rate-of-change threshold candidates.",
+    )
+    parser.add_argument(
+        "--group-client-quantile",
+        type=float,
+        default=0.95,
+        help="Quantile across client-level candidates used for category/subcategory thresholds.",
+    )
+    parser.add_argument(
+        "--threshold-margin",
+        type=float,
+        default=1.10,
+        help="Multiplier applied to calibrated thresholds for a conservative margin.",
     )
     return parser.parse_args()
 
@@ -211,6 +254,341 @@ def build_summary(
     if summary.empty:
         raise ValueError("No aggregated groups contained valid demand values.")
     return summary.sort_values(["max", "group_name"], ascending=[False, True], kind="mergesort").reset_index(drop=True)
+
+
+def _clamp_quantile(value: float, name: str) -> float:
+    if not 0.0 <= float(value) <= 1.0:
+        raise ValueError(f"{name} must be between 0 and 1, got {value}")
+    return float(value)
+
+
+def _finite_array(series: pd.Series) -> np.ndarray:
+    values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    return values[np.isfinite(values)]
+
+
+def build_client_threshold_stats(
+    demand: pd.DataFrame,
+    metadata: pd.DataFrame,
+    *,
+    timestamp_col: str,
+    upper_bound_value_quantile: float,
+    roc_diff_quantile: float,
+) -> pd.DataFrame:
+    value_q = _clamp_quantile(upper_bound_value_quantile, "upper_bound_value_quantile")
+    diff_q = _clamp_quantile(roc_diff_quantile, "roc_diff_quantile")
+    demand_cols = [col for col in demand.columns if col != timestamp_col]
+    meta_index = metadata.set_index("client_id")
+    records: list[dict[str, object]] = []
+
+    for client_id in demand_cols:
+        if client_id not in meta_index.index:
+            continue
+        values = _finite_array(demand[client_id])
+        if values.size == 0:
+            continue
+        diffs = np.abs(np.diff(values))
+        diffs = diffs[np.isfinite(diffs)]
+        meta = meta_index.loc[client_id]
+        records.append(
+            {
+                "client_id": client_id,
+                "Categoria": str(meta["Categoria"]),
+                "Subcategoria": str(meta["Subcategoria"]),
+                "sample_count": int(values.size),
+                "value_max": float(np.max(values)),
+                "value_p95": float(np.quantile(values, 0.95)),
+                "value_p99": float(np.quantile(values, 0.99)),
+                "value_p999": float(np.quantile(values, value_q)),
+                "abs_diff_sample_count": int(diffs.size),
+                "abs_diff_max": float(np.max(diffs)) if diffs.size else 0.0,
+                "abs_diff_p95": float(np.quantile(diffs, 0.95)) if diffs.size else 0.0,
+                "abs_diff_p99": float(np.quantile(diffs, diff_q)) if diffs.size else 0.0,
+            }
+        )
+
+    out = pd.DataFrame(records)
+    if out.empty:
+        raise ValueError("No matched clients had finite demand values for threshold calibration.")
+    return out.sort_values("client_id", kind="mergesort").reset_index(drop=True)
+
+
+def summarize_threshold_group(
+    client_stats: pd.DataFrame,
+    *,
+    group_col: str | None,
+    group_client_quantile: float,
+    threshold_margin: float,
+) -> pd.DataFrame:
+    group_q = _clamp_quantile(group_client_quantile, "group_client_quantile")
+    margin = float(threshold_margin)
+    if margin <= 0:
+        raise ValueError("threshold_margin must be positive")
+
+    records: list[dict[str, object]] = []
+    groups: list[tuple[str, pd.DataFrame]]
+    if group_col is None:
+        groups = [("__global__", client_stats)]
+    else:
+        groups = [(str(name), group.copy()) for name, group in client_stats.groupby(group_col, sort=True)]
+
+    for group_name, group in groups:
+        value_candidates = group["value_p999"].dropna().to_numpy(dtype=np.float64)
+        diff_candidates = group["abs_diff_p99"].dropna().to_numpy(dtype=np.float64)
+        if value_candidates.size == 0 or diff_candidates.size == 0:
+            continue
+        upper_base = float(np.quantile(value_candidates, group_q))
+        roc_base = float(np.quantile(diff_candidates, group_q))
+        records.append(
+            {
+                "group_name": group_name,
+                "client_count": int(group["client_id"].nunique()),
+                "value_candidate_min": float(np.min(value_candidates)),
+                "value_candidate_median": float(np.median(value_candidates)),
+                "value_candidate_p95": float(np.quantile(value_candidates, 0.95)),
+                "value_candidate_max": float(np.max(value_candidates)),
+                "abs_diff_candidate_min": float(np.min(diff_candidates)),
+                "abs_diff_candidate_median": float(np.median(diff_candidates)),
+                "abs_diff_candidate_p95": float(np.quantile(diff_candidates, 0.95)),
+                "abs_diff_candidate_max": float(np.max(diff_candidates)),
+                "calibrated_upper_bound": float(max(0.0, upper_base * margin)),
+                "calibrated_rate_of_change_threshold": float(max(0.0, roc_base * margin)),
+                "group_client_quantile": group_q,
+                "threshold_margin": margin,
+            }
+        )
+
+    out = pd.DataFrame(records)
+    if out.empty:
+        raise ValueError(f"No threshold summaries could be built for {group_col or 'global'}.")
+    return out.sort_values("group_name", kind="mergesort").reset_index(drop=True)
+
+
+def _yaml_scalar(value: object) -> str:
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        if not np.isfinite(float(value)):
+            return "null"
+        return f"{float(value):.12g}"
+    text = str(value).replace("'", "''")
+    return f"'{text}'"
+
+
+def _write_mapping(lines: list[str], indent: int, mapping: dict[str, float]) -> None:
+    pad = " " * indent
+    if not mapping:
+        lines.append(f"{pad}{{}}")
+        return
+    for key, value in mapping.items():
+        lines.append(f"{pad}{_yaml_scalar(key)}: {_yaml_scalar(value)}")
+
+
+def build_threshold_config_lines(
+    *,
+    metadata_path: Path,
+    global_summary: pd.DataFrame,
+    category_summary: pd.DataFrame,
+    subcategory_summary: pd.DataFrame,
+    include_header: bool = True,
+) -> list[str]:
+    global_row = global_summary.iloc[0]
+    cat_upper = dict(zip(category_summary["group_name"], category_summary["calibrated_upper_bound"]))
+    cat_roc = dict(zip(category_summary["group_name"], category_summary["calibrated_rate_of_change_threshold"]))
+    sub_upper = dict(zip(subcategory_summary["group_name"], subcategory_summary["calibrated_upper_bound"]))
+    sub_roc = dict(zip(subcategory_summary["group_name"], subcategory_summary["calibrated_rate_of_change_threshold"]))
+
+    lines: list[str] = []
+    if include_header:
+        lines.extend(
+            [
+                "# Generated by data quality/scripts/group_calibration/calibrate_groups.py",
+                "# Reference copy of the threshold sections written into data_quality_scoring.yaml.",
+            ]
+        )
+    lines.extend(
+        [
+            "metadata:",
+            f"  path: {_yaml_scalar(str(metadata_path))}",
+            "  client_id_column: ID",
+            "  category_column: Categoria",
+            "  subcategory_column: Subcategoria",
+            "",
+            "thresholds:",
+            "  allow_clean_reference_fallback: false",
+            "",
+            "validity:",
+            "  lower_bound: 0.0",
+            f"  upper_bound: {_yaml_scalar(global_row['calibrated_upper_bound'])}",
+            "  upper_bound_by_category:",
+        ]
+    )
+    _write_mapping(lines, 4, cat_upper)
+    lines.append("  upper_bound_by_subcategory:")
+    _write_mapping(lines, 4, sub_upper)
+    lines.extend([
+        "",
+        "consistency:",
+        "  freeze_min_len: 6",
+        "  freeze_atol: 0.0",
+        "  allow_constant_series: false",
+        f"  rate_of_change_threshold: {_yaml_scalar(global_row['calibrated_rate_of_change_threshold'])}",
+        "  rate_of_change_threshold_by_category:",
+    ])
+    _write_mapping(lines, 4, cat_roc)
+    lines.append("  rate_of_change_threshold_by_subcategory:")
+    _write_mapping(lines, 4, sub_roc)
+    lines.append("  roc_multiplier: 1.5")
+    return lines
+
+
+def write_threshold_config_yaml(
+    path: Path,
+    *,
+    metadata_path: Path,
+    global_summary: pd.DataFrame,
+    category_summary: pd.DataFrame,
+    subcategory_summary: pd.DataFrame,
+) -> list[str]:
+    lines = build_threshold_config_lines(
+        metadata_path=metadata_path,
+        global_summary=global_summary,
+        category_summary=category_summary,
+        subcategory_summary=subcategory_summary,
+        include_header=True,
+    )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return lines
+
+
+def _top_level_key(line: str) -> str | None:
+    if not line or line.startswith(" ") or line.startswith("#") or ":" not in line:
+        return None
+    return line.split(":", 1)[0].strip() or None
+
+
+def _split_top_level_blocks(lines: list[str]) -> dict[str, tuple[int, int]]:
+    starts: list[tuple[str, int]] = []
+    for idx, line in enumerate(lines):
+        key = _top_level_key(line)
+        if key is not None:
+            starts.append((key, idx))
+    blocks: dict[str, tuple[int, int]] = {}
+    for pos, (key, start) in enumerate(starts):
+        end = starts[pos + 1][1] if pos + 1 < len(starts) else len(lines)
+        blocks[key] = (start, end)
+    return blocks
+
+
+def _extract_top_level_section(lines: list[str], section: str) -> list[str]:
+    blocks = _split_top_level_blocks(lines)
+    if section not in blocks:
+        raise ValueError(f"Generated threshold config did not contain section {section!r}.")
+    start, end = blocks[section]
+    section_lines = list(lines[start:end])
+    while section_lines and not section_lines[-1].strip():
+        section_lines.pop()
+    return section_lines
+
+
+def update_active_score_config(
+    path: Path,
+    *,
+    threshold_lines: list[str],
+    sections: tuple[str, ...] = ("metadata", "thresholds", "validity", "consistency"),
+) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"Active scoring config does not exist: {path}")
+
+    target_lines = path.read_text(encoding="utf-8").splitlines()
+    replacement_sections = {section: _extract_top_level_section(threshold_lines, section) for section in sections}
+
+    for section in sections:
+        blocks = _split_top_level_blocks(target_lines)
+        replacement = replacement_sections[section]
+        if section in blocks:
+            start, end = blocks[section]
+            target_lines = target_lines[:start] + replacement + [""] + target_lines[end:]
+        else:
+            target_lines.extend(["", *replacement])
+
+    compacted: list[str] = []
+    blank_seen = False
+    for line in target_lines:
+        if line.strip():
+            compacted.append(line)
+            blank_seen = False
+        elif not blank_seen:
+            compacted.append("")
+            blank_seen = True
+    path.write_text("\n".join(compacted).strip() + "\n", encoding="utf-8")
+
+
+def write_threshold_calibration_outputs(
+    *,
+    demand: pd.DataFrame,
+    metadata: pd.DataFrame,
+    timestamp_col: str,
+    metadata_path: Path,
+    output_dir: Path,
+    upper_bound_value_quantile: float,
+    roc_diff_quantile: float,
+    group_client_quantile: float,
+    threshold_margin: float,
+    active_score_config_path: Path | None = None,
+) -> dict[str, str]:
+    threshold_dir = output_dir
+    ensure_dir(threshold_dir)
+    client_stats = build_client_threshold_stats(
+        demand,
+        metadata,
+        timestamp_col=timestamp_col,
+        upper_bound_value_quantile=upper_bound_value_quantile,
+        roc_diff_quantile=roc_diff_quantile,
+    )
+    global_summary = summarize_threshold_group(
+        client_stats,
+        group_col=None,
+        group_client_quantile=group_client_quantile,
+        threshold_margin=threshold_margin,
+    )
+    category_summary = summarize_threshold_group(
+        client_stats,
+        group_col="Categoria",
+        group_client_quantile=group_client_quantile,
+        threshold_margin=threshold_margin,
+    )
+    subcategory_summary = summarize_threshold_group(
+        client_stats,
+        group_col="Subcategoria",
+        group_client_quantile=group_client_quantile,
+        threshold_margin=threshold_margin,
+    )
+
+    client_path = threshold_dir / "client_threshold_stats.csv"
+    global_path = threshold_dir / "global_thresholds.csv"
+    category_path = threshold_dir / "category_thresholds.csv"
+    subcategory_path = threshold_dir / "subcategory_thresholds.csv"
+    yaml_path = threshold_dir / "data_quality_thresholds.yaml"
+    client_stats.to_csv(client_path, index=False)
+    global_summary.to_csv(global_path, index=False)
+    category_summary.to_csv(category_path, index=False)
+    subcategory_summary.to_csv(subcategory_path, index=False)
+    threshold_lines = write_threshold_config_yaml(
+        yaml_path,
+        metadata_path=metadata_path,
+        global_summary=global_summary,
+        category_summary=category_summary,
+        subcategory_summary=subcategory_summary,
+    )
+    if active_score_config_path is not None:
+        update_active_score_config(active_score_config_path, threshold_lines=threshold_lines)
+    return {
+        "client_threshold_stats": str(client_path),
+        "global_thresholds": str(global_path),
+        "category_thresholds": str(category_path),
+        "subcategory_thresholds": str(subcategory_path),
+        "threshold_config_yaml": str(yaml_path),
+        "active_score_config": str(active_score_config_path) if active_score_config_path is not None else "",
+    }
 
 
 def save_matching_report(
@@ -441,6 +819,20 @@ def main() -> int:
         matched=matched,
     )
 
+    log("Calibrating DQ validity/rate-of-change thresholds")
+    threshold_outputs = write_threshold_calibration_outputs(
+        demand=demand,
+        metadata=matched,
+        timestamp_col=args.timestamp_col,
+        metadata_path=args.metadata,
+        output_dir=args.threshold_output_dir,
+        upper_bound_value_quantile=args.upper_bound_value_quantile,
+        roc_diff_quantile=args.roc_diff_quantile,
+        group_client_quantile=args.group_client_quantile,
+        threshold_margin=args.threshold_margin,
+        active_score_config_path=None if args.no_update_active_score_config else args.active_score_config,
+    )
+
     for level_name, group_col in (("category", "Categoria"), ("subcategory", "Subcategoria")):
         log(f"Aggregating {level_name} demand series")
         aggregated_sum, aggregated_mean, group_meta = aggregate_level(
@@ -476,9 +868,17 @@ def main() -> int:
         "metadata_path": str(args.metadata),
         "timestamp_col": args.timestamp_col,
         "output_dir": str(output_dir),
+        "threshold_output_dir": str(args.threshold_output_dir),
+        "active_score_config": str(args.active_score_config),
+        "updated_active_score_config": bool(not args.no_update_active_score_config),
         "rows": int(len(demand)),
         "matched_clients": int(matched["client_id"].nunique()),
         "measures": ["aggregated", "per_client_average"],
+        "threshold_outputs": threshold_outputs,
+        "upper_bound_value_quantile": args.upper_bound_value_quantile,
+        "roc_diff_quantile": args.roc_diff_quantile,
+        "group_client_quantile": args.group_client_quantile,
+        "threshold_margin": args.threshold_margin,
     }
     (output_dir / "run_summary.json").write_text(json.dumps(run_summary, indent=2), encoding="utf-8")
     log(f"Finished. Outputs written to {output_dir}")

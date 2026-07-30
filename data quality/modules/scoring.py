@@ -97,13 +97,91 @@ def _resolve_reference_time(clean_ts: pd.Series, config: dict) -> pd.Timestamp |
     return clean_ts.max()
 
 
+def _normalize_metadata_label(value: object) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def _normalize_client_id(value: object) -> str:
+    text = str(value).strip()
+    if text.endswith(".0"):
+        text = text[:-2]
+    return text
+
+
+def _load_client_metadata(config: dict) -> dict[str, dict[str, str]]:
+    metadata_cfg = dict((config.get("metadata", {}) or {}))
+    path = metadata_cfg.get("path")
+    if not path:
+        return {}
+    meta_path = Path(path)
+    if not meta_path.exists():
+        raise FileNotFoundError(f"Configured metadata.path does not exist: {meta_path}")
+    frame = pd.read_csv(meta_path)
+    client_col = metadata_cfg.get("client_id_column", "ID")
+    category_col = metadata_cfg.get("category_column", "Categoria")
+    subcategory_col = metadata_cfg.get("subcategory_column", "Subcategoria")
+    missing = [col for col in (client_col, category_col, subcategory_col) if col not in frame.columns]
+    if missing:
+        raise ValueError(f"Metadata file {meta_path} is missing required columns: {missing}")
+    out: dict[str, dict[str, str]] = {}
+    for _, row in frame.iterrows():
+        client_id = _normalize_client_id(row[client_col])
+        if not client_id:
+            continue
+        out[client_id] = {
+            "category": _normalize_metadata_label(row[category_col]),
+            "subcategory": _normalize_metadata_label(row[subcategory_col]),
+        }
+    return out
+
+
+def _mapping_lookup(mapping: object, key: str) -> Optional[float]:
+    if not isinstance(mapping, dict) or not key:
+        return None
+    if key in mapping and mapping[key] is not None:
+        return float(mapping[key])
+    upper_key = key.upper()
+    for raw_key, value in mapping.items():
+        if str(raw_key).strip().upper() == upper_key and value is not None:
+            return float(value)
+    return None
+
+
+def _resolve_metadata_threshold(
+    *,
+    config: dict,
+    client_metadata: dict[str, dict[str, str]],
+    client_id: str,
+    global_key: str,
+    category_key: str,
+    subcategory_key: str,
+) -> Optional[float]:
+    meta = client_metadata.get(str(client_id), {})
+    subcategory = meta.get("subcategory", "")
+    category = meta.get("category", "")
+    sub_value = _mapping_lookup(config.get(subcategory_key), subcategory)
+    if sub_value is not None:
+        return sub_value
+    cat_value = _mapping_lookup(config.get(category_key), category)
+    if cat_value is not None:
+        return cat_value
+    global_value = config.get(global_key)
+    if global_value is not None:
+        return float(global_value)
+    return None
+
+
+def _allow_clean_reference_fallback(config: dict) -> bool:
+    thresholds_cfg = dict((config.get("thresholds", {}) or {}))
+    return bool(thresholds_cfg.get("allow_clean_reference_fallback", False))
+
+
 def _series_upper_bound(clean_series: pd.Series, cfg: dict) -> float:
     lower_bound = float(cfg.get("lower_bound", 0.0))
-    fixed_upper = cfg.get("upper_bound")
     upper_multiplier = float(cfg.get("upper_multiplier", 1.5))
     clean_valid = pd.to_numeric(clean_series, errors="coerce").dropna()
-    if fixed_upper is not None:
-        return float(fixed_upper)
     if not clean_valid.empty:
         return float(max(lower_bound, clean_valid.quantile(0.999) * upper_multiplier))
     return float(max(lower_bound, upper_multiplier))
@@ -155,9 +233,10 @@ class CompletenessScorer:
 class ValidityScorer:
     """Validity scoring for wide-format client data."""
 
-    def __init__(self, config: Optional[dict] = None):
+    def __init__(self, config: Optional[dict] = None, client_metadata: Optional[dict[str, dict[str, str]]] = None):
         self.config = config or {}
         self.validity_cfg = dict((self.config.get("validity", {}) or {}))
+        self.client_metadata = client_metadata or {}
 
     def score_client(
         self,
@@ -167,7 +246,6 @@ class ValidityScorer:
     ) -> dict[str, float]:
         diag = current.diagnostics
         current_series = _get_numeric_series(current, client_id)
-        clean_series = _get_numeric_series(clean, client_id)
         column_present = bool(diag.client_column_present.get(client_id, False))
         observed_record_count = int(len(current.frame))
 
@@ -180,7 +258,23 @@ class ValidityScorer:
         v2 = float(diag.timestamp_valid_ratio) if diag.timestamp_col_present else 0.0
 
         lower_bound = float(self.validity_cfg.get("lower_bound", 0.0))
-        upper_bound = _series_upper_bound(clean_series, self.validity_cfg)
+        upper_bound = _resolve_metadata_threshold(
+            config=self.validity_cfg,
+            client_metadata=self.client_metadata,
+            client_id=client_id,
+            global_key="upper_bound",
+            category_key="upper_bound_by_category",
+            subcategory_key="upper_bound_by_subcategory",
+        )
+        if upper_bound is None:
+            if _allow_clean_reference_fallback(self.config):
+                upper_bound = _series_upper_bound(_get_numeric_series(clean, client_id), self.validity_cfg)
+            else:
+                raise ValueError(
+                    "Validity V3 requires a configured upper bound. Set validity.upper_bound, "
+                    "validity.upper_bound_by_category, or validity.upper_bound_by_subcategory "
+                    f"for client {client_id}; or explicitly set thresholds.allow_clean_reference_fallback=true."
+                )
         valid_mask = current_series.notna()
         if valid_mask.any():
             in_range = current_series.loc[valid_mask].between(lower_bound, upper_bound, inclusive="both")
@@ -205,9 +299,10 @@ class ValidityScorer:
 class ConsistencyScorer:
     """Consistency scoring for time ordering and dynamic behavior."""
 
-    def __init__(self, config: Optional[dict] = None):
+    def __init__(self, config: Optional[dict] = None, client_metadata: Optional[dict[str, dict[str, str]]] = None):
         self.config = config or {}
         self.consistency_cfg = dict((self.config.get("consistency", {}) or {}))
+        self.client_metadata = client_metadata or {}
 
     def score_client(
         self,
@@ -253,11 +348,9 @@ class ConsistencyScorer:
                 min_len=int(self.consistency_cfg.get("freeze_min_len", 6)),
                 atol=float(self.consistency_cfg.get("freeze_atol", 0.0)),
             )
-            clean_valid = clean_series.dropna()
-            clean_zero_ratio = float((clean_valid.abs() <= 1e-9).mean()) if not clean_valid.empty else 0.0
-            clean_std = float(clean_valid.std(ddof=0)) if not clean_valid.empty else 0.0
             frozen_ratio = float(freeze_mask.loc[valid].mean())
-            if frozen_ratio >= 0.999 and (clean_zero_ratio >= 0.95 or clean_std <= 1e-9):
+            allow_constant_series = bool(self.consistency_cfg.get("allow_constant_series", False))
+            if allow_constant_series and frozen_ratio >= 0.999:
                 cs4 = 1.0
             else:
                 cs4 = float(max(0.0, 1.0 - frozen_ratio))
@@ -265,14 +358,28 @@ class ConsistencyScorer:
             cs4 = 0.0
 
         diffs = current_series.diff().abs()
-        clean_diffs = clean_series.diff().abs().dropna()
-        fixed_delta = self.consistency_cfg.get("rate_of_change_threshold")
-        if fixed_delta is not None:
-            delta_max = float(fixed_delta)
-        elif not clean_diffs.empty:
-            delta_max = float(clean_diffs.quantile(0.99) * float(self.consistency_cfg.get("roc_multiplier", 1.5)))
-        else:
-            delta_max = float(self.consistency_cfg.get("roc_multiplier", 1.5))
+        delta_max = _resolve_metadata_threshold(
+            config=self.consistency_cfg,
+            client_metadata=self.client_metadata,
+            client_id=client_id,
+            global_key="rate_of_change_threshold",
+            category_key="rate_of_change_threshold_by_category",
+            subcategory_key="rate_of_change_threshold_by_subcategory",
+        )
+        if delta_max is None:
+            if _allow_clean_reference_fallback(self.config):
+                clean_diffs = clean_series.diff().abs().dropna()
+                if not clean_diffs.empty:
+                    delta_max = float(clean_diffs.quantile(0.99) * float(self.consistency_cfg.get("roc_multiplier", 1.5)))
+                else:
+                    delta_max = float(self.consistency_cfg.get("roc_multiplier", 1.5))
+            else:
+                raise ValueError(
+                    "Consistency CS5 requires a configured rate-of-change threshold. Set "
+                    "consistency.rate_of_change_threshold, consistency.rate_of_change_threshold_by_category, "
+                    "or consistency.rate_of_change_threshold_by_subcategory "
+                    f"for client {client_id}; or explicitly set thresholds.allow_clean_reference_fallback=true."
+                )
         applicable = diffs.notna() & valid & valid.shift(1, fill_value=False)
         if applicable.any():
             cs5 = float((diffs.loc[applicable] <= delta_max).mean())
@@ -308,11 +415,10 @@ class AccuracyScorer:
         client_id: str,
     ) -> dict[str, float]:
         current_series = _get_numeric_series(current, client_id)
-        clean_series = _get_numeric_series(clean, client_id)
 
         a1 = self._score_local_anomaly(current_series)
         a2 = self._score_robust_deviation(current_series)
-        a3 = self._score_noise_instability(current_series, clean_series)
+        a3 = self._score_historical_noise_instability(current_series)
 
         weights = dict((self.config.get("subcheck_weights", {}) or {}).get("accuracy", {}) or {})
         accuracy = _weighted_average({"A1": a1, "A2": a2, "A3": a3}, weights)
@@ -350,22 +456,37 @@ class AccuracyScorer:
             return 1.0 if current_series.notna().any() else 0.0
         return float(max(0.0, 1.0 - anomaly.loc[applicable].mean()))
 
-    def _score_noise_instability(self, current_series: pd.Series, clean_series: pd.Series) -> float:
+    def _score_historical_noise_instability(self, current_series: pd.Series) -> float:
         values = pd.to_numeric(current_series, errors="coerce")
-        clean_values = pd.to_numeric(clean_series, errors="coerce")
-        cur_diffs = values.diff().abs().dropna().to_numpy(dtype=float)
-        clean_diffs = clean_values.diff().abs().dropna().to_numpy(dtype=float)
-        cur_diffs = cur_diffs[np.isfinite(cur_diffs)]
-        clean_diffs = clean_diffs[np.isfinite(clean_diffs)]
-        if cur_diffs.size == 0:
+        diffs = values.diff().abs().to_numpy(dtype=float)
+        finite = np.isfinite(diffs)
+        if int(finite.sum()) == 0:
             return 0.0 if values.notna().sum() == 0 else 1.0
 
+        min_diffs = int(self.accuracy_cfg.get("historical_min_diffs", self.accuracy_cfg.get("min_history", 24)))
+        lookback_steps = self.accuracy_cfg.get("historical_lookback_steps")
+        quantile = float(self.accuracy_cfg.get("historical_diff_quantile", 0.95))
+        quantile = min(1.0, max(0.0, quantile))
         epsilon = float(self.accuracy_cfg.get("epsilon", 1e-6))
-        ref_mafd = float(np.mean(clean_diffs)) if clean_diffs.size else 0.0
-        cur_mafd = float(np.mean(cur_diffs))
-        tau_noise = float(self.accuracy_cfg.get("allowed_noise_ratio", 2.0))
-        denom = max(ref_mafd * tau_noise, epsilon)
-        return float(max(0.0, 1.0 - (cur_mafd / denom)))
+
+        outcomes: list[bool] = []
+        for idx in range(len(diffs)):
+            current_diff = diffs[idx]
+            if not np.isfinite(current_diff):
+                continue
+            start = 0 if lookback_steps is None else max(0, idx - int(lookback_steps))
+            history = diffs[start:idx]
+            history = history[np.isfinite(history)]
+            if history.size < min_diffs:
+                continue
+            threshold = float(np.quantile(history, quantile))
+            if threshold <= epsilon:
+                threshold = max(float(np.mean(history)), epsilon)
+            outcomes.append(bool(current_diff <= threshold))
+
+        if not outcomes:
+            return 1.0
+        return float(np.mean(outcomes))
 
 
 class FreshnessScorer:
@@ -431,9 +552,10 @@ class WideDemandQualityScorer:
 
     def __init__(self, config: Optional[dict] = None):
         self.config = config or {}
+        self.client_metadata = _load_client_metadata(self.config)
         self.completeness = CompletenessScorer(config=self.config)
-        self.validity = ValidityScorer(config=self.config)
-        self.consistency = ConsistencyScorer(config=self.config)
+        self.validity = ValidityScorer(config=self.config, client_metadata=self.client_metadata)
+        self.consistency = ConsistencyScorer(config=self.config, client_metadata=self.client_metadata)
         self.accuracy = AccuracyScorer(config=self.config)
         self.freshness = FreshnessScorer(config=self.config)
 
