@@ -37,7 +37,6 @@ tests/           unit, integration, and regression coverage
 run_split.py     main environment-driven SplitFed orchestrator
 ```
 
-Datasets, checkpoints, logs, plots, diagnostics, and experiment outputs are intentionally excluded from Git. This keeps the repository portfolio-sized while preserving all local artifacts in the working directory.
 
 ## Saved forecasting result
 
