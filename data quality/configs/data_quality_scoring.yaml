@@ -1,0 +1,136 @@
+metadata:
+  path: 'dataset/general_categories.csv'
+  client_id_column: ID
+  category_column: Categoria
+  subcategory_column: Subcategoria
+
+thresholds:
+  allow_clean_reference_fallback: false
+
+frequency: "1h"
+
+clients:
+  selected: []
+
+validity:
+  lower_bound: 0.0
+  upper_bound: 174.52391715
+  upper_bound_by_category:
+    'AGRICULTURE': 179.59991225
+    'COMMERCIAL': 111.19873061
+    'FISCAL': 110.6716842
+    'INDUSTRIAL': 353.830942575
+    'MUNICIPAL': 74.407591335
+    'PUBLIC UTILITY': 128.41235726
+    'RESIDENTIAL': 29.139687445
+  upper_bound_by_subcategory:
+    'ALUMBRADO PUBLICO': 4.0864208
+    'APR AGUA POTABLE RURAL': 32.48282532
+    'BOMBA ELEVADORA AGUA POTABLE': 91.6209932
+    'BOMBA REGADIO MECAN. AGRICOLA': 54.61126946
+    'CASA - HABITACION': 29.207009865
+    'CORP. MUNICIPAL DE EDUCACION': 36.5570931
+    'CORP. MUNICIPAL DE SALUD': 22.5373742
+    'EDIFICIO DE DEPARTAMENTOS': 13.03851131
+    'FABRICA': 368.69095725
+    'HOSPITAL': 56.5293597
+    'METALES': 30.7360086
+    'OFICINAS': 173.58152185
+    'OTRO': 32.150228
+    'PRODUCCION AGRICOLA': 189.670118
+    'SERVICIOS DE COMUNICACIONES': 23.91233295
+    'SERVICIOS FISCALES': 120.0899436
+    'SERVICIOS MUNICIPALES': 98.677630425
+
+consistency:
+  freeze_min_len: 6
+  freeze_atol: 0.0
+  allow_constant_series: false
+  rate_of_change_threshold: 61.338838
+  rate_of_change_threshold_by_category:
+    'AGRICULTURE': 96.939073
+    'COMMERCIAL': 25.9900608
+    'FISCAL': 31.5380428
+    'INDUSTRIAL': 233.812524
+    'MUNICIPAL': 36.5234463
+    'PUBLIC UTILITY': 47.2764281
+    'RESIDENTIAL': 9.2314926
+  rate_of_change_threshold_by_subcategory:
+    'ALUMBRADO PUBLICO': 3.052434
+    'APR AGUA POTABLE RURAL': 23.02333
+    'BOMBA ELEVADORA AGUA POTABLE': 46.370192
+    'BOMBA REGADIO MECAN. AGRICOLA': 21.7807524
+    'CASA - HABITACION': 9.3488582
+    'CORP. MUNICIPAL DE EDUCACION': 10.6340124
+    'CORP. MUNICIPAL DE SALUD': 4.326344
+    'EDIFICIO DE DEPARTAMENTOS': 3.5170696
+    'FABRICA': 247.13766
+    'HOSPITAL': 23.475474
+    'METALES': 12.152316
+    'OFICINAS': 32.2000789
+    'OTRO': 10.492592
+    'PRODUCCION AGRICOLA': 108.700504
+    'SERVICIOS DE COMUNICACIONES': 1.8589406
+    'SERVICIOS FISCALES': 33.5712784
+    'SERVICIOS MUNICIPALES': 49.0825665
+  roc_multiplier: 1.5
+
+accuracy:
+  local_anomaly_method: seasonal_naive
+  rolling_window: 24
+  min_history: 6
+  mad_multiplier: 4.0
+  min_threshold_abs: 0.1
+  seasonal_period: 24
+  seasonal_threshold_multiplier: 3.0
+  allowed_noise_ratio: 2.0
+  historical_diff_quantile: 0.95
+  historical_min_diffs: 24
+  historical_lookback_steps:
+  epsilon: 1.0e-6
+
+freshness:
+  staleness_tau: "48h"
+  window_recency_span: "168h"
+  reporting_delay_enabled: false
+  reporting_delay_tau: "24h"
+  reporting_reference_time:
+
+subcheck_weights:
+  completeness:
+    C1: 1.0
+    C2: 1.0
+    C3: 1.0
+  validity:
+    V1: 1.0
+    V2: 1.0
+    V3: 1.0
+    V4: 1.0
+  consistency:
+    CS1: 1.0
+    CS2: 1.0
+    CS3: 1.0
+    CS4: 1.0
+    CS5: 1.0
+  accuracy:
+    A1: 1.0
+    A2: 1.0
+    A3: 1.0
+  freshness:
+    F1: 1.0
+    F2: 1.0
+    F3: 1.0
+
+final_score:
+  # method: pca keeps the historical global PCA/min-max score.
+  # method: average computes a client/window-local weighted mean of the five dimensions.
+  method: average
+  dimension_weights:
+    completeness: 1.0
+    validity: 1.0
+    consistency: 1.0
+    accuracy: 1.0
+    freshness: 1.0
+
+pca:
+  epsilon: 1.0e-9

@@ -1,0 +1,99 @@
+# If fault_fraction is set, use simple mode.
+# If empty/null, use detailed mode under faults:/drift:.
+fault_fraction:
+
+# Simple mode only: possible fault types and their probabilities.
+simple_fault_types: [missing, invalid_high, negative_value, replayed_value]
+simple_fault_probabilities:
+
+# Simple mode severity settings.
+simple_invalid_high_range: [1.5, 3.0]
+simple_negative_value_range: [4.0, 8.0]
+simple_replayed_steps: [-1, 1]
+simple_noise_std_fraction: 0.05
+simple_spike_multiplier: 4.0
+
+# Detailed mode: master intensity knob.
+global_fault_rate: 1.0
+
+# Optional per-client multiplier.
+per_client_fault_rate: {"9906537": 0, "9906758":0, "9904965":0, "9907871":0, "9901455":0, "9907567":0, "9903322":0, "9902771":0.8, "9904304":0.7, "9904324":0.1, "9903803":1, "9907921":0.9}
+
+clients:
+  selected: ["9906537", "9906758", "9904576", "9907460", "9901304", "9904765", "9904965", "9907871", "9901455", "9907567", "9903322", "9902195", "9904296", "9901649", "9904555", "9905539", "9901819", "9906735", "9907872", "9902771", "9904304", "9904324", "9903803", "9907921", "9902188", "9904510", "9908088", "9903560", "9902484", "9904933", "9906883", "9902735", "9907159", "9902389", "9906881", "9902073", "9901509", "9905509", "9903134", "9902928", "9901969", "9905441", "9901708", "9905456", "9902590", "9900803", "9902170", "9908013", "9906096", "9902373", "9900554", "9906633", "9901738", "9901528", "9901620", "9901075", "9900076", "9902565", "9906922", "9901743", "9902641", "9902139", "9905675", "9902059", "9901588", "9907563", "9904353", "9900684", "9905119", "9900070", "9907282", "9902475", "9903290", "9901306", "9902821", "9905148", "9901143", "9902723", "9904490", "9904545", "9901474", "9903928", "9903042", "9901204"]
+  random_fraction: 1.0
+  random_count:
+
+faults:
+  completeness:
+    # Keep full client dropout off for the main experiment.
+    # It is too severe and can dominate the aggregation result.
+    client_dropout_fraction: 0.0
+
+    # Realistic mild random missingness.
+    random_missing_rate: 0.015
+
+    # Shared timestamp loss should be smaller than before.
+    # 1% global row drop affects every client and can dominate C3.
+    dropped_timestamp_rows_fraction: 0.003
+
+    # Now this will appear because global_fault_rate is 1.0.
+    block_missing:
+      events_per_client: 1
+      min_length: 6
+      max_length: 24
+
+    # Structured calendar-shaped missingness.
+    calendar_hole_fraction: 0.01
+    calendar_hole_min_length: 48
+    calendar_hole_max_length: 168
+
+  validity:
+    # Invalid physical values should be rare.
+    negative_rate: 0.0015
+    impossible_high_rate: 0.0015
+    high_multiplier: 2.5
+
+  consistency:
+    # Small duplicate timestamp stress.
+    duplicated_timestamp_fraction: 0.001
+
+    # Now these event-count faults will appear.
+    stale_blocks_per_client: 1
+    stale_min_length: 3
+    stale_max_length: 8
+    lag_choices: [1, 2, 24]
+    lag_probabilities: [0.5, 0.3, 0.2]
+
+    jump_rate: 0.003
+    jump_multiplier: 4.0
+
+    stuck_segments_per_client: 1
+    stuck_min_length: 4
+    stuck_max_length: 12
+
+  accuracy:
+    # Lower than your current effective spike/noise dominance.
+    spike_rate: 0.003
+    spike_multiplier: 3.0
+
+    noise_rate: 0.010
+    noise_std_fraction: 0.03
+
+    # Cluster-level correlated disturbance.
+    # Use this to simulate localized cluster-level mini events.
+    cluster_shared_noise:
+      enabled: true
+      clusters: [1, 2]
+      events_per_cluster: 1
+      min_length: 4
+      max_length: 12
+      noise_std_fraction: 0.05
+      same_pattern_within_cluster: true
+
+  freshness: {}
+
+drift:
+  distribution_shift: {}
+  temporal_pattern_shift: {}
+  regime_shift: {}

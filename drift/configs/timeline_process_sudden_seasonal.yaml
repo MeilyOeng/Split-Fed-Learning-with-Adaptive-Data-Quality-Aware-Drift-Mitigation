@@ -1,0 +1,28 @@
+schema_version: 2
+experiment_id: process-seasonal-sudden-example
+enabled: true
+experiment_seed: 42
+clients:
+  ids: ["101", "205"]
+modes: [test]
+temporal:
+  type: sudden
+  start_index: 7000
+source:
+  type: process
+  old:
+    intercept: 0.0
+    ar_coefficients: [0.80]
+    seasonal_amplitude: 1.0
+    seasonal_phase: 0.0
+    seasonal_period: 24
+    innovation_sigma: 0.1
+  changes: {}
+  seasonal_change:
+    amplitude_delta: 0.5
+    phase_delta: 0.25
+  innovation_mode: clean_residual
+windowing:
+  window_size: 24
+  forecast_horizon: 1
+  target_feature_index: 0

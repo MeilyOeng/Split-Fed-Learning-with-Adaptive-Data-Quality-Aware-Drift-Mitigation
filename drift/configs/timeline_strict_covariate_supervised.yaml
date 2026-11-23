@@ -1,0 +1,23 @@
+schema_version: 2
+experiment_id: strict-covariate-supervised-example
+enabled: true
+experiment_seed: 42
+clients:
+  ids: ["synthetic-client"]
+modes: [test]
+temporal:
+  type: sudden
+  start_index: 100
+source:
+  type: strict_covariate
+  generator_id: frozen_linear_supervised_v1
+  benchmark_kind: supervised
+  reference_inputs:
+    - [0.0, 1.0]
+    - [1.0, 2.0]
+  input_shift: [1.0, -0.5]
+  residual_sigma: 0.1
+windowing:
+  window_size: 24
+  forecast_horizon: 1
+  target_feature_index: 0

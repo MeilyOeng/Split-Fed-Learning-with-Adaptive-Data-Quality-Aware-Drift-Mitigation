@@ -1,0 +1,59 @@
+experiment_id: diagnostic_2x2_e3seed42
+
+clean_wide_csv: dataset/run4/E3Seed42/clean_84_clients.csv
+cluster_assignment_csv: dataset/cluster-assignment.csv
+metadata_csv: dataset/general_categories.csv
+clean_cluster_dir: dataset/output_clean
+selected_clients_csv: dataset/run4/E3Seed42/quality_output/selected_clients.csv
+fault_config: dataset/run4/E3Seed42/fault_injection_E3_seed42.yaml
+dq_score_config: data quality/configs/data_quality_scoring.yaml
+baseline_checkpoint_dir: outputs/baseline-bs128
+timestamp_column: Fecha_Hora
+
+coordinates:
+  window_size: 24
+  forecast_horizon: 1
+  test_window_start_first: 6988
+  test_window_start_last: 8735
+  test_input_observation_first: 6988
+  test_input_observation_last: 8758
+  test_detector_endpoint_first: 7011
+  test_detector_endpoint_last: 8758
+  last_clean_target_index: 8759
+  drift_onset_index: 7885
+
+split:
+  train: 0.7
+  val: 0.1
+  test: 0.2
+
+drift:
+  type: sudden
+  source: measurement
+  scope: test
+  start_ratio: 0.5
+  magnitude: 0.5
+  offset: 0
+  noise: 0
+  seed: 42
+
+detectors:
+  PH_MIN_INSTANCES: 500
+  PH_DELTA: 0.02
+  PH_THRESHOLD: 450
+  PH_ALPHA: 0.9999
+  ADWIN_DELTA: 1.0e-16
+  ADWIN_CLOCK: 32
+  ADWIN_MAX_BUCKETS: 5
+  ADWIN_MIN_WINDOW_LENGTH: 192
+  ADWIN_GRACE_PERIOD: 500
+
+runner:
+  python: venv/bin/python
+  batch_size: 128
+  dq_workers: 4
+  gpu_enabled: false
+  run_clusters_in_parallel: false
+  stream_base_port: 15101
+  server_base_port: 15002
+  client_worker_base_port: 16101

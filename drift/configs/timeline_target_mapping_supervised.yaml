@@ -1,0 +1,20 @@
+schema_version: 2
+experiment_id: target-mapping-supervised-example
+enabled: true
+experiment_seed: 42
+clients:
+  ids: ["synthetic-client"]
+modes: [test]
+temporal:
+  type: sudden
+  start_index: 100
+source:
+  type: target_mapping
+  old_mapping_id: registered_old_mapping_v1
+  new_mapping_id: registered_new_mapping_v1
+  target_fed_back: true
+  supervised_only: true
+windowing:
+  window_size: 24
+  forecast_horizon: 1
+  target_feature_index: 0

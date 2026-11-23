@@ -1,0 +1,105 @@
+suite_id: sudden_process_ar_int0p80_phi0p20_innov1p0_clientseed42_pre30_adapt40_holdout30
+schema_version: 1
+artifact_schema_version: 2
+seeds:
+  experiment_seed: 42
+  client_selection_seed: 42
+  data_order_seed: 42
+  drift_seed: 42
+  h_training_seed: 42
+  adaptation_seed: 42
+population:
+  total_clients: 84
+  clusters: 4
+  drifted_per_cluster: 8
+  controls_per_cluster: 13
+source:
+  directory: dataset/output_clean
+  assignment_path: dataset/cluster-assignment.csv
+  observations_per_client: 8760
+process:
+  drift_type: sudden
+  drift_source: process
+  old_intercept: 1.0
+  old_ar_coefficients: [0.50]
+  intercept_delta: 0.80
+  ar_coefficient_delta: [0.20]
+  innovation_sigma: 1.0
+  innovation_scale: 1.0
+  innovation_source: observed_process_residual
+windowing:
+  window_size: 24
+  forecast_horizon: 1
+  target_feature_index: 0
+model:
+  input_size: 1
+  hidden_size: 128
+  num_layers: 3
+  split_layer: 2
+  output_size: 1
+  dropout: 0.4
+  bidirectional: false
+splits:
+  train_windows: 6115
+  validation_windows: 873
+  deployment_windows: 1748
+segments:
+  pre_drift: 524
+  adaptation: 700
+  final_holdout: 524
+normalization:
+  method: zscore
+  ownership: per_client
+  shared_x_y_scaler: true
+  fit_scope: clean_training_observations_only
+streaming:
+  chronological: true
+  shuffle: false
+  adaptation_passes: 1
+  prequential: true
+methods: [R0_clean_frozen, R1_clean_continued_splitfed, M0_drift_frozen, M1_continued_splitfed, M2_oracle_client_only, M3_oracle_client_ewc]
+checkpoint_h:
+  policy: coherent_fixed_epoch
+  fixed_epoch: 130
+  validation_role: prediction_only_monitoring
+  client_pattern: cluster_{cluster_id}/client_{client_id}_final.pt
+  server_pattern: cluster_{cluster_id}/server_final.pt
+  global_server: global/global_server_latest.pt
+  completed_epochs: 130
+  checkpoint_selection: epoch_130_atomic_suite_state
+prepared_backend:
+  enabled: true
+  representation: normalized
+  normalization_applied_count: 1
+  runtime_normalization: false
+  runtime_scaler_fitting: false
+  runtime_drift_generation: false
+  runtime_window_construction: false
+  runtime_target_construction: false
+  runtime_split_calculation: false
+checkpoint_h_training:
+  gradient_roles: [clean_train]
+  evaluation_only_roles: [clean_validation]
+  epochs: 130
+  run_test_after_training: false
+  forbidden_roles:
+    - clean_deployment
+    - drifted_deployment
+    - ADAPTATION
+    - FINAL_HOLDOUT
+    - residuals
+    - drift_ground_truth
+    - oracle_events
+runtime:
+  batch_size: 128
+  shuffle: false
+adaptation:
+  adaptation_epochs: 3
+  client_only_adaptation_epochs: 3
+  ewc_adaptation_epochs: 3
+ewc:
+  enabled: true
+  lambda: 1.0
+  fisher_source: clean_validation
+  fisher_type: empirical_diagonal
+  fisher_max_batches: null
