@@ -1,0 +1,15 @@
+schema_version: 2
+experiment_id: no-drift-reference
+enabled: false
+experiment_seed: 42
+clients:
+  fraction: 0.0
+modes: [test]
+temporal:
+  type: none
+source:
+  type: measurement
+windowing:
+  window_size: 24
+  forecast_horizon: 1
+  target_feature_index: 0

@@ -195,7 +195,7 @@ def validate_experiment_config(config: Mapping[str, object]) -> None:
     drift = dict(config.get("drift", {}) or {})
     required_drift = {
         "type": "sudden",
-        "source": "input",
+        "source": "measurement",
         "scope": "test",
         "start_ratio": 0.5,
         "magnitude": 0.5,
@@ -204,7 +204,10 @@ def validate_experiment_config(config: Mapping[str, object]) -> None:
         "seed": 42,
     }
     for key, value in required_drift.items():
-        if drift.get(key) != value:
+        actual = drift.get(key)
+        if key == "source" and actual == "input":
+            actual = "measurement"
+        if actual != value:
             raise ValueError(f"drift.{key} must be {value!r}, got {drift.get(key)!r}")
     detector = dict(config.get("detectors", {}) or {})
     expected_detector = {
@@ -383,7 +386,7 @@ def _make_drift_config(
         mode="test",
         scope="test",
         drift_type=DriftType.SUDDEN,
-        drift_source=DriftSource.INPUT,
+        drift_source=DriftSource.MEASUREMENT,
         start_index=_coordinate(config, "drift_onset_index"),
         magnitude=float(drift["magnitude"]),
         offset_delta=float(drift["offset"]),
@@ -1296,7 +1299,7 @@ def build_run_environment(
         "DRIFT_DETECTION_ENABLED": "true",
         "DRIFT_DETECTORS": "page_hinkley,adwin",
         "DRIFT_TYPE": "none",
-        "DRIFT_SOURCE": "input",
+        "DRIFT_SOURCE": "measurement",
         "DRIFT_SCOPE": "test",
         "DRIFT_RUN_ID": f"{config['experiment_id']}_{condition_manifest['condition_id']}",
         "DRIFT_CONFIGURATION_ID": f"{config['experiment_id']}_{condition_manifest['condition_id']}",

@@ -25,7 +25,10 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+
+# Secrets and local environment
 .env
+
 # Virtual environments
 
 .venv
@@ -47,39 +50,74 @@ venv.bak/
 .DS_Store
 Thumbs.db
 
-# Project specific
+# Project source noise
 *.log
-tests/
-!tests/
-tests/*
-!tests/test_fault_alignment_scoring.py
-!tests/test_positive_clean_dataset.py
-!tests/test_runtime_quality_artifact.py
-!tests/test_split_lstm.py
-!tests/test_quality_runtime_modes.py
-!tests/test_controlled_window_fault_injection.py
-!tests/test_drift_standalone.py
-!tests/test_drift_stream_integration.py
-!tests/test_drift_detector_stream.py
-!tests/test_drift_evaluator_integration.py
-!tests/test_frozen_drift_validation.py
-!tests/test_drift_disabled_regression.py
-dataset/
-outputs/
-plots/
-notes/
-note/
-*.pdf
+*.orig
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.npz
 .dist/
+
+# Local datasets and generated experiment artifacts
+/dataset/
+/experiment/
+/experiments/
+/analysis/
+/diagnostics/
+/diagnostics-*/
+/output/
+/outputs/
+/plots/
+/plotting/
+/results/
+/reports/
+/global_summary.json
+
+# Local research notes and long-form working documentation
+/docs/
+/notes/
+/note/
+
+# Local data-quality calibration artifacts and helpers
+/data quality/scripts/group_calibration/*
+/data quality/configs/thresholds/*
+
+# One-off sweep configurations; canonical examples remain versioned
+/drift/configs/*clientsel*.yaml
+/drift/configs/mitigation_config_*_drift*.yaml
+/drift/configs/mitigation_sudden_process_seed42_*.yaml
+
+# Local experiment drivers and generated research reports
+/rerun_*.sh
+/drift/run_*sweep.sh
+/drift/run_m4_*.py
+/drift/run_drift_mitigation_matrix_gaps.py
+/drift/mitigation/*.md
+# Generated tabular/figure outputs
+*.pdf
 *.csv
-output-*
-output/*
-# compare_*.py
-# reports/
-# report-*/
-simple_plots/
-# simple_report_plots.py
-# comparison_training_plots.py
-# comparison_outputs/
-simple_plots_clean_vs_faulty/
-analysis/
+/output-*/
+/simple_plots/
+/simple_plots_clean_vs_faulty/
+
+# Generated test artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+junit.xml
+/test-results/
+/test_output/
+/test_outputs/
+/tests/output/
+/tests/outputs/
+
+# ignore the full suite and keep representative tests
+/tests/*
+!/tests/test_split_lstm.py
+!/tests/test_timeline_drift_framework.py
+!/tests/test_drift_mitigation_suite.py
+!/tests/test_prepared_faults.py

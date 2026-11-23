@@ -11,9 +11,10 @@ from pathlib import Path
 from typing import Optional, Sequence
 from collections import defaultdict
 from .summary_metrics import aggregate_detector_rows
-
 from .contracts import (
+    ClientSelectionRecord,
     DetectorEvent,
+    DriftManifestRow,
     DriftEvaluationResult,
     DriftType,
     ForecastSegment,
@@ -257,6 +258,136 @@ def load_injection_records(path: str | Path) -> list[InjectionRecord]:
         return rows
 
 
+
+def load_component_manifest(path: str | Path) -> list[DriftManifestRow]:
+    """Load schema-v2 component-level ground truth without collapsing mixed effects."""
+    with Path(path).open(newline="", encoding="utf-8") as handle:
+        return [
+            DriftManifestRow(
+                experiment_id=row["experiment_id"],
+                configuration_id=row["configuration_id"],
+                cluster_id=row["cluster_id"],
+                client_id=row["client_id"],
+                absolute_index=int(row["absolute_index"]),
+                timestamp=row.get("timestamp") or None,
+                component_id=row["component_id"],
+                component_type=row["component_type"],
+                drift_type=row["drift_type"],
+                drift_source=row["drift_source"],
+                configured_regime=row["configured_regime"],
+                old_concept_id=row["old_concept_id"],
+                new_concept_id=row["new_concept_id"],
+                active_concept_id=row["active_concept_id"],
+                drift_weight=float(row["drift_weight"]),
+                regime_active=_bool(row["regime_active"]),
+                change_point_event=_bool(row["change_point_event"]),
+                new_regime_selected=_bool(row["new_regime_selected"]),
+                transformation_applied=_bool(row["transformation_applied"]),
+                affected_features=row["affected_features"],
+                transformation_parameters=row["transformation_parameters"],
+                experiment_seed=int(row["experiment_seed"]),
+                client_seed=int(row["client_seed"]),
+                config_hash=row["config_hash"],
+                resolved_schedule_hash=row["resolved_schedule_hash"],
+                autoregressive_consistency_expected=_bool(row["autoregressive_consistency_expected"]),
+                exception_reason=row.get("exception_reason") or None,
+                base_values=row["base_values"],
+                runtime_values=row["runtime_values"],
+            )
+            for row in csv.DictReader(handle)
+        ]
+
+
+def load_client_selection_manifest(path: str | Path) -> list[ClientSelectionRecord]:
+    with Path(path).open(newline="", encoding="utf-8") as handle:
+        return [
+            ClientSelectionRecord(
+                experiment_id=row["experiment_id"],
+                cluster_id=row["cluster_id"],
+                client_id=row["client_id"],
+                affected=_bool(row["affected"]),
+                selection_method=row["selection_method"],
+                experiment_seed=int(row["experiment_seed"]),
+                client_seed=int(row["client_seed"]),
+                config_hash=row["config_hash"],
+                resolved_schedule_hash=row["resolved_schedule_hash"],
+            )
+            for row in csv.DictReader(handle)
+        ]
+
+
+def evaluate_detection_from_manifest(
+    events: Sequence[DetectorEvent],
+    manifest_rows: Sequence[DriftManifestRow],
+    *,
+    affected: bool,
+) -> DriftEvaluationResult:
+    """Evaluate detector events from schema-v2 component truth and client selection."""
+    if not affected:
+        return evaluate_detection(events, ())
+    if not manifest_rows:
+        raise ValueError("an affected client requires schema-v2 component manifest rows")
+    identities = {
+        (row.experiment_id, row.cluster_id, row.client_id) for row in manifest_rows
+    }
+    if len(identities) != 1:
+        raise ValueError("component manifest rows must belong to one experiment/client")
+    event_identities = {(event.run_id, event.cluster_id, event.client_id) for event in events}
+    if identities != event_identities:
+        raise ValueError("component manifest rows do not match detector event identity")
+    drift_types = {row.drift_type for row in manifest_rows}
+    if len(drift_types) != 1:
+        raise ValueError("mixed components must share one temporal drift type")
+    drift_type = DriftType.parse(next(iter(drift_types)))
+    by_index: dict[int, list[DriftManifestRow]] = defaultdict(list)
+    for row in manifest_rows:
+        by_index[row.absolute_index].append(row)
+    onset_candidates = sorted({
+        row.absolute_index for row in manifest_rows if row.change_point_event
+    })
+    if not onset_candidates:
+        raise ValueError("affected schema-v2 manifest contains no change-point event")
+    onset = onset_candidates[0]
+    event_mode = events[0].mode if events else "test"
+    synthetic: list[InjectionRecord] = []
+    for absolute_index, rows in sorted(by_index.items()):
+        representative = rows[0]
+        if any(row.drift_weight != representative.drift_weight for row in rows):
+            raise ValueError("mixed component schedule weights disagree at one timestamp")
+        selected_new = any(row.new_regime_selected for row in rows)
+        active = selected_new if drift_type is DriftType.RECURRING else any(
+            row.regime_active for row in rows
+        )
+        transformed = any(row.transformation_applied for row in rows)
+        synthetic.append(InjectionRecord(
+            run_id=representative.experiment_id,
+            configuration_id=representative.configuration_id,
+            cluster_id=representative.cluster_id,
+            client_id=representative.client_id,
+            mode=event_mode,
+            observation_index=absolute_index,
+            timestamp=representative.timestamp,
+            base_value=0.0,
+            runtime_value=1.0 if transformed else 0.0,
+            drift_type=drift_type.value,
+            drift_source=representative.drift_source,
+            configured_start_index=onset,
+            configured_end_index=None,
+            drift_weight=representative.drift_weight,
+            regime_active=active,
+            transform_applied=transformed,
+            affected_sample_count=int(transformed),
+            magnitude=0.0,
+            offset_delta=0.0,
+            noise_sigma=0.0,
+            label_delta=0.0,
+            period=None,
+            transition_function="resolved_manifest",
+            random_seed=representative.client_seed,
+        ))
+    return evaluate_detection(events, synthetic)
+
+
 def evaluate_run_artifacts(run_dir: str | Path, output_dir: str | Path) -> dict[str, object]:
     """Evaluate persisted stream artifacts without loading models, data, or scalers."""
     run_root = Path(run_dir)
@@ -264,21 +395,44 @@ def evaluate_run_artifacts(run_dir: str | Path, output_dir: str | Path) -> dict[
     destination.mkdir(parents=True, exist_ok=True)
     events_by_identity: dict[tuple[str, str, str, str, str, str], list[DetectorEvent]] = defaultdict(list)
     records_by_client: dict[tuple[str, str, str, str], list[InjectionRecord]] = defaultdict(list)
-    for path in sorted(run_root.glob("cluster_*/drift/detector_events.csv")):
+    components_by_client: dict[tuple[str, str, str], list[DriftManifestRow]] = defaultdict(list)
+    selections_by_client: dict[tuple[str, str, str], ClientSelectionRecord] = {}
+    for path in sorted(run_root.glob("**/drift/detector_events.csv")):
         for event in load_detector_events(path):
             events_by_identity[(event.run_id, event.cluster_id, event.client_id, event.mode, event.stream_name, event.detector_name)].append(event)
-    for path in sorted(run_root.glob("cluster_*/drift/injection_manifest.csv")):
+    for path in sorted(run_root.glob("**/drift/injection_manifest.csv")):
         for record in load_injection_records(path):
             records_by_client[(record.run_id, record.cluster_id, record.client_id, record.mode)].append(record)
+    for path in sorted(run_root.glob("**/drift/component_manifest.csv")):
+        for row in load_component_manifest(path):
+            components_by_client[(row.experiment_id, row.cluster_id, row.client_id)].append(row)
+    for path in sorted(run_root.glob("**/drift/client_selection_manifest.csv")):
+        for row in load_client_selection_manifest(path):
+            key = (row.experiment_id, row.cluster_id, row.client_id)
+            previous = selections_by_client.get(key)
+            if previous is not None and previous != row:
+                raise ValueError(f"conflicting client-selection rows for {key}")
+            selections_by_client[key] = row
     summaries = []
     forecast_rows = []
     for identity, event_rows in sorted(events_by_identity.items()):
         run_id, cluster_id, client_id, mode, stream_name, detector_name = identity
         records = records_by_client.get((run_id, cluster_id, client_id, mode), [])
-        result = evaluate_detection(event_rows, records)
+        schema_key = (run_id, cluster_id, client_id)
+        schema_rows = components_by_client.get(schema_key, [])
+        selection = selections_by_client.get(schema_key)
+        if schema_rows or selection is not None:
+            affected = selection.affected if selection is not None else bool(schema_rows)
+            result = evaluate_detection_from_manifest(
+                event_rows, schema_rows, affected=affected
+            )
+            drifted_client = affected
+        else:
+            result = evaluate_detection(event_rows, records)
+            drifted_client = bool(records)
         summaries.append({
             "run_id": run_id, "cluster_id": cluster_id, "client_id": client_id, "mode": mode,
-            "stream_name": stream_name, "detector_name": detector_name, "drifted_client": bool(records),
+            "stream_name": stream_name, "detector_name": detector_name, "drifted_client": drifted_client,
             "observations_seen": result.observations_seen, "alarm_count": len(result.all_alarms),
             "first_alarm_anywhere": result.first_alarm_anywhere,
             "clean_client_false_positive": result.clean_client_false_positive,

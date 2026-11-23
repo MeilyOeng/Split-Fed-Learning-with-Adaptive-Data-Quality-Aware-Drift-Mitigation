@@ -66,7 +66,7 @@ run_clean_calibration() {
             FROZEN_VALIDATION_MODE=true \
             DRIFT_INJECTION_ENABLED=false \
             DRIFT_DETECTION_ENABLED=true \
-            DRIFT_SOURCE=input \
+            DRIFT_SOURCE=measurement \
             DRIFT_SCOPE=test \
             DRIFT_TYPE=none \
             DRIFT_CLIENT_IDS= \

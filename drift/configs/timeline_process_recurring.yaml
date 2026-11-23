@@ -1,0 +1,27 @@
+schema_version: 2
+experiment_id: process-recurring-example
+enabled: true
+experiment_seed: 42
+clients:
+  fraction: 0.25
+modes: [test]
+temporal:
+  type: recurring
+  start_index: 7000
+  cycle_length: 336
+  new_duration: 168
+  old_duration: 168
+source:
+  type: process
+  old:
+    intercept: 0.0
+    ar_coefficients: [0.80]
+    innovation_sigma: 0.1
+  changes:
+    intercept_delta: 0.5
+    ar_coefficient_delta: [0.05]
+  innovation_mode: clean_residual
+windowing:
+  window_size: 24
+  forecast_horizon: 1
+  target_feature_index: 0

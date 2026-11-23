@@ -104,6 +104,7 @@ class StreamingIterableDataset(IterableDataset):
                 "mode": payload.get("mode", self.mode),
                 "window_start_indices": payload.get("window_start_indices", []),
                 "window_end_indices": payload.get("window_end_indices", []),
+                "target_indices": payload.get("target_indices", []),
                 "window_start_timestamps": payload.get("window_start_timestamps", []),
                 "window_end_timestamps": payload.get("window_end_timestamps", []),
                 "target_timestamps": payload.get("target_timestamps", []),

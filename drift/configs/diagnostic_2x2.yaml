@@ -29,7 +29,7 @@ split:
 
 drift:
   type: sudden
-  source: input
+  source: measurement
   scope: test
   start_ratio: 0.5
   magnitude: 0.5

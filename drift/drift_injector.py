@@ -23,7 +23,7 @@ def inject_drift(series, drift_type="sudden", start_ratio=0.2, magnitude=0.5, en
     end = int(end_ratio * size) if dtype in (DriftType.GRADUAL, DriftType.INCREMENTAL) else None
     config = DriftConfig(
         run_id="legacy", configuration_id="legacy", cluster_id="legacy", client_id="test",
-        drift_type=dtype, drift_source=DriftSource.INPUT, start_index=start, end_index=end,
+        drift_type=dtype, drift_source=DriftSource.MEASUREMENT, start_index=start, end_index=end,
         magnitude=magnitude, period=period if dtype is DriftType.RECURRING else None,
         transition=transition, random_seed=seed,
     )

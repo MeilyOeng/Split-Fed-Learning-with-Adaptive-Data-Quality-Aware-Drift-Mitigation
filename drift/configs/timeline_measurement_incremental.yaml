@@ -1,0 +1,25 @@
+schema_version: 2
+experiment_id: measurement-incremental-example
+enabled: true
+experiment_seed: 42
+clients:
+  fraction: 0.25
+modes: [test]
+temporal:
+  type: incremental
+  start_index: 7000
+  end_index: 7600
+  transition: sigmoid
+  sigmoid_k: 10.0
+source:
+  type: measurement
+  feature_transforms:
+    0:
+      - type: scale
+        factor: 1.20
+      - type: offset
+        delta: 2.0
+windowing:
+  window_size: 24
+  forecast_horizon: 1
+  target_feature_index: 0

@@ -50,14 +50,14 @@ def inject_series(
 
         transformed = float(original)
         changed = False
-        if config.drift_source in (DriftSource.INPUT, DriftSource.PROCESS):
+        if config.drift_source is DriftSource.MEASUREMENT:
             transformed, changed = transform_value(
                 transformed,
                 weight=applied_weight,
                 config=config,
                 rng=rng,
             )
-        if config.drift_source is DriftSource.TARGET and applied_weight > 0.0 and config.has_target_effect:
+        if config.drift_source is DriftSource.TARGET_MAPPING and applied_weight > 0.0 and config.has_target_effect:
             transformed += applied_weight * config.label_delta
             changed = not np.isclose(transformed, float(original), rtol=0.0, atol=1e-12)
 

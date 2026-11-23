@@ -20,6 +20,11 @@ def apply_drift(X, y, mode: str, drift_cfg: Optional[DriftConfig], *, observatio
     if observation_index is None:
         raise ValueError("observation_index is required; mutable call-counter drift timing was removed")
     warnings.warn("drift_framework.apply_drift is deprecated; use drift.injector.inject_series", DeprecationWarning)
+    if drift_cfg.drift_source is not DriftSource.MEASUREMENT:
+        raise ValueError(
+            "legacy window-level apply_drift supports measurement drift only; "
+            "use drift.pipeline.inject_timeline for coherent sources"
+        )
     weight = transition_progress(observation_index, drift_cfg)
     array = X.detach().cpu().numpy() if hasattr(X, "detach") else np.asarray(X)
     transformed = np.array(array, copy=True, dtype=float)

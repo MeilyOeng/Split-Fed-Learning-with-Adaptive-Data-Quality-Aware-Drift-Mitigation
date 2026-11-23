@@ -18,6 +18,10 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from models.split_lstm import build_split_lstm
+try:
+    from server.frozen_gradient import frozen_server_activation_step
+except ModuleNotFoundError:  # direct execution as server/server.py
+    from frozen_gradient import frozen_server_activation_step
 from utils.quality_aggregation import (
     ClientGradientContribution,
     aggregate_anchor_gradients,
@@ -30,11 +34,14 @@ from utils.runtime_utils import (
     build_quality_anchor_config,
     derive_dq_mode,
     get_device_info,
+    load_checkpoint_base_reference,
     parse_bool,
     QualityAnchorConfig,
     resolve_device,
+    resolve_server_checkpoint_fallback,
     save_torch_checkpoint,
     try_load_torch_checkpoint,
+    try_load_torch_checkpoint_with_fallback,
 )
 
 
@@ -152,11 +159,22 @@ class SplitLearningServerState:
         self.accum_quality_weight_sum = 0.0
         self.quality_anchor_contributions: List[ClientGradientContribution] = []
         # try loading latest checkpoint on startup
-        latest_path = server_checkpoint_path(self.runtime_cfg.cluster_id, "latest.pt") 
-        extra, ok = try_load_torch_checkpoint(
+        latest_path = server_checkpoint_path(self.runtime_cfg.cluster_id, "latest.pt")
+        # CHECKPOINT_BASE_REFERENCE_PATH, when set, is the exact declared
+        # path to this method's checkpoints/base_reference.json -- never
+        # searched for. Unset for every legacy run and for legacy_full-mode
+        # runs, so the fallback branch below is provably unreached for them.
+        base_reference_path = _get_env("CHECKPOINT_BASE_REFERENCE_PATH", "")
+        base_reference = load_checkpoint_base_reference(base_reference_path or None)
+        fallback = None
+        if base_reference is not None:
+            fallback = resolve_server_checkpoint_fallback(base_reference, base_reference_path, self.runtime_cfg.cluster_id)
+        extra, ok = try_load_torch_checkpoint_with_fallback(
             self.model,
             self.optimizer,
             latest_path,
+            base_reference=base_reference,
+            fallback=fallback,
             map_location=str(self.device),
             strict=True,
             log_prefix="Server",
@@ -894,6 +912,7 @@ class SplitLearningServerState:
         return {
             "grad_activations": grad_activations,
             "loss": raw_loss,
+            "predictions": preds.detach().cpu(),
             "weighted_loss": weighted_loss_value,
             "effective_loss": effective_loss_value,
             "client_mean_quality": client_mean_quality,
@@ -909,6 +928,29 @@ class SplitLearningServerState:
             **self.round_state(),
             "active_accum_steps_target": active_accum_steps_target_snapshot,
         }
+
+    def frozen_activation_step(self, client_id: str, activations_cpu: torch.Tensor, targets_cpu: torch.Tensor) -> Dict[str, Any]:
+        """M2-only activation derivative with every server-owned state frozen."""
+        before = {
+            "parameters": self.parameter_hash(),
+            "optimizer_steps": self.optimizer_step_count,
+            "global_step": self.global_step,
+            "round_id": self.round_id,
+            "optimizer_state": pickle.dumps(self.optimizer.state_dict()),
+        }
+        result = frozen_server_activation_step(
+            self.model, self.criterion, activations_cpu, targets_cpu, device=self.device
+        )
+        after = {
+            "parameters": self.parameter_hash(),
+            "optimizer_steps": self.optimizer_step_count,
+            "global_step": self.global_step,
+            "round_id": self.round_id,
+            "optimizer_state": pickle.dumps(self.optimizer.state_dict()),
+        }
+        if before != after:
+            raise RuntimeError("M2 frozen server call mutated server-owned state")
+        return {**result, "client_id": str(client_id), "server_state_unchanged": True}
 
     def validate_step(self, client_id: str, activations_cpu: torch.Tensor, targets_cpu: torch.Tensor) -> Dict[str, Any]:
         self._flush_before_eval_if_needed(reason=f"before_validate:{client_id}") # apply any pending gradients first
@@ -965,6 +1007,27 @@ class SplitLearningServerState:
         save_torch_checkpoint(self.model, self.optimizer, path, extra=self._checkpoint_extra(), log_prefix="Server")
         return path
 
+    def _load_checkpoint_with_base_reference_fallback(self, primary_path: str) -> Tuple[Optional[Dict[str, Any]], bool]:
+        # Mirrors the fallback the constructor already uses (see __init__
+        # above): when SKIP_TRAINING left this run's own OUTPUT_DIR empty,
+        # re-load the same H artifact the server loaded at startup instead
+        # of failing closed against a local-only path.
+        base_reference_path = _get_env("CHECKPOINT_BASE_REFERENCE_PATH", "")
+        base_reference = load_checkpoint_base_reference(base_reference_path or None)
+        if base_reference is None:
+            return None, False
+        fallback = resolve_server_checkpoint_fallback(base_reference, base_reference_path, self.runtime_cfg.cluster_id)
+        return try_load_torch_checkpoint_with_fallback(
+            self.model,
+            self.optimizer,
+            primary_path,
+            base_reference=base_reference,
+            fallback=fallback,
+            map_location=str(self.device),
+            strict=True,
+            log_prefix="Server",
+        )
+
     def _load_best(self) -> str:
         self._flush_before_eval_if_needed(reason="load_best")
         path = server_checkpoint_path(self.runtime_cfg.cluster_id, "best.pt")
@@ -976,6 +1039,8 @@ class SplitLearningServerState:
             strict=True,
             log_prefix="Server",
         )
+        if not ok:
+            extra, ok = self._load_checkpoint_with_base_reference_fallback(path)
         if not ok:
             raise FileNotFoundError(path)
         if extra:
@@ -997,6 +1062,8 @@ class SplitLearningServerState:
             strict=True,
             log_prefix="Server",
         )
+        if not ok:
+            extra, ok = self._load_checkpoint_with_base_reference_fallback(latest_path)
         if not ok:
             raise FileNotFoundError(latest_path)
         if extra:
@@ -1020,6 +1087,8 @@ class SplitLearningServerState:
             strict=True,
             log_prefix="Server",
         )
+        if not ok:
+            extra, ok = self._load_checkpoint_with_base_reference_fallback(target)
         if not ok:
             raise FileNotFoundError(target)
         if extra:
@@ -1225,6 +1294,28 @@ def train_step():
                     }
                 )
             return jsonify({"error": str(e), **state.round_state()}), 409
+
+
+@app.route("/frozen_activation_step", methods=["POST"])
+def frozen_activation_step_route():
+    request_bytes = len(request.get_data(cache=True) or b"")
+    t0 = time.perf_counter()
+    with state.lock:
+        payload = _unpickle_request_data()
+        result = state.frozen_activation_step(
+            str(payload["client_id"]), payload["activations"], payload["targets"]
+        )
+        response_blob = pickle.dumps(result)
+        if state.comm_log_train and state._should_log_batch(payload.get("batch_id")):
+            state._append_comm_row({
+                "level": "split", "observer": "server", "cluster_id": state.runtime_cfg.cluster_id,
+                "client_id": str(payload["client_id"]), "event": "frozen_activation_step",
+                "route": "/frozen_activation_step", "direction": "server_process",
+                "payload_type": "activation_payload", "payload_bytes": request_bytes,
+                "latency_ms": round((time.perf_counter() - t0) * 1000.0, 3), "status": "ok",
+                "server_optimizer_steps": 0, "server_state_unchanged": True,
+            })
+        return Response(response_blob, content_type="application/octet-stream")
 
 
 @app.route("/validate_step", methods=["POST"])

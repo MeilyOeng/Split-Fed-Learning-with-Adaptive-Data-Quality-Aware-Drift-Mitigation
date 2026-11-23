@@ -115,7 +115,7 @@ run_experiment() {
             FROZEN_VALIDATION_MODE=true \
             NORMALIZE=true \
             NORMALIZE_METHOD=zscore \
-            DRIFT_SOURCE=input \
+            DRIFT_SOURCE=measurement \
             DRIFT_SCOPE=test \
             DRIFT_DETECTION_ENABLED=true \
             DRIFT_DETECTORS=page_hinkley,adwin \

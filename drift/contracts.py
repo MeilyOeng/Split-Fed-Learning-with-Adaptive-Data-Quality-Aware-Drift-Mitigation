@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -31,15 +31,40 @@ class DriftType(_StrictEnum):
 
 
 class DriftSource(_StrictEnum):
-    INPUT = "input"
+    STRICT_COVARIATE = "strict_covariate"
+    MEASUREMENT = "measurement"
+    TARGET_MAPPING = "target_mapping"
     PROCESS = "process"
-    TARGET = "target"
+    MIXED = "mixed"
+    @classmethod
+    def parse(cls, value: object):
+        legacy = {
+            "input": "measurement",
+            "target": "target_mapping",
+            "label": "target_mapping",
+            "both": "mixed",
+        }
+        return super().parse(legacy.get(str(value).strip().lower(), value))
+
+    # Deprecated symbolic aliases keep Python callers working while serialized output
+    # and enum iteration always use the corrected terminology.
+    INPUT = "measurement"
+    LABEL = "target_mapping"
+    BOTH = "mixed"
+    TARGET = "target_mapping"
 
 
 class TransitionFunction(_StrictEnum):
     LINEAR = "linear"
     SIGMOID = "sigmoid"
     EXPONENTIAL = "exponential"
+
+class TransformType(_StrictEnum):
+    SCALE = "scale"
+    OFFSET = "offset"
+    NOISE = "noise"
+    NONLINEAR = "nonlinear"
+
 
 
 class DetectorName(_StrictEnum):
@@ -61,7 +86,7 @@ class DriftConfig:
     mode: str = "inference"
     scope: str = "test"
     drift_type: DriftType = DriftType.NONE
-    drift_source: DriftSource = DriftSource.INPUT
+    drift_source: DriftSource = DriftSource.MEASUREMENT
     start_index: Optional[int] = None
     end_index: Optional[int] = None
     magnitude: float = 0.0
@@ -133,6 +158,144 @@ class DriftConfig:
     def has_target_effect(self) -> bool:
         return self.label_delta != 0.0
 
+@dataclass(frozen=True)
+class FeatureTransform:
+    feature_index: int
+    transform_type: TransformType
+    parameters: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "transform_type", TransformType.parse(self.transform_type))
+        object.__setattr__(self, "parameters", dict(self.parameters))
+        if self.feature_index < 0:
+            raise ValueError("feature_index must be >= 0")
+
+
+@dataclass(frozen=True)
+class TemporalConfig:
+    drift_type: DriftType
+    start_index: Optional[int] = None
+    end_index: Optional[int] = None
+    start_timestamp: Optional[str] = None
+    end_timestamp: Optional[str] = None
+    transition: TransitionFunction = TransitionFunction.LINEAR
+    sigmoid_k: float = 10.0
+    exp_alpha: float = 3.0
+    cycle_length: Optional[int] = None
+    old_duration: Optional[int] = None
+    new_duration: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "drift_type", DriftType.parse(self.drift_type))
+        object.__setattr__(self, "transition", TransitionFunction.parse(self.transition))
+
+
+@dataclass(frozen=True)
+class DriftComponentConfig:
+    component_id: str
+    source: DriftSource
+    feature_transforms: tuple[FeatureTransform, ...] = field(default_factory=tuple)
+    parameters: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source", DriftSource.parse(self.source))
+        object.__setattr__(self, "feature_transforms", tuple(self.feature_transforms))
+        object.__setattr__(self, "parameters", dict(self.parameters))
+        if not self.component_id.strip():
+            raise ValueError("component_id must be non-empty")
+
+
+@dataclass(frozen=True)
+class DriftExperimentConfig:
+    schema_version: int
+    experiment_id: str
+    enabled: bool
+    experiment_seed: int
+    drift_source: DriftSource
+    temporal: TemporalConfig
+    components: tuple[DriftComponentConfig, ...]
+    client_ids: tuple[str, ...] = field(default_factory=tuple)
+    client_fraction: Optional[float] = None
+    modes: tuple[str, ...] = ("test",)
+    target_feature_index: int = 0
+    window_size: int = 24
+    forecast_horizon: int = 1
+    config_hash: str = ""
+    canonical_config: str = ""
+
+
+@dataclass(frozen=True)
+class SchedulePoint:
+    absolute_index: int
+    timestamp: Optional[str]
+    configured_regime: str
+    old_concept_id: str
+    new_concept_id: str
+    active_concept_id: str
+    drift_weight: float
+    regime_active: bool
+    change_point_event: bool
+    new_regime_selected: bool
+
+
+@dataclass(frozen=True)
+class ClientSelectionRecord:
+    experiment_id: str
+    cluster_id: str
+    client_id: str
+    affected: bool
+    selection_method: str
+    experiment_seed: int
+    client_seed: int
+    config_hash: str
+    resolved_schedule_hash: str
+
+
+@dataclass(frozen=True)
+class DriftManifestRow:
+    experiment_id: str
+    configuration_id: str
+    cluster_id: str
+    client_id: str
+    absolute_index: int
+    timestamp: Optional[str]
+    component_id: str
+    new_regime_selected: bool
+    component_type: str
+    drift_type: str
+    drift_source: str
+    configured_regime: str
+    old_concept_id: str
+    new_concept_id: str
+    active_concept_id: str
+    drift_weight: float
+    regime_active: bool
+    change_point_event: bool
+    transformation_applied: bool
+    affected_features: str
+    transformation_parameters: str
+    experiment_seed: int
+    client_seed: int
+    config_hash: str
+    resolved_schedule_hash: str
+    autoregressive_consistency_expected: bool
+    exception_reason: Optional[str]
+    base_values: str
+    runtime_values: str
+
+
+@dataclass(frozen=True)
+class TimelineInjectionResult:
+    clean_timeline: np.ndarray
+    latent_timeline: np.ndarray
+    observed_timeline: np.ndarray
+    target_timeline: np.ndarray
+    manifest: tuple[DriftManifestRow, ...]
+    autoregressive_consistency_expected: bool
+    exception_reason: Optional[str]
+    innovation_source: Optional[str] = None
+    innovations: Optional[np.ndarray] = None
+    equation_units: str = "raw_source_units"
 
 @dataclass(frozen=True)
 class InjectionRecord:

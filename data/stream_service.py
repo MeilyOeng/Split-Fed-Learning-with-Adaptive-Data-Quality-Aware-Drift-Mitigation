@@ -18,9 +18,13 @@ if BASE_DIR not in sys.path:
 from utils.comm_logging import append_comm_row, tensor_shape
 from utils.runtime_utils import build_quality_anchor_config, derive_dq_mode, quality_scores_needed
 from drift.artifacts import CsvArtifactWriter, write_csv, write_json
-from drift.contracts import DetectorEvent, DetectorKey, DetectorName, DetectorParameters, DriftConfig, DriftSource, DriftType, InjectionRecord, TransitionFunction
+from drift.contracts import ClientSelectionRecord, DetectorEvent, DetectorKey, DetectorName, DetectorParameters, DriftConfig, DriftManifestRow, DriftSource, DriftType, InjectionRecord, TransitionFunction
 from drift.detectors import DetectorRegistry
 from drift.injector import derive_client_seed, inject_series
+from drift.configuration import load_drift_config
+from drift.pipeline import inject_timeline
+from drift.schedule import resolve_experiment_schedule
+from drift.windowing import fit_clean_training_scalers
 
 app = Flask(__name__)
 
@@ -88,6 +92,7 @@ QUALITY_NEEDED = quality_scores_needed(
 MODEL_INPUT_SIZE_RAW = str(os.environ.get("MODEL_INPUT_SIZE", "")).strip()
 DRIFT_INJECTION_ENABLED = os.environ.get("DRIFT_INJECTION_ENABLED", "false").lower() in ("1", "true", "yes", "y")
 DRIFT_DETECTION_ENABLED = os.environ.get("DRIFT_DETECTION_ENABLED", "false").lower() in ("1", "true", "yes", "y")
+DRIFT_CONFIG_PATH = str(os.environ.get("DRIFT_CONFIG_PATH", "")).strip()
 DRIFT_SOURCE_RAW = os.environ.get("DRIFT_SOURCE", "input").strip().lower()
 DRIFT_SCOPE = os.environ.get("DRIFT_SCOPE", "test").strip().lower()
 DRIFT_RUN_ID = os.environ.get("DRIFT_RUN_ID", "drift-validation").strip()
@@ -131,6 +136,9 @@ client_window_counts: Dict[Tuple[str, str, int], Dict[str, int]] = {}
 client_input_sizes: Dict[Tuple[str, int], int] = {}
 client_offsets: Dict[Tuple[str, int, str], int] = {}
 client_runtime_series: Dict[Tuple[str, str, int], torch.Tensor] = {}
+client_schema_v2_scalers: Dict[Tuple[str, int], Any] = {}
+schema_v2_config: Optional[Any] = None
+schema_v2_resolved: Optional[Any] = None
 drift_injection_records: Dict[Tuple[str, str, int], Dict[int, InjectionRecord]] = {}
 drift_selected_clients: set[Tuple[str, int]] = set()
 drift_detector_registry: Optional[DetectorRegistry] = None
@@ -256,7 +264,16 @@ def _get_split_bounds(num_values: int) -> Dict[str, Tuple[int, int]]:
 def _compute_norm_stats(values: torch.Tensor) -> Tuple[float, float]:
     split_bounds = _get_split_bounds(len(values))
     _, train_end = split_bounds["train"]
-    train_value_end = min(len(values), train_end + WINDOW_SIZE + FORECAST_HORIZON)
+    if train_end <= 0:
+        return 0.0, 1.0
+    # Training window starts occupy [0, train_end). The final training target
+    # is therefore at train_end + WINDOW_SIZE + FORECAST_HORIZON - 2, making
+    # the following value the exclusive slice boundary. Advancing one element
+    # further would include the target of the first validation window.
+    train_value_end = min(
+        len(values),
+        train_end + WINDOW_SIZE + FORECAST_HORIZON - 1,
+    )
     train_values = values[:train_value_end]
     if train_values.numel() == 0:
         return 0.0, 1.0
@@ -792,9 +809,121 @@ def _initialize_drift_runtime() -> None:
     })
 
 
+def _initialize_schema_v2_drift_runtime() -> None:
+    """Wire the source-aware timeline drift library (drift.pipeline.inject_timeline)
+    into the runtime stream, independent of the legacy v1 DRIFT_TYPE injector above.
+    """
+    global schema_v2_config, schema_v2_resolved
+    drift_dir = os.path.join(OUTPUT_DIR, "drift")
+    if not (DRIFT_CONFIG_PATH or DRIFT_INJECTION_ENABLED or DRIFT_DETECTION_ENABLED):
+        os.makedirs(drift_dir, exist_ok=True)
+        write_json(os.path.join(drift_dir, "resolved_config_v2.json"), {
+            "schema_version": None,
+            "injection_enabled": False,
+            "detection_enabled": False,
+            "drift_config_path": None,
+        })
+        return
+    if not DRIFT_CONFIG_PATH:
+        return
+
+    config = load_drift_config(DRIFT_CONFIG_PATH)
+    client_timelines: Dict[Tuple[str, str], Tuple[List[int], List[pd.Timestamp]]] = {}
+    for mode, cluster_id, client_id in list(client_series.keys()):
+        if mode != "test":
+            continue
+        series_key = _series_key(mode, cluster_id, client_id)
+        length = len(client_series[series_key])
+        client_timelines[(str(cluster_id), str(client_id))] = (
+            list(range(length)), client_timestamps[series_key],
+        )
+    resolved = resolve_experiment_schedule(config, client_timelines)
+    schema_v2_config, schema_v2_resolved = config, resolved
+
+    os.makedirs(drift_dir, exist_ok=True)
+    all_manifest_rows: list[DriftManifestRow] = []
+    normalization_entries: list[dict] = []
+    for selection in resolved.selections:
+        if not selection.affected:
+            continue
+        cluster_id, client_id_str = selection.cluster_id, selection.client_id
+        client_id = int(client_id_str)
+        series_key = _series_key("test", cluster_id, client_id)
+        clean_values = client_series[series_key].cpu().numpy()
+        timestamps = client_timestamps[series_key]
+        result = inject_timeline(
+            clean_values, timestamps=timestamps, config=config, resolved_schedule=resolved,
+            cluster_id=cluster_id, client_id=client_id_str,
+        )
+        client_runtime_series[series_key] = torch.as_tensor(
+            result.observed_timeline[:, 0], dtype=torch.float32
+        ).contiguous()
+        client_target_lookup[series_key] = {
+            pd.Timestamp(timestamp): torch.tensor(float(result.target_timeline[index, 0]), dtype=torch.float32)
+            for index, timestamp in enumerate(timestamps) if not pd.isna(timestamp)
+        }
+        all_manifest_rows.extend(result.manifest)
+
+        train_key = _series_key("train", cluster_id, client_id)
+        if train_key in client_series:
+            train_values = client_series[train_key].cpu().numpy()
+            train_start, train_end = client_split_bounds[train_key]["train"]
+            scaler = fit_clean_training_scalers(
+                train_values, train_values, training_window_starts=range(train_start, train_end),
+                window_size=WINDOW_SIZE, forecast_horizon=FORECAST_HORIZON, target_feature_index=0,
+                method=NORMALIZE_METHOD, share_target_scaler=True,
+            )
+            client_schema_v2_scalers[_client_key(cluster_id, client_id)] = scaler
+            normalization_entries.append({
+                "cluster_id": cluster_id, "client_id": client_id_str,
+                "target_scaling_strategy": scaler.target_scaling_strategy,
+                "method": scaler.method,
+                "x_location": list(scaler.x_location), "x_scale": list(scaler.x_scale),
+                "y_location": scaler.y_location, "y_scale": scaler.y_scale,
+                "shared_target_indices": list(scaler.shared_target_indices),
+                "shared_target_union_hash": scaler.shared_target_union_hash,
+            })
+
+    if all_manifest_rows:
+        write_csv(os.path.join(drift_dir, "component_manifest.csv"), all_manifest_rows, DriftManifestRow)
+    write_csv(
+        os.path.join(drift_dir, "client_selection_manifest.csv"),
+        list(resolved.selections), ClientSelectionRecord,
+    )
+    write_json(os.path.join(drift_dir, "normalization_manifest.json"), {"clients": normalization_entries})
+    write_json(os.path.join(drift_dir, "resolved_config_v2.json"), {
+        "schema_version": config.schema_version,
+        "experiment_id": config.experiment_id,
+        "drift_source": config.drift_source.value,
+        "injection_enabled": True,
+        "detection_enabled": DRIFT_DETECTION_ENABLED,
+        "drift_config_path": DRIFT_CONFIG_PATH,
+        "config_hash": config.config_hash,
+        "resolved_schedule_hash": resolved.resolved_schedule_hash,
+        "affected_clients": [
+            {"cluster_id": item.cluster_id, "client_id": item.client_id}
+            for item in resolved.selections if item.affected
+        ],
+    })
+
+
 load_cluster_data()
 _load_quality_score_index()
 _initialize_drift_runtime()
+_initialize_schema_v2_drift_runtime()
+
+
+@app.route("/drift/config", methods=["GET"])
+def drift_config():
+    if schema_v2_config is None or schema_v2_resolved is None:
+        return jsonify({"error": "no schema-v2 drift configuration loaded"}), 404
+    return jsonify({
+        "schema_version": schema_v2_config.schema_version,
+        "experiment_id": schema_v2_config.experiment_id,
+        "drift_source": schema_v2_config.drift_source.value,
+        "config_hash": schema_v2_config.config_hash,
+        "resolved_schedule_hash": schema_v2_resolved.resolved_schedule_hash,
+    })
 
 
 @app.route("/health", methods=["GET"])
@@ -888,6 +1017,15 @@ def stream_norm_stats():
         "cluster_data_dirs": MODE_CLUSTER_DIRS,
         "target_cluster_data_dirs": MODE_TARGET_CLUSTER_DIRS,
     }
+    schema_v2_scaler = client_schema_v2_scalers.get(key)
+    if schema_v2_scaler is not None:
+        response.update({
+            "target_scaling_strategy": schema_v2_scaler.target_scaling_strategy,
+            "x_location": list(schema_v2_scaler.x_location),
+            "x_scale": list(schema_v2_scaler.x_scale),
+            "y_location": schema_v2_scaler.y_location,
+            "y_scale": schema_v2_scaler.y_scale,
+        })
     if COMM_LOG_STREAM:
         _append_stream_comm(
             {
@@ -1062,10 +1200,17 @@ def stream_next():
         )
 
     if NORMALIZE:
+        schema_v2_scaler = client_schema_v2_scalers.get(_client_key(cluster_id, client_id))
         mean, scale = client_norm_stats[_client_key(cluster_id, client_id)]
         X_batch = X_batch.clone()
-        X_batch[:, :, 0] = _normalize_tensor(X_batch[:, :, 0], mean, scale)
-        y_batch = _normalize_tensor(y_batch, mean, scale)
+        if schema_v2_scaler is not None:
+            X_batch[:, :, 0] = _normalize_tensor(
+                X_batch[:, :, 0], float(schema_v2_scaler.x_location[0]), float(schema_v2_scaler.x_scale[0])
+            )
+            y_batch = _normalize_tensor(y_batch, float(schema_v2_scaler.y_location), float(schema_v2_scaler.y_scale))
+        else:
+            X_batch[:, :, 0] = _normalize_tensor(X_batch[:, :, 0], mean, scale)
+            y_batch = _normalize_tensor(y_batch, mean, scale)
 
     drift_batch_metadata = []
     if DRIFT_DETECTION_ENABLED and mode == "test" and drift_detector_registry is not None:
@@ -1118,7 +1263,7 @@ def stream_next():
             "dimension_freshness": [record.get("dimension_freshness") for record in quality_records],
         },
     }
-    if DRIFT_INJECTION_ENABLED or DRIFT_DETECTION_ENABLED:
+    if DRIFT_CONFIG_PATH or DRIFT_INJECTION_ENABLED or DRIFT_DETECTION_ENABLED:
         payload["drift_metadata"] = drift_batch_metadata
     if USE_QUALITY_ANCHOR_AGGREGATION:
         payload["quality_anchor_scores"] = quality_anchor_scores

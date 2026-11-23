@@ -1,0 +1,19 @@
+schema_version: 2
+experiment_id: strict-covariate-chronological-example
+enabled: true
+experiment_seed: 42
+clients:
+  ids: ["synthetic-client"]
+modes: [test]
+temporal:
+  type: sudden
+  start_index: 100
+source:
+  type: strict_covariate
+  generator_id: registered_chronological_generator_v1
+  benchmark_kind: chronological
+  guarantees_autoregressive_consistency: true
+windowing:
+  window_size: 24
+  forecast_horizon: 1
+  target_feature_index: 0

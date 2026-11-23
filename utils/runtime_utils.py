@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import time
@@ -393,3 +394,166 @@ def try_load_torch_checkpoint(
     except Exception as e:
         print(f"[{log_prefix}] WARNING: skipping incompatible checkpoint {path}: {e}", flush=True)
         return None, False
+
+
+def file_sha256(path: str | Path) -> str:
+    """Plain SHA256 of a file's raw bytes. Deliberately self-contained (not
+    imported from drift.mitigation.core, which has an equivalent) so this
+    module -- consumed by generic client/server runtime -- never depends on
+    a drift-mitigation-specific package.
+    """
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_checkpoint_base_reference(path: Optional[str | Path]) -> Optional[Dict[str, Any]]:
+    """Read exactly the base-reference file at ``path`` (the caller passes
+    the CHECKPOINT_BASE_REFERENCE_PATH env var straight through) -- never
+    searched for, never inferred from a directory walk.
+
+    Returns None only when no reference was declared at all (path is falsy,
+    or points at a file that doesn't exist) -- the true legacy case, where
+    today's existing missing-checkpoint behavior applies unchanged. A
+    reference that *is* declared but is unreadable or has an unsupported
+    schema version raises: a declared-but-broken reference is a data
+    integrity failure, not "no reference exists".
+    """
+    if not path:
+        return None
+    reference_path = Path(path)
+    if not reference_path.is_file():
+        return None
+    try:
+        data = json.loads(reference_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"declared checkpoint base reference is unreadable: {reference_path}: {exc}") from exc
+    if data.get("base_reference_schema_version") != 1:
+        raise ValueError(
+            f"unsupported checkpoint base reference schema at {reference_path}: "
+            f"{data.get('base_reference_schema_version')!r}"
+        )
+    return data
+
+
+@dataclass(frozen=True)
+class CheckpointFallback:
+    path: Path
+    expected_artifact_hash: Optional[str]
+
+
+def _resolve_base_reference_root(base_reference: Mapping[str, Any], base_reference_path: str | Path) -> Path:
+    """Anchor resolution: the base-reference file's own location IS the
+    anchor for "relative_to_method_root" (it always lives at
+    ``<method_root>/checkpoints/base_reference.json``, so its grandparent
+    directory is method_root) -- no separate method_root parameter needed,
+    and no directory search involved.
+    """
+    path_type = base_reference.get("path_type")
+    raw_root = base_reference.get("checkpoint_h_root")
+    if raw_root is None:
+        raise ValueError("checkpoint base reference is missing checkpoint_h_root")
+    if path_type == "absolute":
+        return Path(raw_root).resolve()
+    if path_type == "relative_to_method_root":
+        method_root = Path(base_reference_path).resolve().parent.parent
+        return (method_root / raw_root).resolve()
+    raise ValueError(f"unsupported checkpoint base reference path_type: {path_type!r}")
+
+
+def _lookup_base_reference_artifact_hash(base_reference: Mapping[str, Any], key: str, **match: str) -> Optional[str]:
+    for row in base_reference.get(key) or []:
+        if all(str(row.get(field)) == str(value) for field, value in match.items()):
+            return row.get("artifact_file")
+    return None
+
+
+def resolve_client_checkpoint_fallback(
+    base_reference: Mapping[str, Any], base_reference_path: str | Path, cluster_id: str, client_id: str,
+) -> CheckpointFallback:
+    """H's only per-client artifact is always named ``client_{id}_final.pt``
+    -- never the same relative name the live runtime requests
+    (``checkpoint.pt``/``best_checkpoint.pt``/``latest``) -- so this maps by
+    artifact kind, deliberately, rather than echoing the requested filename.
+    """
+    root = _resolve_base_reference_root(base_reference, base_reference_path)
+    path = root / f"cluster_{cluster_id}" / f"client_{client_id}_final.pt"
+    expected_hash = _lookup_base_reference_artifact_hash(base_reference, "clients", cluster_id=cluster_id, client_id=client_id)
+    return CheckpointFallback(path=path, expected_artifact_hash=expected_hash)
+
+
+def resolve_server_checkpoint_fallback(
+    base_reference: Mapping[str, Any], base_reference_path: str | Path, cluster_id: str,
+) -> CheckpointFallback:
+    """H's only per-server artifact is always named ``server_final.pt``."""
+    root = _resolve_base_reference_root(base_reference, base_reference_path)
+    path = root / f"cluster_{cluster_id}" / "server_final.pt"
+    expected_hash = _lookup_base_reference_artifact_hash(base_reference, "servers", cluster_id=cluster_id)
+    return CheckpointFallback(path=path, expected_artifact_hash=expected_hash)
+
+
+def resolve_global_server_checkpoint_fallback(
+    base_reference: Mapping[str, Any], base_reference_path: str | Path,
+) -> CheckpointFallback:
+    """H's global-server artifact -- the one case where H and the runtime
+    already share the same relative path (``global/global_server_latest.pt``,
+    required by both checkpoint_registry.py's H validation and
+    prepared/training.py's H-construction code). Not consulted by any live
+    loader today -- only full_final/FedAvg methods ever touch global state,
+    and they always write it for real, never falling back -- this exists so
+    offline reconstruction (the compactor) is complete for every artifact
+    kind it might remove, not just clients/servers.
+    """
+    root = _resolve_base_reference_root(base_reference, base_reference_path)
+    path = root / "global" / "global_server_latest.pt"
+    global_server = base_reference.get("global_server") or {}
+    expected_hash = global_server.get("artifact_file")
+    return CheckpointFallback(path=path, expected_artifact_hash=expected_hash)
+
+
+def try_load_torch_checkpoint_with_fallback(
+    model: nn.Module,
+    optimizer: Optional[optim.Optimizer],
+    primary_path: str | Path,
+    *,
+    base_reference: Optional[Mapping[str, Any]],
+    fallback: Optional[CheckpointFallback],
+    map_location: str = "cpu",
+    strict: bool = True,
+    log_prefix: str = "Checkpoint",
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Local-first, then a declared base-reference fallback -- fail closed.
+
+    - primary_path exists -> load it (today's exact ``try_load_torch_checkpoint``
+      call/behavior, unchanged).
+    - primary_path missing, no base_reference declared -> (None, False), the
+      same "no compatible checkpoint" signal callers already handle today.
+    - primary_path missing, base_reference declared -> this method has
+      explicitly committed to "missing local state comes from H". The
+      fallback artifact must exist and (if a hash was recorded) match, or
+      this raises -- it never silently falls through to (None, False) in
+      this branch, since that would look like a successful cold start when
+      it is actually a broken sparse-storage contract.
+    """
+    if os.path.exists(str(primary_path)):
+        return try_load_torch_checkpoint(model, optimizer, primary_path, map_location=map_location, strict=strict, log_prefix=log_prefix)
+    if base_reference is None:
+        return None, False
+    if fallback is None or not fallback.path.exists():
+        raise FileNotFoundError(
+            f"[{log_prefix}] checkpoint base reference is declared but its artifact is missing: "
+            f"{fallback.path if fallback is not None else '<unresolved>'}"
+        )
+    if fallback.expected_artifact_hash is not None:
+        actual_hash = file_sha256(fallback.path)
+        if actual_hash != fallback.expected_artifact_hash:
+            raise ValueError(
+                f"[{log_prefix}] checkpoint base reference artifact hash mismatch for {fallback.path}: "
+                f"expected {fallback.expected_artifact_hash}, got {actual_hash}"
+            )
+    extra, ok = try_load_torch_checkpoint(model, optimizer, str(fallback.path), map_location=map_location, strict=strict, log_prefix=log_prefix)
+    if not ok:
+        raise ValueError(f"[{log_prefix}] checkpoint base reference artifact failed to load: {fallback.path}")
+    return extra, True

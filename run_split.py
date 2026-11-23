@@ -75,9 +75,10 @@ def configure_output_dirs() -> None:
 
 
 def refresh_runtime_settings_from_env() -> None:
-    global STREAM_BASE_PORT, SERVER_BASE_PORT, CLIENT_WORKER_BASE_PORT
+    global STREAM_BASE_PORT, SERVER_BASE_PORT, CLIENT_WORKER_BASE_PORT, ASSIGNMENTS_PATH
     global CLUSTER_DATA_DIR, TRAIN_CLUSTER_DATA_DIR, VAL_CLUSTER_DATA_DIR, TEST_CLUSTER_DATA_DIR
     global TRAIN_TARGET_CLUSTER_DATA_DIR, VAL_TARGET_CLUSTER_DATA_DIR, TEST_TARGET_CLUSTER_DATA_DIR
+    ASSIGNMENTS_PATH = Path(os.environ.get("ASSIGNMENTS_PATH", str(ASSIGNMENTS_PATH)))
     STREAM_BASE_PORT = int(os.environ.get("STREAM_BASE_PORT", str(STREAM_BASE_PORT)))
     SERVER_BASE_PORT = int(os.environ.get("SERVER_BASE_PORT", str(SERVER_BASE_PORT)))
     CLIENT_WORKER_BASE_PORT = int(os.environ.get("CLIENT_WORKER_BASE_PORT", str(CLIENT_WORKER_BASE_PORT)))
@@ -1241,7 +1242,76 @@ def run_training_schedule_with_fedavg(cluster_ids, cluster_clients, env):
     return merged_durations
 
 
-def run_test_phase_for_cluster(cluster_id: str, client_ids: List[str], cluster_idx: int, stop_event: Event):
+def run_m2_oracle_client_only(cluster_ids, cluster_clients, selected_client_ids: set[str]):
+    """Drive selected clients only; frozen server endpoint owns no optimizer or FedAvg path."""
+    rows = []
+    active = []
+    for cluster_idx, cluster_id in enumerate(cluster_ids):
+        for client_idx, client_id in enumerate(cluster_clients[cluster_id]):
+            if str(client_id) in selected_client_ids:
+                active.append((cluster_idx, str(cluster_id), client_idx, str(client_id)))
+    # One chronological batch per selected client per cycle. Optimizers remain
+    # resident in their worker; controls never receive an adaptation command.
+    while active:
+        next_active = []
+        for cluster_idx, cluster_id, client_idx, client_id in active:
+            port = CLIENT_WORKER_BASE_PORT + cluster_idx * 100 + client_idx
+            result = post_json(
+                f"http://localhost:{port}/command/oracle_adapt_one_batch",
+                {"selected_for_drift": True}, timeout=600.0,
+            )
+            rows.append({"cluster_id": cluster_id, "client_id": client_id, **result})
+            if result.get("status") == "batch_processed":
+                next_active.append((cluster_idx, cluster_id, client_idx, client_id))
+            elif result.get("status") != "adaptation_complete":
+                raise RuntimeError(f"unexpected M2 client status: {result}")
+        active = next_active
+    return rows
+
+
+def run_m3_oracle_client_ewc(cluster_ids, cluster_clients, selected_client_ids: set[str]):
+    """Drive selected clients only, identical in shape to
+    run_m2_oracle_client_only (same frozen-server endpoint, same
+    selected-only targeting -- controls and split servers are never
+    contacted, so they stay tensor-identical to H structurally, not by a
+    separate check). The EWC penalty itself is entirely client-side,
+    driven by that worker's own EWC_ENABLED/EWC_LAMBDA/EWC_REFERENCE_ROOT
+    environment, not by anything in this request -- which is what makes
+    lambda=0 an exact rerun of this same code path, not a parallel one.
+    """
+    rows = []
+    active = []
+    for cluster_idx, cluster_id in enumerate(cluster_ids):
+        for client_idx, client_id in enumerate(cluster_clients[cluster_id]):
+            if str(client_id) in selected_client_ids:
+                active.append((cluster_idx, str(cluster_id), client_idx, str(client_id)))
+    while active:
+        next_active = []
+        for cluster_idx, cluster_id, client_idx, client_id in active:
+            port = CLIENT_WORKER_BASE_PORT + cluster_idx * 100 + client_idx
+            result = post_json(
+                f"http://localhost:{port}/command/oracle_adapt_one_batch",
+                {"selected_for_drift": True}, timeout=600.0,
+            )
+            rows.append({"cluster_id": cluster_id, "client_id": client_id, **result})
+            if result.get("status") == "batch_processed":
+                next_active.append((cluster_idx, cluster_id, client_idx, client_id))
+            elif result.get("status") != "adaptation_complete":
+                raise RuntimeError(f"unexpected M3 client status: {result}")
+        active = next_active
+    return rows
+
+
+def run_test_phase_for_cluster(
+    cluster_id: str,
+    client_ids: List[str],
+    cluster_idx: int,
+    stop_event: Event,
+    *,
+    window_offset: int = 0,
+    window_limit: int | None = None,
+    stream_mode: str | None = None,
+):
     test_durations = defaultdict(float)
     for idx, client_id in enumerate(client_ids):
         if stop_event.is_set():
@@ -1249,7 +1319,11 @@ def run_test_phase_for_cluster(cluster_id: str, client_ids: List[str], cluster_i
         port = CLIENT_WORKER_BASE_PORT + cluster_idx * 100 + idx
         t0 = time.time()
         try:
-            result = post_json(f"http://localhost:{port}/command/test", {}, timeout=600.0)
+            result = post_json(
+                f"http://localhost:{port}/command/test",
+                {"window_offset": int(window_offset), "window_limit": window_limit, "stream_mode": stream_mode},
+                timeout=600.0,
+            )
         except Exception:
             dump_failure_context(cluster_id, client_id)
             raise
@@ -1262,7 +1336,7 @@ def run_test_phase_for_cluster(cluster_id: str, client_ids: List[str], cluster_i
     return test_durations
 
 
-def run_test_phase(cluster_ids, cluster_clients, env):
+def run_test_phase(cluster_ids, cluster_clients, env, *, window_offset: int = 0, window_limit: int | None = None, stream_mode: str | None = None):
     run_parallel = parse_bool(env.get("RUN_CLUSTERS_IN_PARALLEL"), default=True) and len(cluster_ids) > 1
     log(f"[TEST] cluster_parallelism={'enabled' if run_parallel else 'disabled'}")
     merged_durations = defaultdict(float)
@@ -1270,7 +1344,9 @@ def run_test_phase(cluster_ids, cluster_clients, env):
 
     if not run_parallel:
         for cluster_idx, cluster_id in enumerate(cluster_ids):
-            cluster_durations = run_test_phase_for_cluster(cluster_id, cluster_clients[cluster_id], cluster_idx, stop_event)
+            cluster_durations = run_test_phase_for_cluster(
+                cluster_id, cluster_clients[cluster_id], cluster_idx, stop_event, window_offset=window_offset, window_limit=window_limit, stream_mode=stream_mode
+            )
             for key, value in cluster_durations.items():
                 merged_durations[key] += value
         return merged_durations
@@ -1278,7 +1354,16 @@ def run_test_phase(cluster_ids, cluster_clients, env):
     first_exception = None
     with ThreadPoolExecutor(max_workers=len(cluster_ids)) as executor:
         futures = {
-            executor.submit(run_test_phase_for_cluster, cluster_id, cluster_clients[cluster_id], cluster_idx, stop_event): cluster_id
+            executor.submit(
+                run_test_phase_for_cluster,
+                cluster_id,
+                cluster_clients[cluster_id],
+                cluster_idx,
+                stop_event,
+                window_offset=window_offset,
+                window_limit=window_limit,
+                stream_mode=stream_mode,
+            ): cluster_id
             for cluster_idx, cluster_id in enumerate(cluster_ids)
         }
         for future in as_completed(futures):
@@ -1351,6 +1436,12 @@ def main() -> int:
             "WRITE_COMMUNICATION_LOG": os.environ.get("WRITE_COMMUNICATION_LOG", "true"),
             "SKIP_TRAINING": os.environ.get("SKIP_TRAINING", "false"),
             "FROZEN_VALIDATION_MODE": os.environ.get("FROZEN_VALIDATION_MODE", "false"),
+            "MITIGATION_METHOD": os.environ.get("MITIGATION_METHOD", ""),
+            "TRAIN_STREAM_MODE": os.environ.get("TRAIN_STREAM_MODE", "train"),
+            "TEST_STREAM_MODE": os.environ.get("TEST_STREAM_MODE", ""),
+            "TEST_WINDOW_OFFSET": os.environ.get("TEST_WINDOW_OFFSET", "0"),
+            "TEST_WINDOW_LIMIT": os.environ.get("TEST_WINDOW_LIMIT", ""),
+            "DRIFT_SELECTED_CLIENT_IDS": os.environ.get("DRIFT_SELECTED_CLIENT_IDS", ""),
             "USE_STATIC_FEATURES": os.environ.get("USE_STATIC_FEATURES", "false"),
             "STATIC_FEATURE_COLUMNS": os.environ.get("STATIC_FEATURE_COLUMNS", ""),
             "STATIC_FEATURE_GROUPS": os.environ.get("STATIC_FEATURE_GROUPS", ""),
@@ -1491,18 +1582,43 @@ def main() -> int:
                 log(f"[worker_ready] cluster={cluster_id} client={client_id} port={worker_port} status={status}")
 
         train_durations = defaultdict(float)
-        if parse_bool(env.get("SKIP_TRAINING"), default=False):
+        mitigation_method = str(env.get("MITIGATION_METHOD", "")).strip().upper()
+        if mitigation_method == "M2":
+            selected_ids = {item.strip() for item in env.get("DRIFT_SELECTED_CLIENT_IDS", "").split(",") if item.strip()}
+            expected_selected = int(env.get("EXPECTED_DRIFT_SELECTED_COUNT", "32") or 32)
+            if len(selected_ids) != expected_selected:
+                raise ValueError(
+                    f"M2 requires exactly {expected_selected} selected clients, got {len(selected_ids)}"
+                )
+            m2_rows = run_m2_oracle_client_only(cluster_ids, cluster_clients, selected_ids)
+            write_json(RESULTS_DIR / "m2_adaptation_events.json", m2_rows)
+        elif mitigation_method == "M3":
+            selected_ids = {item.strip() for item in env.get("DRIFT_SELECTED_CLIENT_IDS", "").split(",") if item.strip()}
+            expected_selected = int(env.get("EXPECTED_DRIFT_SELECTED_COUNT", "32") or 32)
+            if len(selected_ids) != expected_selected:
+                raise ValueError(
+                    f"M3 requires exactly {expected_selected} selected clients, got {len(selected_ids)}"
+                )
+            m3_rows = run_m3_oracle_client_ewc(cluster_ids, cluster_clients, selected_ids)
+            write_json(RESULTS_DIR / "m3_ewc_adaptation_events.json", m3_rows)
+        elif parse_bool(env.get("SKIP_TRAINING"), default=False):
             log("[TRAIN] skipped; using existing checkpoints for test evaluation")
         else:
             train_durations = run_training_schedule_with_fedavg(cluster_ids, cluster_clients, env)
-
             for cluster_idx, cluster_id in enumerate(cluster_ids):
                 post_json(f"http://localhost:{SERVER_BASE_PORT + cluster_idx}/save_final_checkpoint", {}, timeout=30)
             ensure_final_client_checkpoints(cluster_ids, cluster_clients)
 
+        test_offset = int(env.get("TEST_WINDOW_OFFSET", "0") or 0)
+        test_limit_raw = str(env.get("TEST_WINDOW_LIMIT", "")).strip()
+        test_limit = None if not test_limit_raw else int(test_limit_raw)
+        test_stream_mode = str(env.get("TEST_STREAM_MODE", "")).strip() or None
         test_durations = defaultdict(float)
         for cluster_idx, cluster_id in enumerate(cluster_ids):
-            cluster_test = run_test_phase_for_cluster(cluster_id, cluster_clients[cluster_id], cluster_idx, stop_event)
+            cluster_test = run_test_phase_for_cluster(
+                cluster_id, cluster_clients[cluster_id], cluster_idx, stop_event,
+                window_offset=test_offset, window_limit=test_limit, stream_mode=test_stream_mode,
+            )
             for key, value in cluster_test.items():
                 test_durations[key] += value
         if parse_bool(env.get("DRIFT_DETECTION_ENABLED"), default=False):

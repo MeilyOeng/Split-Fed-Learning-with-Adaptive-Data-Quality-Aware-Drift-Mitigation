@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import csv
+import json
 import os
 import pickle
 import random
@@ -12,7 +13,7 @@ import math
 import numpy as np
 import requests
 import torch
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from torch import nn, optim
 torch.backends.cudnn.enabled = False
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -20,6 +21,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from data.data_streaming import StreamingIterableDataset
+from utils.client_optimization import apply_client_optimizer_step
 from models.split_lstm import build_split_lstm
 from utils.comm_logging import append_comm_row, calc_bandwidth, should_log_index, tensor_nbytes, tensor_shape
 from utils.runtime_utils import (
@@ -30,11 +32,14 @@ from utils.runtime_utils import (
     compute_model_input_size,
     derive_dq_mode,
     get_device_info,
+    load_checkpoint_base_reference,
     parse_bool,
     read_json,
+    resolve_client_checkpoint_fallback,
     resolve_device,
     save_torch_checkpoint,
     try_load_torch_checkpoint,
+    try_load_torch_checkpoint_with_fallback,
     write_json,
 )
 
@@ -69,6 +74,10 @@ def client_test_metrics_path(cluster_id: str, client_id: str) -> str:
 
 def client_test_predictions_path(cluster_id: str, client_id: str) -> str:
     return os.path.join(_cluster_output_dir(cluster_id), f"client_{client_id}_test_predictions.csv")
+
+
+def client_adaptation_predictions_path(cluster_id: str, client_id: str) -> str:
+    return os.path.join(_cluster_output_dir(cluster_id), f"client_{client_id}_adaptation_predictions.csv")
 
 
 def client_progress_path(cluster_id: str, client_id: str) -> str:
@@ -118,6 +127,44 @@ def write_prediction_points_csv(
                     "sq_error": err * err,
                 }
             )
+
+
+ADAPTATION_PREDICTION_FIELDNAMES = [
+    "cluster_id",
+    "client_id",
+    "adaptation_epoch",
+    "batch_id",
+    "deployment_window_number",
+    "window_start_index",
+    "window_end_index",
+    "target_index",
+    "timestamp",
+    "y_true",
+    "y_pred",
+    "abs_error",
+    "sq_error",
+    "optimizer_step_before",
+    "optimizer_step_after",
+]
+
+
+def append_adaptation_prediction_rows_csv(path: str, rows: list) -> None:
+    """Append pre-update adaptation-phase prediction rows to a standardized
+    CSV, writing the header only the first time this run creates the file.
+
+    Rows are supplied already computed (physical/original units) by the
+    caller; this function performs no inference of its own.
+    """
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_header = not os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=ADAPTATION_PREDICTION_FIELDNAMES)
+        if write_header:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 @dataclass
@@ -220,16 +267,22 @@ class ClusteredClientRunner:
         self.stop_reason = self.progress.get("stop_reason")
         self.start_epoch = self._maybe_load_checkpoint()
 
-        self.train_dataset = self._build_stream_dataset("train")
+        self.train_stream_mode = _get_env("TRAIN_STREAM_MODE", "train").strip().lower()
+        self.train_dataset = self._build_stream_dataset(self.train_stream_mode)
         self.val_dataset = self._build_stream_dataset("val")
         self.test_dataset = self._build_stream_dataset("test")
         self.train_iter: Optional[Iterator[Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]]] = None
         self.train_stream_active = bool(self.progress.get("train_stream_active", False))
         self.prefetched_train_batch = None
         self.train_epoch_exhausted = False
-        if self.train_stream_active:
-            self._reset_stream("train", window_offset=int(self.progress.get("stream_window_offset", 0)))
+        if self.train_stream_active and self.runtime_cfg.num_epochs > 0:
+            self._reset_training_stream(window_offset=int(self.progress.get("stream_window_offset", 0)))
             self.train_iter = iter(self.train_dataset)
+        elif self.train_stream_active:
+            # Prediction-only process (NUM_EPOCHS=0): keep the adapted checkpoint
+            # already loaded above, but do not reopen the training stream the
+            # saved progress was mid-epoch on.
+            self.train_stream_active = False
 
         self._save_run_config()
         print(
@@ -349,10 +402,23 @@ class ClusteredClientRunner:
 
     def _maybe_load_checkpoint(self) -> int:
         latest_path = client_checkpoint_path(self.runtime_cfg.cluster_id, self.runtime_cfg.client_id)
-        extra, ok = try_load_torch_checkpoint(
+        # CHECKPOINT_BASE_REFERENCE_PATH, when set, is the exact declared
+        # path to this method's checkpoints/base_reference.json -- never
+        # searched for. Unset for every legacy run and for legacy_full-mode
+        # runs, so the fallback branch below is provably unreached for them.
+        base_reference_path = _get_env("CHECKPOINT_BASE_REFERENCE_PATH", "")
+        base_reference = load_checkpoint_base_reference(base_reference_path or None)
+        fallback = None
+        if base_reference is not None:
+            fallback = resolve_client_checkpoint_fallback(
+                base_reference, base_reference_path, self.runtime_cfg.cluster_id, self.runtime_cfg.client_id,
+            )
+        extra, ok = try_load_torch_checkpoint_with_fallback(
             self.client_model,
             self.optimizer,
             latest_path,
+            base_reference=base_reference,
+            fallback=fallback,
             strict=True,
             log_prefix=f"Client {self.runtime_cfg.client_id}",
         )
@@ -373,10 +439,14 @@ class ClusteredClientRunner:
             backoff=1.0,
         )
 
-    def _reset_stream(self, mode: str, window_offset: int = 0) -> None:
+    def _reset_stream(self, mode: str, window_offset: int = 0, window_limit: Optional[int] = None, *, materialized: bool = False, for_training: bool = False) -> None:
         payload = {"client_id": self.runtime_cfg.client_id, "cluster_id": self.runtime_cfg.cluster_id, "mode": mode}
         if window_offset > 0:
             payload["window_offset"] = int(window_offset)
+        if window_limit is not None:
+            payload["window_limit"] = int(window_limit)
+        if materialized:
+            payload.update({"materialized": True, "runtime_drift_injection": False, "for_training": bool(for_training)})
         resp = requests.post(
             f"{self.runtime_cfg.data_stream_api_url}/stream/reset",
             json=payload,
@@ -389,10 +459,26 @@ class ClusteredClientRunner:
             f"window_offset={body.get('window_offset', 0)}"
         )
 
+    def _reset_training_stream(self, *, window_offset: int = 0) -> None:
+        if self.train_stream_mode == "deployment_adaptation":
+            if window_offset not in (0,):
+                raise ValueError("resuming inside a prepared adaptation slice requires validated suite resume")
+            adaptation_offset = int(_get_env("ADAPTATION_WINDOW_OFFSET", "524"))
+            adaptation_limit = int(_get_env("ADAPTATION_WINDOW_LIMIT", "700"))
+            self._reset_stream(
+                self.train_stream_mode,
+                window_offset=adaptation_offset,
+                window_limit=adaptation_limit,
+                materialized=True,
+                for_training=True,
+            )
+        else:
+            self._reset_stream(self.train_stream_mode, window_offset=window_offset)
+
     def _ensure_train_stream(self) -> None:
         if self.train_iter is None:
             window_offset = int(self.progress.get("stream_window_offset", 0))
-            self._reset_stream("train", window_offset=window_offset)
+            self._reset_training_stream(window_offset=window_offset)
             self.train_iter = iter(self.train_dataset)
             self.train_stream_active = True
             self.train_epoch_exhausted = False
@@ -583,7 +669,7 @@ class ClusteredClientRunner:
         status = "ok"
         result = None
         try:
-            resp = self.session.post(url, data=data, timeout=120.0)
+            resp = self.session.post(url, data=data, timeout=300.0)
             response_bytes = len(resp.content)
             latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
             if resp.status_code >= 400:
@@ -695,6 +781,62 @@ class ClusteredClientRunner:
             return arr * scale + mean
         return arr * scale + mean
 
+    def _write_adaptation_prediction_batch(
+        self,
+        *,
+        adaptation_epoch: int,
+        batch_id: int,
+        y_norm: torch.Tensor,
+        preds_norm,
+        batch_meta: Dict[str, Any],
+        optimizer_step_before: Optional[int],
+        optimizer_step_after: Optional[int],
+    ) -> None:
+        """Append one CSV row per sample in this batch, using the exact
+        pre-update prediction/target values the caller already computed
+        (no additional forward pass). y_true/y_pred are converted to
+        physical/original units via the same scaler the test-prediction
+        CSVs use.
+        """
+        preds_arr = preds_norm
+        if torch.is_tensor(preds_arr):
+            preds_arr = preds_arr.detach().cpu().numpy()
+        preds_arr = np.asarray(preds_arr, dtype=np.float32).reshape(-1)
+        trues_arr = y_norm.detach().cpu().numpy().astype(np.float32).reshape(-1)
+        if preds_arr.size == 0:
+            return
+        preds_raw = self._inverse_tensor(preds_arr)
+        trues_raw = self._inverse_tensor(trues_arr)
+        window_start_indices = list(batch_meta.get("window_start_indices", []))
+        window_end_indices = list(batch_meta.get("window_end_indices", []))
+        target_indices = list(batch_meta.get("target_indices", []))
+        target_timestamps = list(batch_meta.get("target_timestamps", []))
+        deployment_window_numbers = list(batch_meta.get("deployment_window_numbers", []))
+        rows = []
+        for idx in range(len(trues_raw)):
+            err = float(preds_raw[idx] - trues_raw[idx])
+            rows.append({
+                "cluster_id": self.runtime_cfg.cluster_id,
+                "client_id": self.runtime_cfg.client_id,
+                "adaptation_epoch": adaptation_epoch,
+                "batch_id": batch_id,
+                "deployment_window_number": deployment_window_numbers[idx] if idx < len(deployment_window_numbers) else "",
+                "window_start_index": window_start_indices[idx] if idx < len(window_start_indices) else "",
+                "window_end_index": window_end_indices[idx] if idx < len(window_end_indices) else "",
+                "target_index": target_indices[idx] if idx < len(target_indices) else "",
+                "timestamp": target_timestamps[idx] if idx < len(target_timestamps) else "",
+                "y_true": float(trues_raw[idx]),
+                "y_pred": float(preds_raw[idx]),
+                "abs_error": abs(err),
+                "sq_error": err * err,
+                "optimizer_step_before": optimizer_step_before,
+                "optimizer_step_after": optimizer_step_after,
+            })
+        append_adaptation_prediction_rows_csv(
+            client_adaptation_predictions_path(self.runtime_cfg.cluster_id, self.runtime_cfg.client_id),
+            rows,
+        )
+
     def _compute_metrics(self, preds: np.ndarray, trues: np.ndarray) -> Dict[str, Optional[float]]:
         preds = preds.reshape(-1)
         trues = trues.reshape(-1)
@@ -741,11 +883,20 @@ class ClusteredClientRunner:
             log_prefix="Client",
         )
 
-    def _run_eval(self, mode: str, epoch: Optional[int] = None, save_json_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def _run_eval(
+        self,
+        mode: str,
+        epoch: Optional[int] = None,
+        save_json_path: Optional[str] = None,
+        window_offset: int = 0,
+        window_limit: Optional[int] = None,
+        stream_mode: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         if mode not in {"val", "test"}:
             raise ValueError(f"Unsupported eval mode: {mode}")
-        dataset = self.val_dataset if mode == "val" else self.test_dataset
-        self._reset_stream(mode)
+        effective_mode = stream_mode or mode
+        dataset = self.val_dataset if mode == "val" else (self._build_stream_dataset(effective_mode) if stream_mode else self.test_dataset)
+        self._reset_stream(effective_mode, window_offset=window_offset, window_limit=window_limit, materialized=effective_mode.startswith("deployment_"), for_training=False)
         loader = iter(dataset)
         route = "/validate_step" if mode == "val" else "/inference_step"
         self.client_model.eval()
@@ -858,7 +1009,11 @@ class ClusteredClientRunner:
         return result
 
     def _finalize_epoch(self, epoch_number: int, avg_train_loss: Optional[float]) -> Dict[str, Any]:
-        val_result = self._run_eval("val", epoch=epoch_number)
+        disable_validation_replay = parse_bool(
+            _get_env("MITIGATION_DISABLE_VALIDATION_REPLAY", "false"),
+            default=False,
+        )
+        val_result = None if disable_validation_replay else self._run_eval("val", epoch=epoch_number)
         val_raw_mae = None if val_result is None else val_result["raw_metrics"]["mae"]
         val_server_loss = None if val_result is None else val_result["server_loss"]
         val_raw_rmse = None if val_result is None else val_result["raw_metrics"]["rmse"]
@@ -999,6 +1154,30 @@ class ClusteredClientRunner:
             loss = float(result["loss"])
             if not math.isfinite(loss):
                 raise ValueError(f"[Client {self.runtime_cfg.client_id}] Non-finite server loss: {loss}")
+            prequential_event_path = None
+            adaptation_predictions_pre_update = None
+            if mode == "deployment_adaptation" and result.get("predictions") is not None:
+                prequential_event_path = os.path.join(
+                    _cluster_output_dir(self.runtime_cfg.cluster_id),
+                    f"client_{self.runtime_cfg.client_id}_adaptation_prequential.jsonl",
+                )
+                target_indices = [int(value) for value in batch_meta.get("target_indices", [])]
+                predictions = result["predictions"]
+                if torch.is_tensor(predictions):
+                    predictions = predictions.detach().cpu().reshape(-1).tolist()
+                # Captured here (pre-update) so the CSV row written after the
+                # optimizer step below still records the exact same
+                # pre-update prediction -- no recomputation after backward.
+                adaptation_predictions_pre_update = predictions
+                with open(prequential_event_path, "a", encoding="utf-8") as event_file:
+                    event_file.write(json.dumps({
+                        "sequence": 1, "event": "prediction_recorded", "batch_id": batch_id,
+                        "target_indices": target_indices, "predictions_pre_update": predictions,
+                    }, sort_keys=True) + "\n")
+                    event_file.write(json.dumps({
+                        "sequence": 2, "event": "target_revealed", "batch_id": batch_id,
+                        "target_indices": target_indices,
+                    }, sort_keys=True) + "\n")
 
             grad = result["grad_activations"].to(self.device)
             if not torch.isfinite(grad).all():
@@ -1007,8 +1186,182 @@ class ClusteredClientRunner:
             activations.backward(gradient=grad)
 
         torch.nn.utils.clip_grad_norm_(self.client_model.parameters(), max_norm=1.0)
-        self.optimizer.step()
+        optimizer_step_before = getattr(self, "_adaptation_optimizer_step_count", 0)
+        apply_client_optimizer_step(
+            self.optimizer,
+            update_allowed=True,
+        )
+        if prequential_event_path is not None:
+            self._adaptation_optimizer_step_count = optimizer_step_before + 1
+            self._write_adaptation_prediction_batch(
+                adaptation_epoch=local_epoch, batch_id=batch_id,
+                y_norm=y, preds_norm=adaptation_predictions_pre_update, batch_meta=batch_meta,
+                optimizer_step_before=optimizer_step_before, optimizer_step_after=self._adaptation_optimizer_step_count,
+            )
+            with open(prequential_event_path, "a", encoding="utf-8") as event_file:
+                event_file.write(json.dumps({
+                    "sequence": 3, "event": "client_optimizer_step", "batch_id": batch_id,
+                    "target_indices": [int(value) for value in batch_meta.get("target_indices", [])],
+                }, sort_keys=True) + "\n")
         return loss
+
+    def _load_ewc_reference_for_client(self) -> Optional[Dict[str, Any]]:
+        """Lazily load this client's theta_star/fisher_diagonal, computed
+        offline by prepared.ewc.build_or_load_ewc_reference. Returns None
+        when EWC is not enabled for this run, in which case
+        oracle_adapt_one_batch behaves exactly like M2 -- no EWC gradient
+        contribution is ever computed, not merely a zero-valued one.
+        """
+        if not parse_bool(_get_env("EWC_ENABLED", "false")):
+            return None
+        reference_root = _get_env("EWC_REFERENCE_ROOT", "")
+        if not reference_root:
+            raise ValueError("EWC_ENABLED=true requires EWC_REFERENCE_ROOT")
+        path = os.path.join(
+            reference_root, f"cluster_{self.runtime_cfg.cluster_id}",
+            f"client_{self.runtime_cfg.client_id}_ewc_reference.pt",
+        )
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        return {
+            "theta_star": payload["theta_star"], "fisher": payload["fisher_diagonal"],
+            "lambda": float(_get_env("EWC_LAMBDA", "0")),
+        }
+
+    def _ewc_penalty_loss(self, ewc: Dict[str, Any]) -> torch.Tensor:
+        """L_ewc = (lambda/2) * sum_i F_i * (theta_i - theta_star_i)^2 over
+        client parameters only -- never server parameters. Callers must
+        gate this on ewc["lambda"] > 0 themselves (see the split-learning
+        gradient requirement in oracle_adapt_one_batch): building a graph
+        for a lambda=0 penalty and never calling backward() on it would be
+        harmless, but computing it at all is wasted work when the whole
+        point is a true no-op.
+        """
+        penalty = torch.zeros((), device=self.device)
+        for name, param in self.client_model.named_parameters():
+            if not param.requires_grad:
+                continue
+            theta_star = ewc["theta_star"][name].to(self.device)
+            fisher = ewc["fisher"][name].to(self.device)
+            penalty = penalty + (fisher * (param - theta_star) ** 2).sum()
+        return 0.5 * ewc["lambda"] * penalty
+
+    def _reset_mitigation_adaptation_stream(self) -> None:
+        adaptation_offset = int(_get_env("ADAPTATION_WINDOW_OFFSET", "524"))
+        adaptation_limit = int(_get_env("ADAPTATION_WINDOW_LIMIT", "700"))
+        self._reset_stream(
+            "deployment_adaptation",
+            window_offset=adaptation_offset, window_limit=adaptation_limit,
+            materialized=True, for_training=True,
+        )
+        self._mitigation_adaptation_iter = iter(self._build_stream_dataset("deployment_adaptation"))
+
+    def oracle_adapt_one_batch(self) -> Dict[str, Any]:
+        """Run one chronological M2 batch through the immutable-server endpoint.
+
+        When ``self.runtime_cfg.num_epochs`` (client_only_adaptation_epochs)
+        is greater than 1, exhausting one pass over the ADAPTATION segment
+        re-resets the same segment and continues into the next pass, rather
+        than completing -- the oracle-onset event still fires only once,
+        on the very first window of the very first pass.
+        """
+        if not hasattr(self, "_mitigation_adaptation_iter"):
+            self._mitigation_adaptation_epoch = 1
+            self._mitigation_client_optimizer_steps = 0
+            self._mitigation_oracle_emitted = False
+            self._mitigation_ewc = self._load_ewc_reference_for_client()
+            self._reset_mitigation_adaptation_stream()
+        while True:
+            try:
+                X, y, batch_meta = self._unpack_stream_batch(next(self._mitigation_adaptation_iter))
+                break
+            except StopIteration:
+                if self._mitigation_adaptation_epoch >= self.runtime_cfg.num_epochs:
+                    self._save_latest(int(self.start_epoch or 130))
+                    self._save_final(int(self.start_epoch or 130))
+                    return {
+                        "status": "adaptation_complete",
+                        "client_optimizer_steps": self._mitigation_client_optimizer_steps,
+                        "oracle_events": 1 if self._mitigation_oracle_emitted else 0,
+                        "server_optimizer_steps": 0,
+                        "fedavg_events": 0,
+                    }
+                self._mitigation_adaptation_epoch += 1
+                self._reset_mitigation_adaptation_stream()
+        X, y = self._prepare_batch_for_lstm(X, y)
+        self.client_model.train()
+        self.optimizer.zero_grad(set_to_none=True)
+        activations = self.client_model(X)[:, -1, :]
+        result = self._post_pickle(
+            f"{self.current_server_url}/frozen_activation_step",
+            self._pack_payload(
+                self.runtime_cfg.client_id, activations, y,
+                quality_scores=None, quality_score_metadata=None,
+                meta={"batch_id": self._mitigation_client_optimizer_steps + 1, "mode": "deployment_adaptation"},
+            ),
+            log_meta={
+                "log_enabled": self.comm_log_train, "scheduler_epoch": 1, "local_epoch": 1,
+                "round_id": None, "batch_id": self._mitigation_client_optimizer_steps + 1,
+                "event": "frozen_activation_step", "request_payload_type": "activation_payload",
+                "response_payload_type": "gradient_payload", "activation_shape": tensor_shape(activations),
+                "activation_bytes": tensor_nbytes(activations), "target_bytes": tensor_nbytes(y),
+            },
+        )
+        target_indices = [int(item) for item in batch_meta.get("target_indices", [])]
+        target_timestamps = list(batch_meta.get("target_timestamps", []))
+        first_target = target_indices[0] if target_indices else None
+        events = [
+            {"sequence": 1, "event": "prediction_recorded", "target_index": first_target, "prediction_phase": "pre_update"},
+            {"sequence": 2, "event": "target_revealed", "target_index": first_target},
+        ]
+        if not self._mitigation_oracle_emitted:
+            events.append({"sequence": 3, "event": "oracle_onset", "target_index": first_target, "latency_windows": 0})
+            self._mitigation_oracle_emitted = True
+        grad = result["grad_activations"].to(self.device)
+        # Split-learning gradient flow, preserved exactly: the server
+        # computes L_forecast and returns dL_forecast/dh; this backward
+        # call is what turns that into dL_forecast/dtheta_client via the
+        # encoder. EWC (if any) contributes a second, purely local
+        # backward pass on the same leaf parameters immediately after --
+        # no server involvement, nothing sent over the wire for it. With
+        # lambda == 0 (or EWC disabled), that second backward call simply
+        # never happens, which is what makes M3(lambda=0) infrastructurally
+        # identical to M2, not just approximately so.
+        activations.backward(gradient=grad)
+        forecast_loss = float(result["loss"])
+        ewc = getattr(self, "_mitigation_ewc", None)
+        ewc_loss = 0.0
+        if ewc is not None and ewc["lambda"] > 0:
+            ewc_penalty = self._ewc_penalty_loss(ewc)
+            ewc_penalty.backward()
+            ewc_loss = float(ewc_penalty.item())
+        lambda_ewc = float(ewc["lambda"]) if ewc is not None else 0.0
+        torch.nn.utils.clip_grad_norm_(self.client_model.parameters(), max_norm=1.0)
+        optimizer_step_before = self._mitigation_client_optimizer_steps
+        batch_id = optimizer_step_before + 1
+        apply_client_optimizer_step(self.optimizer, update_allowed=True)
+        self._mitigation_client_optimizer_steps += 1
+        events.append({
+            "sequence": 4, "event": "client_optimizer_step", "target_index": first_target,
+            "optimizer_step_count": self._mitigation_client_optimizer_steps,
+        })
+        self._write_adaptation_prediction_batch(
+            adaptation_epoch=self._mitigation_adaptation_epoch, batch_id=batch_id,
+            y_norm=y, preds_norm=result["predictions"], batch_meta=batch_meta,
+            optimizer_step_before=optimizer_step_before, optimizer_step_after=self._mitigation_client_optimizer_steps,
+        )
+        return {
+            "status": "batch_processed", "client_id": self.runtime_cfg.client_id,
+            "cluster_id": self.runtime_cfg.cluster_id,
+            "batch_size": int(X.shape[0]), "batch_id": batch_id, "target_indices": target_indices,
+            "target_timestamps": target_timestamps, "predictions_pre_update": result["predictions"].numpy().reshape(-1).tolist(),
+            "loss": float(result["loss"]), "onset_order_events": events,
+            "adaptation_epoch": self._mitigation_adaptation_epoch,
+            "forecast_loss": forecast_loss, "ewc_loss": ewc_loss, "total_loss": forecast_loss + ewc_loss,
+            "lambda_ewc": lambda_ewc,
+            "client_optimizer_steps": self._mitigation_client_optimizer_steps,
+            "server_optimizer_steps": 0, "server_state_unchanged": bool(result.get("server_state_unchanged")),
+            "fedavg_events": 0,
+        }
 
     def train_one_batch(self) -> Dict[str, Any]:
         if self.is_done():
@@ -1099,7 +1452,7 @@ class ClusteredClientRunner:
         final_status = "training_complete" if self.is_done() else "epoch_completed"
         return {"status": final_status, "summary": summary, **self.status()}
 
-    def test(self) -> Dict[str, Any]:
+    def test(self, *, window_offset: int = 0, window_limit: Optional[int] = None, stream_mode: Optional[str] = None) -> Dict[str, Any]:
         mode = str(self.runtime_cfg.eval_mode).strip().lower()
         client_paths = []
         server_route = "/load_final_checkpoint"
@@ -1134,11 +1487,37 @@ class ClusteredClientRunner:
             if ok:
                 break
         if not ok:
+            # No local candidate exists (e.g. SKIP_TRAINING left OUTPUT_DIR
+            # empty). Fall back to the same H base-reference this client
+            # loaded from at startup (see _maybe_load_checkpoint), so test()
+            # can re-load the identical weights instead of failing closed.
+            base_reference_path = _get_env("CHECKPOINT_BASE_REFERENCE_PATH", "")
+            base_reference = load_checkpoint_base_reference(base_reference_path or None)
+            if base_reference is not None:
+                fallback = resolve_client_checkpoint_fallback(
+                    base_reference, base_reference_path, self.runtime_cfg.cluster_id, self.runtime_cfg.client_id,
+                )
+                _, ok = try_load_torch_checkpoint_with_fallback(
+                    self.client_model,
+                    None,
+                    client_paths[0] if client_paths else "",
+                    base_reference=base_reference,
+                    fallback=fallback,
+                    strict=True,
+                    log_prefix="Client",
+                )
+        if not ok:
             raise FileNotFoundError(f"Missing client checkpoint candidates: {client_paths}")
 
         resp = self.session.post(f"{self.current_server_url}{server_route}", timeout=30.0)
         resp.raise_for_status()
-        result = self._run_eval("test", save_json_path=client_test_metrics_path(self.runtime_cfg.cluster_id, self.runtime_cfg.client_id))
+        result = self._run_eval(
+            "test",
+            save_json_path=client_test_metrics_path(self.runtime_cfg.cluster_id, self.runtime_cfg.client_id),
+            window_offset=window_offset,
+            window_limit=window_limit,
+            stream_mode=stream_mode,
+        )
         if result is None:
             raise RuntimeError("Test evaluation produced no batches")
         return result
@@ -1178,6 +1557,17 @@ def status():
     return jsonify(runner.status())
 
 
+@app.route("/command/oracle_adapt_one_batch", methods=["POST"])
+def command_oracle_adapt_one_batch():
+    try:
+        data = request.get_json(silent=True) or {}
+        if not bool(data.get("selected_for_drift", False)):
+            return jsonify({"error": "M2 adaptation is forbidden for control clients"}), 409
+        return jsonify(runner.oracle_adapt_one_batch())
+    except Exception as exc:
+        return _error_response(exc, "/command/oracle_adapt_one_batch")
+
+
 @app.route("/command/train_one_batch", methods=["POST"])
 def command_train_one_batch():
     try:
@@ -1213,7 +1603,12 @@ def command_finalize_epoch():
 @app.route("/command/test", methods=["POST"])
 def command_test():
     try:
-        return jsonify(runner.test())
+        data = request.get_json(silent=True) or {}
+        return jsonify(runner.test(
+            window_offset=max(0, int(data.get("window_offset", 0))),
+            window_limit=None if data.get("window_limit") is None else int(data["window_limit"]),
+            stream_mode=data.get("stream_mode"),
+        ))
     except Exception as exc:
         return _error_response(exc, "/command/test")
 
